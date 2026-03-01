@@ -4,6 +4,7 @@ import requests
 import urllib.parse
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
 # ====== Railway Variables ======
 TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
@@ -31,14 +32,31 @@ last_signal = None
 last_status_time = 0.0
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Fix yfinance MultiIndex columns if they appear."""
     if df is None or df.empty:
         return df
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
     return df
 
+def _ensure_numeric_close(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure Close is numeric. This fixes: 'No numeric types to aggregate'
+    """
+    if df is None or df.empty:
+        return df
+    if "Close" not in df.columns:
+        return df
+
+    # convert to numeric; bad values become NaN
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+
+    # drop rows where Close is NaN
+    df = df.dropna(subset=["Close"])
+
+    return df
+
 def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
+    close = pd.to_numeric(close, errors="coerce")
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
@@ -46,14 +64,15 @@ def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
 
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 def stoch_rsi(close: pd.Series, rsi_len: int = 14, stoch_len: int = 14) -> pd.Series:
     rsi = rsi_wilder(close, rsi_len)
     rsi_min = rsi.rolling(stoch_len).min()
     rsi_max = rsi.rolling(stoch_len).max()
-    return 100 * (rsi - rsi_min) / (rsi_max - rsi_min)
+    srsi = 100 * (rsi - rsi_min) / (rsi_max - rsi_min)
+    return srsi
 
 # رسالة تشغيل
 send_telegram("⚡ دكتور محمد: البوت اشتغل على Railway ✅")
@@ -70,12 +89,12 @@ while True:
         # ===== بيانات 15 دقيقة (EMA) =====
         data_15 = yf.download(symbol, interval="15m", period="2d", progress=False)
         data_15 = _normalize_columns(data_15)
+        data_15 = _ensure_numeric_close(data_15)
 
-        if data_15 is None or data_15.empty or "Close" not in data_15.columns:
+        if data_15 is None or data_15.empty:
             time.sleep(POLL_SECONDS)
             continue
 
-        data_15 = data_15.dropna(subset=["Close"])
         data_15["EMA20"] = data_15["Close"].ewm(span=short_ema, adjust=False).mean()
         data_15["EMA50"] = data_15["Close"].ewm(span=long_ema, adjust=False).mean()
 
@@ -86,12 +105,11 @@ while True:
         # ===== بيانات 1 ساعة (Stoch RSI الحقيقي) =====
         data_60 = yf.download(symbol, interval="60m", period="10d", progress=False)
         data_60 = _normalize_columns(data_60)
+        data_60 = _ensure_numeric_close(data_60)
 
-        if data_60 is None or data_60.empty or "Close" not in data_60.columns:
+        if data_60 is None or data_60.empty:
             time.sleep(POLL_SECONDS)
             continue
-
-        data_60 = data_60.dropna(subset=["Close"])
 
         srsi = stoch_rsi(data_60["Close"], rsi_len=14, stoch_len=14).dropna()
         if srsi.empty:
