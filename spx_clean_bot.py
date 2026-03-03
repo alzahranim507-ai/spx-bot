@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 ES Trading Bot (Balanced + Scalp Mode) — Yahoo Finance data
-Rules (per Dr. Mohammed):
+(per Dr. Mohammed)
+
+Core:
 - Always use ES=F in ALL sessions (Pre / Market / After)
 - Always adjust ES by -10 points (match TradingView)
 - Hourly Update: every hour (NO entry/targets)
-- Balanced Signals: Trend-following with Entry/SL/Targets/RR (score >= 4)
-- Scalp Mode Signals: Counter-trend execution (stricter conditions) with Entry/SL/Targets/RR
-- Mandatory: Structure + Key Levels
+- Balanced Signals: Trend-following with Entry/SL/Targets/RR
+- Scalp Mode Signals: Counter-trend (more bold) with Entry/SL/Targets/RR
 - Telegram messages always include: "دكتور محمد"
 """
 
@@ -56,12 +57,16 @@ class Config:
     balanced_signal_cooldown_minutes: int = 30
     balanced_min_rr_to_t1: float = 1.2
 
-    # Scalp mode (counter-trend execution)
+    # =========================
+    # Scalp mode (Counter-trend) — MORE BOLD (enters more)
+    # =========================
     scalp_mode_enabled: bool = True
-    scalp_score_threshold: int = 4          # keep strict (same as balanced)
-    scalp_signal_cooldown_minutes: int = 45
-    scalp_min_rr_to_t1: float = 1.0         # scalp tolerates slightly lower RR
-    scalp_exhaustion_threshold: float = 0.004  # 0.4% move in last ~40m
+    scalp_score_threshold: int = 4
+    scalp_signal_cooldown_minutes: int = 35  # a bit shorter -> more entries
+    scalp_min_rr_to_t1: float = 0.9          # tolerate slightly lower RR for scalps
+    scalp_exhaustion_threshold: float = 0.0035  # 0.35% move in last ~40m (more sensitive)
+    scalp_rejection_wick_min: float = 0.25      # was 0.45 strict -> now 0.25 (more entries)
+    scalp_require_close_direction: bool = False # do NOT require green/red close -> more entries
 
     # Loop
     loop_sleep_seconds: int = 30
@@ -354,6 +359,34 @@ def rejection_candle_score(df_5m: pd.DataFrame, direction: str) -> int:
         return 2 if cond else 0
     return 0
 
+def scalp_rejection_ok(df_5m: pd.DataFrame, direction: str) -> bool:
+    """
+    More bold scalp rejection:
+    - Accept wick >= scalp_rejection_wick_min (0.25 by default)
+    - Do not require green/red close by default
+    """
+    c = df_5m.iloc[-1]
+    o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
+    rng = max(h - l, 1e-9)
+    upper = h - max(o, cl)
+    lower = min(o, cl) - l
+
+    wick_min = CFG.scalp_rejection_wick_min
+
+    if direction == "Bullish":
+        wick_ok = (lower / rng) >= wick_min
+        close_ok = (cl > o) if CFG.scalp_require_close_direction else True
+        upper_ok = (upper / rng) <= 0.65  # allow more noise
+        return bool(wick_ok and close_ok and upper_ok)
+
+    if direction == "Bearish":
+        wick_ok = (upper / rng) >= wick_min
+        close_ok = (cl < o) if CFG.scalp_require_close_direction else True
+        lower_ok = (lower / rng) <= 0.65
+        return bool(wick_ok and close_ok and lower_ok)
+
+    return False
+
 def break_retest_score(df_5m: pd.DataFrame, level: float, direction: str, tol_frac: float) -> int:
     price = float(df_5m["close"].iloc[-1])
     window = df_5m.tail(8)
@@ -428,9 +461,9 @@ def exhaustion_ok(df_5m: pd.DataFrame, direction: str) -> bool:
     move = (end - start) / max(start, 1e-9)
 
     thr = CFG.scalp_exhaustion_threshold
-    if direction == "Bullish":  # after drop
+    if direction == "Bullish":  # bounce after drop
         return move <= -thr
-    if direction == "Bearish":  # after spike
+    if direction == "Bearish":  # drop after spike
         return move >= thr
     return False
 
@@ -448,7 +481,7 @@ def stoch_extreme_ok(df_5m: pd.DataFrame, direction: str) -> bool:
         return (np.max(k) > 0.8) and (prev > 0 and curr < 0)
     return False
 
-def scalp_direction_guess(df_5m: pd.DataFrame) -> str | None:
+def scalp_direction_guess(df_5m: pd.DataFrame):
     if len(df_5m) < 8:
         return None
     w = df_5m.tail(8)
@@ -457,9 +490,9 @@ def scalp_direction_guess(df_5m: pd.DataFrame) -> str | None:
     move = (end - start) / max(start, 1e-9)
     thr = CFG.scalp_exhaustion_threshold
     if move <= -thr:
-        return "Bullish"   # bounce after drop
+        return "Bullish"
     if move >= thr:
-        return "Bearish"   # drop after spike
+        return "Bearish"
     return None
 
 
@@ -524,8 +557,8 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list[float], level_hit: floa
 class BotState:
     def __init__(self):
         self.last_hour_sent = None
-        self.last_balanced_ts = {}  # key: f"{dir}:{round(level,1)}"
-        self.last_scalp_ts = {}     # key: f"{dir}:{round(level,1)}"
+        self.last_balanced_ts = {}
+        self.last_scalp_ts = {}
 
     def can_send_balanced(self, direction: str, level: float) -> bool:
         key = f"{direction}:{round(level, 1)}"
@@ -636,26 +669,22 @@ def evaluate_once():
             STATE.last_hour_sent = current_hour
 
     # -------------------------
-    # Scalp Mode (Counter-trend) — execution
+    # Scalp Mode (Counter-trend) — more bold
     # Only when bias is Weak/Range
     # -------------------------
     if CFG.scalp_mode_enabled and bias in ("Weak", "Range") and levels:
         dir_guess = scalp_direction_guess(df_5m)
         if dir_guess is not None:
-            # Use nearest level as context/anchor
             level_hit = min(levels, key=lambda x: abs(x - price))
 
-            # Must have exhaustion + rejection + stoch extreme cross
-            if exhaustion_ok(df_5m, dir_guess) and (rejection_candle_score(df_5m, dir_guess) == 2) and stoch_extreme_ok(df_5m, dir_guess):
-                # Scalp scoring
+            if exhaustion_ok(df_5m, dir_guess) and scalp_rejection_ok(df_5m, dir_guess) and stoch_extreme_ok(df_5m, dir_guess):
                 score = 0
                 reasons = []
 
                 score += 2; reasons.append("Exhaustion")
-                score += 2; reasons.append("Rejection")
+                score += 2; reasons.append("Rejection-lite")
                 score += 1; reasons.append("Stoch extreme+cross")
 
-                # add extra confirmations if present
                 rs = rsi_turn_score(df_5m, dir_guess)
                 if rs:
                     score += rs; reasons.append("RSI turn")
@@ -671,7 +700,7 @@ def evaluate_once():
                         STATE.mark_scalp(dir_guess, level_hit)
 
     # -------------------------
-    # Balanced Mode (Trend-following) — execution
+    # Balanced Mode (Trend-following)
     # Only when bias is Bullish/Bearish and near a level
     # -------------------------
     if bias in ("Weak", "Range") or not levels:
@@ -682,7 +711,6 @@ def evaluate_once():
         return
     level_hit = min(nearby, key=lambda x: abs(x - price))
 
-    # Balanced scoring
     score = 0
     reasons = []
 
@@ -728,7 +756,7 @@ def main():
         f"- All Sessions: {CFG.es_symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
         f"- Hourly Update: ON\n"
         f"- Balanced: score ≥ {CFG.balanced_score_threshold}\n"
-        f"- Scalp Mode: {'ON' if CFG.scalp_mode_enabled else 'OFF'} (score ≥ {CFG.scalp_score_threshold})"
+        f"- Scalp Mode: {'ON' if CFG.scalp_mode_enabled else 'OFF'} (more bold)"
     )
 
     while True:
