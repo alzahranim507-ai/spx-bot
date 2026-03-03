@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-ES Trading Bot (Balanced Scoring) — Yahoo Finance data
+ES Trading Bot (Balanced + Scalp Mode) — Yahoo Finance data
 Rules (per Dr. Mohammed):
 - Always use ES=F in ALL sessions (Pre / Market / After)
 - Always adjust ES by -10 points (match TradingView)
 - Hourly Update: every hour (NO entry/targets)
-- Signals: Event-driven with Entry/SL/Targets/RR
+- Balanced Signals: Trend-following with Entry/SL/Targets/RR (score >= 4)
+- Scalp Mode Signals: Counter-trend execution (stricter conditions) with Entry/SL/Targets/RR
 - Mandatory: Structure + Key Levels
-- Balanced Scoring threshold >= 4
 - Telegram messages always include: "دكتور محمد"
 """
 
@@ -51,18 +51,23 @@ class Config:
     level_cluster_tolerance: float = 0.0010
     max_levels: int = 6
 
-    # Scoring
-    score_threshold: int = 4
-    signal_cooldown_minutes: int = 30
+    # Balanced mode scoring
+    balanced_score_threshold: int = 4
+    balanced_signal_cooldown_minutes: int = 30
+    balanced_min_rr_to_t1: float = 1.2
+
+    # Scalp mode (counter-trend execution)
+    scalp_mode_enabled: bool = True
+    scalp_score_threshold: int = 4          # keep strict (same as balanced)
+    scalp_signal_cooldown_minutes: int = 45
+    scalp_min_rr_to_t1: float = 1.0         # scalp tolerates slightly lower RR
+    scalp_exhaustion_threshold: float = 0.004  # 0.4% move in last ~40m
 
     # Loop
     loop_sleep_seconds: int = 30
 
     # Hourly update
     hourly_update: bool = True
-
-    # Risk quality filter
-    min_rr_to_t1: float = 1.2
 
     # Telegram (ONLY these names)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -146,7 +151,7 @@ def send_telegram(text: str):
 
 
 # =========================
-# Data fetching (Yahoo)
+# Data fetching (Yahoo) — ES ONLY
 # =========================
 
 def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
@@ -158,7 +163,6 @@ def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
         progress=False,
         threads=True
     )
-
     if df is None or df.empty:
         raise RuntimeError(f"Yahoo returned empty data for {symbol} interval={interval} period={period}")
 
@@ -176,7 +180,6 @@ def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
     return df
 
 def apply_es_adjustment(df: pd.DataFrame) -> pd.DataFrame:
-    """Subtract 10 points from ES OHLC so it matches your TradingView baseline."""
     out = df.copy()
     adj = CFG.es_points_adjust
     for col in ["open", "high", "low", "close"]:
@@ -184,17 +187,12 @@ def apply_es_adjustment(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def fetch_timeframes_es_only():
-    """
-    Always fetch ES=F:
-    - 5m (7d), 15m (30d), 60m (60d)
-    Then derive 4h from 60m resample.
-    """
     sym = CFG.es_symbol
     df_5m = apply_es_adjustment(_yf_download(sym, interval="5m", period="7d"))
     df_15m = apply_es_adjustment(_yf_download(sym, interval="15m", period="30d"))
     df_1h = apply_es_adjustment(_yf_download(sym, interval="60m", period="60d"))
 
-    agg_map = {"open":"first","high":"max","low":"min","close":"last"}
+    agg_map = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df_1h.columns:
         agg_map["volume"] = "sum"
 
@@ -236,7 +234,6 @@ def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
             return "Weak"
         h1, h2 = highs[-2][1], highs[-1][1]
         l1, l2 = lows[-2][1], lows[-1][1]
-
         if h2 > h1 and l2 > l1:
             return "Bullish"
         if h2 < h1 and l2 < l1:
@@ -308,7 +305,7 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list[float]
     merged = sorted(merged)
 
     if len(merged) > CFG.max_levels:
-        around = sorted(merged, key=lambda x: abs(x - price))[:CFG.max_levels-2]
+        around = sorted(merged, key=lambda x: abs(x - price))[:CFG.max_levels - 2]
         merged = sorted(cluster_levels(around + [min(merged), max(merged)], CFG.level_cluster_tolerance, price))
 
     return merged
@@ -321,12 +318,11 @@ def fmt_levels(levels: list[float]) -> str:
 
 
 # =========================
-# Indicators & Scoring
+# Indicators
 # =========================
 
 def compute_indicators(df_5m: pd.DataFrame) -> pd.DataFrame:
     out = df_5m.copy()
-
     out["rsi"] = RSIIndicator(close=out["close"], window=14).rsi()
 
     st = StochRSIIndicator(close=out["close"], window=14, smooth1=3, smooth2=3)
@@ -336,8 +332,12 @@ def compute_indicators(df_5m: pd.DataFrame) -> pd.DataFrame:
     out["ema20"] = EMAIndicator(close=out["close"], window=20).ema_indicator()
     macd = MACD(close=out["close"], window_slow=26, window_fast=12, window_sign=9)
     out["macd_hist"] = macd.macd_diff()
-
     return out
+
+
+# =========================
+# Scoring helpers
+# =========================
 
 def rejection_candle_score(df_5m: pd.DataFrame, direction: str) -> int:
     c = df_5m.iloc[-1]
@@ -392,10 +392,8 @@ def stoch_cross_score(df_5m: pd.DataFrame, direction: str) -> int:
     d = df_5m["stochrsi_d"].tail(3).values
     if len(k) < 3 or np.isnan(k).any() or np.isnan(d).any():
         return 0
-
     prev = k[-2] - d[-2]
     curr = k[-1] - d[-1]
-
     if direction == "Bullish":
         return 1 if (prev < 0 and curr > 0) else 0
     if direction == "Bearish":
@@ -405,7 +403,6 @@ def stoch_cross_score(df_5m: pd.DataFrame, direction: str) -> int:
 def momentum_shift_score(df_5m: pd.DataFrame, direction: str) -> int:
     if len(df_5m) < 30:
         return 0
-
     c = float(df_5m["close"].iloc[-1])
     ema = float(df_5m["ema20"].iloc[-1])
     hist = float(df_5m["macd_hist"].iloc[-1])
@@ -419,25 +416,68 @@ def momentum_shift_score(df_5m: pd.DataFrame, direction: str) -> int:
 
 
 # =========================
+# Scalp mode conditions
+# =========================
+
+def exhaustion_ok(df_5m: pd.DataFrame, direction: str) -> bool:
+    if len(df_5m) < 8:
+        return False
+    w = df_5m.tail(8)
+    start = float(w["close"].iloc[0])
+    end = float(w["close"].iloc[-1])
+    move = (end - start) / max(start, 1e-9)
+
+    thr = CFG.scalp_exhaustion_threshold
+    if direction == "Bullish":  # after drop
+        return move <= -thr
+    if direction == "Bearish":  # after spike
+        return move >= thr
+    return False
+
+def stoch_extreme_ok(df_5m: pd.DataFrame, direction: str) -> bool:
+    k = df_5m["stochrsi_k"].tail(6).values
+    d = df_5m["stochrsi_d"].tail(6).values
+    if len(k) < 3 or np.isnan(k).any() or np.isnan(d).any():
+        return False
+    prev = k[-2] - d[-2]
+    curr = k[-1] - d[-1]
+
+    if direction == "Bullish":
+        return (np.min(k) < 0.2) and (prev < 0 and curr > 0)
+    if direction == "Bearish":
+        return (np.max(k) > 0.8) and (prev > 0 and curr < 0)
+    return False
+
+def scalp_direction_guess(df_5m: pd.DataFrame) -> str | None:
+    if len(df_5m) < 8:
+        return None
+    w = df_5m.tail(8)
+    start = float(w["close"].iloc[0])
+    end = float(w["close"].iloc[-1])
+    move = (end - start) / max(start, 1e-9)
+    thr = CFG.scalp_exhaustion_threshold
+    if move <= -thr:
+        return "Bullish"   # bounce after drop
+    if move >= thr:
+        return "Bearish"   # drop after spike
+    return None
+
+
+# =========================
 # Trade plan (Entry/SL/Targets)
 # =========================
 
 def pick_targets(levels: list[float], entry: float, direction: str):
     if not levels:
         return None, None
-
     if direction == "Bullish":
         above = sorted([lvl for lvl in levels if lvl > entry])
-        t1 = above[0] if len(above) >= 1 else None
-        t2 = above[1] if len(above) >= 2 else None
-        return t1, t2
-
+        return (above[0] if len(above) >= 1 else None,
+                above[1] if len(above) >= 2 else None)
     if direction == "Bearish":
         below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
-        t1 = below[0] if len(below) >= 1 else None
-        t2 = below[1] if len(below) >= 2 else None
-        return t1, t2
-
+        return (below[0] if len(below) >= 1 else None,
+                below[1] if len(below) >= 2 else None)
     return None, None
 
 def compute_trade_plan(df_5m: pd.DataFrame, levels: list[float], level_hit: float, direction: str, trigger: str):
@@ -484,18 +524,30 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list[float], level_hit: floa
 class BotState:
     def __init__(self):
         self.last_hour_sent = None
-        self.last_signal_ts = {}  # key: f"{dir}:{round(level,1)}"
+        self.last_balanced_ts = {}  # key: f"{dir}:{round(level,1)}"
+        self.last_scalp_ts = {}     # key: f"{dir}:{round(level,1)}"
 
-    def can_send_signal(self, direction: str, level: float) -> bool:
+    def can_send_balanced(self, direction: str, level: float) -> bool:
         key = f"{direction}:{round(level, 1)}"
-        last = self.last_signal_ts.get(key)
+        last = self.last_balanced_ts.get(key)
         if last is None:
             return True
-        return (datetime.utcnow() - last) >= timedelta(minutes=CFG.signal_cooldown_minutes)
+        return (datetime.utcnow() - last) >= timedelta(minutes=CFG.balanced_signal_cooldown_minutes)
 
-    def mark_signal(self, direction: str, level: float):
+    def mark_balanced(self, direction: str, level: float):
         key = f"{direction}:{round(level, 1)}"
-        self.last_signal_ts[key] = datetime.utcnow()
+        self.last_balanced_ts[key] = datetime.utcnow()
+
+    def can_send_scalp(self, direction: str, level: float) -> bool:
+        key = f"{direction}:{round(level, 1)}"
+        last = self.last_scalp_ts.get(key)
+        if last is None:
+            return True
+        return (datetime.utcnow() - last) >= timedelta(minutes=CFG.scalp_signal_cooldown_minutes)
+
+    def mark_scalp(self, direction: str, level: float):
+        key = f"{direction}:{round(level, 1)}"
+        self.last_scalp_ts[key] = datetime.utcnow()
 
 STATE = BotState()
 
@@ -516,11 +568,14 @@ def build_hourly_update(session: str, symbol: str, bias: str, levels: list[float
         f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
     )
 
-def build_signal_message(session: str, symbol: str, bias: str, level_hit: float, score: int, reasons: list[str], plan: dict) -> str:
+def _fmt_plan(plan: dict):
     rr_txt = f"{plan['rr']:.2f}" if plan["rr"] is not None else "N/A"
     t1_txt = f"{plan['t1']:.1f}" if plan["t1"] is not None else "N/A"
     t2_txt = f"{plan['t2']:.1f}" if plan["t2"] is not None else "N/A"
+    return rr_txt, t1_txt, t2_txt
 
+def build_balanced_signal(session: str, symbol: str, bias: str, level_hit: float, score: int, reasons: list[str], plan: dict) -> str:
+    rr_txt, t1_txt, t2_txt = _fmt_plan(plan)
     return (
         f"🚨 {CFG.user_title} — فرصة دخول (Balanced)\n"
         f"🕒 Time: {now_riyadh().strftime('%Y-%m-%d %H:%M')} (Riyadh)\n"
@@ -538,9 +593,30 @@ def build_signal_message(session: str, symbol: str, bias: str, level_hit: float,
         f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
     )
 
+def build_scalp_signal(session: str, symbol: str, dirn: str, level_hit: float, score: int, reasons: list[str], plan: dict, bias: str) -> str:
+    rr_txt, t1_txt, t2_txt = _fmt_plan(plan)
+    return (
+        f"🟡 {CFG.user_title} — Scalp Mode Signal (Counter-Trend)\n"
+        f"🕒 Time: {now_riyadh().strftime('%Y-%m-%d %H:%M')} (Riyadh)\n"
+        f"🏷️ Session: {session}\n"
+        f"📌 Source: Yahoo | Symbol: {symbol}\n"
+        f"📍 Direction: <b>{dirn}</b>\n"
+        f"🧭 Market State: <b>{bias}</b>\n"
+        f"🧱 Level Context: {level_hit:.1f}\n\n"
+        f"✅ Entry: <b>{plan['entry']:.1f}</b>\n"
+        f"🛑 Stop: <b>{plan['stop']:.1f}</b>\n"
+        f"🎯 Target 1: <b>{t1_txt}</b>\n"
+        f"🎯 Target 2: <b>{t2_txt}</b>\n"
+        f"📐 RR (to T1): <b>{rr_txt}</b>\n\n"
+        f"⭐ Score: <b>{score}/7</b>\n"
+        f"🧠 Reason: {', '.join(reasons)}\n"
+        f"⚠️ Counter-trend scalp: manual management required\n"
+        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
+    )
+
 
 # =========================
-# Main evaluation
+# Core evaluation
 # =========================
 
 def evaluate_once():
@@ -549,67 +625,100 @@ def evaluate_once():
     df_5m = compute_indicators(df_5m_raw)
 
     price = float(df_15m["close"].iloc[-1])
-
     bias = structure_bias(df_1h, df_4h)
     levels = extract_key_levels(df_15m, df_1h)
 
+    # Hourly update (NO entries)
     if CFG.hourly_update:
         current_hour = now_riyadh().replace(minute=0, second=0, microsecond=0)
         if STATE.last_hour_sent is None or current_hour > STATE.last_hour_sent:
             send_telegram(build_hourly_update(session, symbol, bias, levels, price))
             STATE.last_hour_sent = current_hour
 
+    # -------------------------
+    # Scalp Mode (Counter-trend) — execution
+    # Only when bias is Weak/Range
+    # -------------------------
+    if CFG.scalp_mode_enabled and bias in ("Weak", "Range") and levels:
+        dir_guess = scalp_direction_guess(df_5m)
+        if dir_guess is not None:
+            # Use nearest level as context/anchor
+            level_hit = min(levels, key=lambda x: abs(x - price))
+
+            # Must have exhaustion + rejection + stoch extreme cross
+            if exhaustion_ok(df_5m, dir_guess) and (rejection_candle_score(df_5m, dir_guess) == 2) and stoch_extreme_ok(df_5m, dir_guess):
+                # Scalp scoring
+                score = 0
+                reasons = []
+
+                score += 2; reasons.append("Exhaustion")
+                score += 2; reasons.append("Rejection")
+                score += 1; reasons.append("Stoch extreme+cross")
+
+                # add extra confirmations if present
+                rs = rsi_turn_score(df_5m, dir_guess)
+                if rs:
+                    score += rs; reasons.append("RSI turn")
+
+                ms = momentum_shift_score(df_5m, dir_guess)
+                if ms:
+                    score += ms; reasons.append("Momentum shift")
+
+                if score >= CFG.scalp_score_threshold and STATE.can_send_scalp(dir_guess, level_hit):
+                    plan = compute_trade_plan(df_5m, levels, level_hit, dir_guess, trigger="Rejection")
+                    if plan["rr"] is None or plan["rr"] >= CFG.scalp_min_rr_to_t1:
+                        send_telegram(build_scalp_signal(session, symbol, dir_guess, level_hit, score, reasons, plan, bias))
+                        STATE.mark_scalp(dir_guess, level_hit)
+
+    # -------------------------
+    # Balanced Mode (Trend-following) — execution
+    # Only when bias is Bullish/Bearish and near a level
+    # -------------------------
     if bias in ("Weak", "Range") or not levels:
         return
 
     nearby = [lvl for lvl in levels if near_level(price, lvl, CFG.level_touch_tolerance)]
     if not nearby:
         return
-
     level_hit = min(nearby, key=lambda x: abs(x - price))
 
+    # Balanced scoring
     score = 0
     reasons = []
 
     rj = rejection_candle_score(df_5m, bias)
     if rj:
-        score += rj
-        reasons.append("Rejection")
+        score += rj; reasons.append("Rejection")
 
     br = break_retest_score(df_5m, level_hit, bias, CFG.level_touch_tolerance)
     if br:
-        score += br
-        reasons.append("Break&Retest")
+        score += br; reasons.append("Break&Retest")
 
     rs = rsi_turn_score(df_5m, bias)
     if rs:
-        score += rs
-        reasons.append("RSI turn")
+        score += rs; reasons.append("RSI turn")
 
     sc = stoch_cross_score(df_5m, bias)
     if sc:
-        score += sc
-        reasons.append("Stoch cross")
+        score += sc; reasons.append("Stoch cross")
 
     ms = momentum_shift_score(df_5m, bias)
     if ms:
-        score += ms
-        reasons.append("Momentum shift")
+        score += ms; reasons.append("Momentum shift")
 
-    if score < CFG.score_threshold:
+    if score < CFG.balanced_score_threshold:
         return
-
-    if not STATE.can_send_signal(bias, level_hit):
+    if not STATE.can_send_balanced(bias, level_hit):
         return
 
     trigger = "Rejection" if "Rejection" in reasons else ("Break&Retest" if "Break&Retest" in reasons else "Momentum")
     plan = compute_trade_plan(df_5m, levels, level_hit, bias, trigger)
 
-    if plan["rr"] is not None and plan["rr"] < CFG.min_rr_to_t1:
+    if plan["rr"] is not None and plan["rr"] < CFG.balanced_min_rr_to_t1:
         return
 
-    send_telegram(build_signal_message(session, symbol, bias, level_hit, score, reasons, plan))
-    STATE.mark_signal(bias, level_hit)
+    send_telegram(build_balanced_signal(session, symbol, bias, level_hit, score, reasons, plan))
+    STATE.mark_balanced(bias, level_hit)
 
 
 def main():
@@ -618,7 +727,8 @@ def main():
         f"Rules:\n"
         f"- All Sessions: {CFG.es_symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
         f"- Hourly Update: ON\n"
-        f"- Signals: Balanced score ≥ {CFG.score_threshold}"
+        f"- Balanced: score ≥ {CFG.balanced_score_threshold}\n"
+        f"- Scalp Mode: {'ON' if CFG.scalp_mode_enabled else 'OFF'} (score ≥ {CFG.scalp_score_threshold})"
     )
 
     while True:
