@@ -5,6 +5,8 @@ import urllib.parse
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 
 # ====== Railway Variables ======
 TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
@@ -14,22 +16,38 @@ if not TOKEN or not CHAT_ID:
     raise RuntimeError("Missing TELEGRAM_TOKEN or CHAT_ID in Railway Variables")
 
 def send_telegram(message: str):
-    encoded_msg = urllib.parse.quote(message)
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={CHAT_ID}&text={encoded_msg}"
+    encoded = urllib.parse.quote(message)
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={CHAT_ID}&text={encoded}"
     r = requests.get(url, timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
-# ====== Strategy Settings ======
-symbol = "^SPX"
+# ====== Settings ======
+SPX_SYMBOL = "^SPX"
+FUT_SYMBOL = "ES=F"
+
 short_ema = 20
 long_ema = 50
 
-POLL_SECONDS = 300          # كل 5 دقائق
-STATUS_INTERVAL = 1800      # كل 30 دقيقة
+POLL_SECONDS = 300           # كل 5 دقائق
+STATUS_INTERVAL = 21600      # كل 6 ساعات (6 × 60 × 60)
 
+# ====== State ======
 last_signal = None
 last_status_time = 0.0
+
+NY = ZoneInfo("America/New_York")
+
+def is_market_open_now() -> bool:
+    """
+    سوق الأسهم الأمريكي (SPX cash):
+    Mon–Fri 9:30am–4:00pm ET
+    """
+    now = datetime.now(NY)
+    if now.weekday() >= 5:  # Sat/Sun
+        return False
+    t = now.time()
+    return dtime(9, 30) <= t <= dtime(16, 0)
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -39,20 +57,12 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _ensure_numeric_close(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make sure Close is numeric. This fixes: 'No numeric types to aggregate'
-    """
     if df is None or df.empty:
         return df
     if "Close" not in df.columns:
         return df
-
-    # convert to numeric; bad values become NaN
     df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-
-    # drop rows where Close is NaN
     df = df.dropna(subset=["Close"])
-
     return df
 
 def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
@@ -71,26 +81,39 @@ def stoch_rsi(close: pd.Series, rsi_len: int = 14, stoch_len: int = 14) -> pd.Se
     rsi = rsi_wilder(close, rsi_len)
     rsi_min = rsi.rolling(stoch_len).min()
     rsi_max = rsi.rolling(stoch_len).max()
-    srsi = 100 * (rsi - rsi_min) / (rsi_max - rsi_min)
-    return srsi
+    return 100 * (rsi - rsi_min) / (rsi_max - rsi_min)
+
+def fetch_15m(symbol: str) -> pd.DataFrame:
+    df = yf.download(symbol, interval="15m", period="2d", progress=False)
+    df = _normalize_columns(df)
+    df = _ensure_numeric_close(df)
+    return df
+
+def fetch_60m(symbol: str) -> pd.DataFrame:
+    df = yf.download(symbol, interval="60m", period="10d", progress=False)
+    df = _normalize_columns(df)
+    df = _ensure_numeric_close(df)
+    return df
 
 # رسالة تشغيل
 send_telegram("⚡ دكتور محمد: البوت اشتغل على Railway ✅")
 
 while True:
     try:
-        now = time.time()
+        now_ts = time.time()
 
-        # ===== رسالة حالة كل 30 دقيقة =====
-        if now - last_status_time >= STATUS_INTERVAL:
+        # رسالة حالة كل 6 ساعات
+        if now_ts - last_status_time >= STATUS_INTERVAL:
             send_telegram("⚡ النظام ماشي زي الحلاوة يا دكتور ✅")
-            last_status_time = now
+            last_status_time = now_ts
 
-        # ===== بيانات 15 دقيقة (EMA) =====
-        data_15 = yf.download(symbol, interval="15m", period="2d", progress=False)
-        data_15 = _normalize_columns(data_15)
-        data_15 = _ensure_numeric_close(data_15)
+        # اختيار المصدر: SPX أثناء السوق، ES خارج السوق
+        market_open = is_market_open_now()
+        symbol = SPX_SYMBOL if market_open else FUT_SYMBOL
+        source_label = "SPX (Market Open)" if market_open else "ES Futures (Pre/After)"
 
+        # ===== 15m (EMA) =====
+        data_15 = fetch_15m(symbol)
         if data_15 is None or data_15.empty:
             time.sleep(POLL_SECONDS)
             continue
@@ -102,11 +125,8 @@ while True:
         ema20 = data_15["EMA20"].iloc[-1].item()
         ema50 = data_15["EMA50"].iloc[-1].item()
 
-        # ===== بيانات 1 ساعة (Stoch RSI الحقيقي) =====
-        data_60 = yf.download(symbol, interval="60m", period="10d", progress=False)
-        data_60 = _normalize_columns(data_60)
-        data_60 = _ensure_numeric_close(data_60)
-
+        # ===== 60m (Stoch RSI) =====
+        data_60 = fetch_60m(symbol)
         if data_60 is None or data_60.empty:
             time.sleep(POLL_SECONDS)
             continue
@@ -118,7 +138,7 @@ while True:
 
         last_srsi = srsi.iloc[-1].item()
 
-        # ===== إشارات + TP =====
+        # ===== Signal =====
         signal = None
         tp_price = None
 
@@ -129,16 +149,20 @@ while True:
             signal = "PUT"
             tp_price = last_close * 0.998
 
-        # ===== إرسال فقط عند تغير الإشارة =====
+        # إرسال فقط عند تغيّر الإشارة
         if signal and signal != last_signal:
             send_telegram(
-                f"✅ دكتور محمد: {signal} | Price: {last_close:.2f} | "
-                f"StochRSI(1H): {last_srsi:.1f} | Take Profit: {tp_price:.2f}"
+                f"✅ دكتور محمد: {signal}\n"
+                f"Source: {source_label}\n"
+                f"Price: {last_close:.2f}\n"
+                f"EMA20: {ema20:.2f} | EMA50: {ema50:.2f}\n"
+                f"StochRSI(1H): {last_srsi:.1f}\n"
+                f"Take Profit: {tp_price:.2f}"
             )
             last_signal = signal
 
         time.sleep(POLL_SECONDS)
 
-    except Exception as e:
-        send_telegram(f"❌ دكتور محمد: خطأ - {str(e)}")
+    except Exception:
+        # بدون سبام أخطاء — نكمّل بهدوء
         time.sleep(POLL_SECONDS)
