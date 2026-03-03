@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-SPX/ES Trading Bot (Balanced Scoring) — Yahoo Finance data
+ES Trading Bot (Balanced Scoring) — Yahoo Finance data
 Rules (per Dr. Mohammed):
-- Pre-Market & After-Hours: use ES=F (with -10 points adjustment)
-- Regular Market (RTH): use ^GSPC (SPX Index)
+- Always use ES=F in ALL sessions (Pre / Market / After)
+- Always adjust ES by -10 points (match TradingView)
 - Hourly Update: every hour (NO entry/targets)
 - Signals: Event-driven with Entry/SL/Targets/RR
 - Mandatory: Structure + Key Levels
@@ -36,12 +36,10 @@ except ImportError:
 
 @dataclass
 class Config:
-    # Symbols
-    es_symbol: str = "ES=F"     # Futures (pre/after)
-    spx_symbol: str = "^GSPC"   # Index (regular market)
+    # Symbol (always)
+    es_symbol: str = "ES=F"
 
-    # ES adjustment to match your TradingView (TV) chart:
-    # "TradingView ناقص 10 عن ياهو" => subtract 10 from Yahoo ES for alignment.
+    # Adjustment to match TradingView baseline
     es_points_adjust: float = 10.0
 
     # Structure / pivots
@@ -66,7 +64,7 @@ class Config:
     # Risk quality filter
     min_rr_to_t1: float = 1.2
 
-    # Telegram
+    # Telegram (ONLY these names)
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -87,7 +85,6 @@ CFG = Config()
 
 def tzinfo(name: str):
     if ZoneInfo is None:
-        # fallback: best-effort fixed offset (Riyadh +3, NY -5)
         if name == "Asia/Riyadh":
             return timezone(timedelta(hours=3))
         if name == "America/New_York":
@@ -106,7 +103,7 @@ def now_ny() -> datetime:
 
 def session_label() -> str:
     """
-    Labels by NY time:
+    Labels by NY time (informational only):
     - Pre-Market: 04:00–09:30
     - Market:     09:30–16:00
     - After-Hours: else
@@ -165,19 +162,15 @@ def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
     if df is None or df.empty:
         raise RuntimeError(f"Yahoo returned empty data for {symbol} interval={interval} period={period}")
 
-    # Normalize columns (yfinance can return multiindex with tickers)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].lower() for c in df.columns]
     else:
         df.columns = [c.lower() for c in df.columns]
 
-    # Keep standard OHLCV
-    cols = ["open", "high", "low", "close"]
-    for c in cols:
+    for c in ["open", "high", "low", "close"]:
         if c not in df.columns:
             raise RuntimeError(f"Missing column '{c}' in {symbol} data")
 
-    # Ensure datetime index is tz-aware (assume UTC if naive)
     if df.index.tz is None:
         df.index = df.index.tz_localize(timezone.utc)
     return df
@@ -190,48 +183,23 @@ def apply_es_adjustment(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = out[col].astype(float) - adj
     return out
 
-def fetch_timeframes(symbol: str, is_es: bool):
+def fetch_timeframes_es_only():
     """
-    Fetch:
+    Always fetch ES=F:
     - 5m (7d), 15m (30d), 60m (60d)
     Then derive 4h from 60m resample.
     """
-    df_5m = _yf_download(symbol, interval="5m", period="7d")
-    df_15m = _yf_download(symbol, interval="15m", period="30d")
-    df_1h = _yf_download(symbol, interval="60m", period="60d")
+    sym = CFG.es_symbol
+    df_5m = apply_es_adjustment(_yf_download(sym, interval="5m", period="7d"))
+    df_15m = apply_es_adjustment(_yf_download(sym, interval="15m", period="30d"))
+    df_1h = apply_es_adjustment(_yf_download(sym, interval="60m", period="60d"))
 
-    if is_es:
-        df_5m = apply_es_adjustment(df_5m)
-        df_15m = apply_es_adjustment(df_15m)
-        df_1h = apply_es_adjustment(df_1h)
+    agg_map = {"open":"first","high":"max","low":"min","close":"last"}
+    if "volume" in df_1h.columns:
+        agg_map["volume"] = "sum"
 
-    # Build 4H from 1H
-    df_4h = (
-        df_1h
-        .resample("4H")
-        .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"} if "volume" in df_1h.columns else
-             {"open":"first","high":"max","low":"min","close":"last"})
-        .dropna()
-    )
-
-    return df_4h, df_1h, df_15m, df_5m
-
-
-def active_symbol_and_data():
-    """
-    Market session => ^GSPC
-    Pre/After => ES=F (adjusted -10)
-    """
-    sess = session_label()
-    if sess == "Market":
-        sym = CFG.spx_symbol
-        is_es = False
-    else:
-        sym = CFG.es_symbol
-        is_es = True
-
-    df_4h, df_1h, df_15m, df_5m = fetch_timeframes(sym, is_es=is_es)
-    return sess, sym, is_es, df_4h, df_1h, df_15m, df_5m
+    df_4h = df_1h.resample("4h").agg(agg_map).dropna()
+    return sym, df_4h, df_1h, df_15m, df_5m
 
 
 # =========================
@@ -306,18 +274,15 @@ def cluster_levels(levels: list[float], tol_frac: float, price_ref: float) -> li
 def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list[float]:
     price = float(df_15m["close"].iloc[-1])
 
-    # Swing points from 1H
     hi_idx, lo_idx = find_pivots(df_1h["high"], CFG.pivot_left, CFG.pivot_right)
     swing_highs = [float(df_1h["high"].iloc[i]) for i in hi_idx[-10:]] if hi_idx else []
     swing_lows  = [float(df_1h["low"].iloc[i])  for i in lo_idx[-10:]] if lo_idx else []
 
-    # Recent 15m range extremes
     recent = df_15m.tail(200)
     range_hi = float(recent["high"].max())
     range_lo = float(recent["low"].min())
 
-    # Previous day high/low (Riyadh date split)
-    prev = df_15m.tail(96*2).copy()  # ~2 days
+    prev = df_15m.tail(96*2).copy()
     prev_local = prev.copy()
     prev_local.index = prev_local.index.tz_convert(TZ_RIYADH)
     prev_local["date"] = prev_local.index.date
@@ -336,11 +301,8 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list[float]
     candidates = [float(x) for x in candidates if np.isfinite(x)]
     clustered = cluster_levels(candidates, CFG.level_cluster_tolerance, price)
 
-    # Rank by proximity to current price, keep extremes too
     clustered = sorted(clustered, key=lambda x: abs(x - price))
-    extremes = []
-    if clustered:
-        extremes = [min(clustered), max(clustered)]
+    extremes = [min(clustered), max(clustered)] if clustered else []
 
     merged = cluster_levels(clustered + extremes, CFG.level_cluster_tolerance, price)
     merged = sorted(merged)
@@ -522,17 +484,17 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list[float], level_hit: floa
 class BotState:
     def __init__(self):
         self.last_hour_sent = None
-        self.last_signal_ts = {}  # key: f"{symbol}:{dir}:{round(level,1)}"
+        self.last_signal_ts = {}  # key: f"{dir}:{round(level,1)}"
 
-    def can_send_signal(self, symbol: str, direction: str, level: float) -> bool:
-        key = f"{symbol}:{direction}:{round(level, 1)}"
+    def can_send_signal(self, direction: str, level: float) -> bool:
+        key = f"{direction}:{round(level, 1)}"
         last = self.last_signal_ts.get(key)
         if last is None:
             return True
         return (datetime.utcnow() - last) >= timedelta(minutes=CFG.signal_cooldown_minutes)
 
-    def mark_signal(self, symbol: str, direction: str, level: float):
-        key = f"{symbol}:{direction}:{round(level, 1)}"
+    def mark_signal(self, direction: str, level: float):
+        key = f"{direction}:{round(level, 1)}"
         self.last_signal_ts[key] = datetime.utcnow()
 
 STATE = BotState()
@@ -542,10 +504,7 @@ STATE = BotState()
 # Messaging
 # =========================
 
-def build_hourly_update(session: str, symbol: str, bias: str, levels: list[float], price: float, is_es: bool) -> str:
-    note = ""
-    if is_es:
-        note = f"\n🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
+def build_hourly_update(session: str, symbol: str, bias: str, levels: list[float], price: float) -> str:
     return (
         f"👋 {CFG.user_title}\n"
         f"🕐 Hourly Update ({now_riyadh().strftime('%Y-%m-%d %H:%M')} Riyadh)\n"
@@ -553,17 +512,14 @@ def build_hourly_update(session: str, symbol: str, bias: str, levels: list[float
         f"📌 Source: Yahoo | Symbol: {symbol}\n"
         f"🧭 Bias: <b>{bias}</b>\n"
         f"💵 Price: {price:.1f}\n"
-        f"🧱 Key Levels: {fmt_levels(levels)}"
-        f"{note}"
+        f"🧱 Key Levels: {fmt_levels(levels)}\n"
+        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
     )
 
-def build_signal_message(session: str, symbol: str, bias: str, level_hit: float, score: int, reasons: list[str], plan: dict, is_es: bool) -> str:
+def build_signal_message(session: str, symbol: str, bias: str, level_hit: float, score: int, reasons: list[str], plan: dict) -> str:
     rr_txt = f"{plan['rr']:.2f}" if plan["rr"] is not None else "N/A"
     t1_txt = f"{plan['t1']:.1f}" if plan["t1"] is not None else "N/A"
     t2_txt = f"{plan['t2']:.1f}" if plan["t2"] is not None else "N/A"
-    note = ""
-    if is_es:
-        note = f"\n🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
 
     return (
         f"🚨 {CFG.user_title} — فرصة دخول (Balanced)\n"
@@ -578,8 +534,8 @@ def build_signal_message(session: str, symbol: str, bias: str, level_hit: float,
         f"🎯 Target 2: <b>{t2_txt}</b>\n"
         f"📐 RR (to T1): <b>{rr_txt}</b>\n\n"
         f"⭐ Score: <b>{score}/7</b>\n"
-        f"🧠 Reason: {', '.join(reasons)}"
-        f"{note}"
+        f"🧠 Reason: {', '.join(reasons)}\n"
+        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
     )
 
 
@@ -588,36 +544,30 @@ def build_signal_message(session: str, symbol: str, bias: str, level_hit: float,
 # =========================
 
 def evaluate_once():
-    session, symbol, is_es, df_4h, df_1h, df_15m, df_5m_raw = active_symbol_and_data()
+    session = session_label()
+    symbol, df_4h, df_1h, df_15m, df_5m_raw = fetch_timeframes_es_only()
     df_5m = compute_indicators(df_5m_raw)
 
     price = float(df_15m["close"].iloc[-1])
 
-    # 1) Structure/Bias (mandatory)
     bias = structure_bias(df_1h, df_4h)
-
-    # 2) Key levels (mandatory)
     levels = extract_key_levels(df_15m, df_1h)
 
-    # Hourly update (no entry/targets)
     if CFG.hourly_update:
         current_hour = now_riyadh().replace(minute=0, second=0, microsecond=0)
         if STATE.last_hour_sent is None or current_hour > STATE.last_hour_sent:
-            send_telegram(build_hourly_update(session, symbol, bias, levels, price, is_es))
+            send_telegram(build_hourly_update(session, symbol, bias, levels, price))
             STATE.last_hour_sent = current_hour
 
-    # Gate: need clear bias + levels
     if bias in ("Weak", "Range") or not levels:
         return
 
-    # Must be near a key level
     nearby = [lvl for lvl in levels if near_level(price, lvl, CFG.level_touch_tolerance)]
     if not nearby:
         return
 
     level_hit = min(nearby, key=lambda x: abs(x - price))
 
-    # Scoring
     score = 0
     reasons = []
 
@@ -649,7 +599,7 @@ def evaluate_once():
     if score < CFG.score_threshold:
         return
 
-    if not STATE.can_send_signal(symbol, bias, level_hit):
+    if not STATE.can_send_signal(bias, level_hit):
         return
 
     trigger = "Rejection" if "Rejection" in reasons else ("Break&Retest" if "Break&Retest" in reasons else "Momentum")
@@ -658,16 +608,15 @@ def evaluate_once():
     if plan["rr"] is not None and plan["rr"] < CFG.min_rr_to_t1:
         return
 
-    send_telegram(build_signal_message(session, symbol, bias, level_hit, score, reasons, plan, is_es))
-    STATE.mark_signal(symbol, bias, level_hit)
+    send_telegram(build_signal_message(session, symbol, bias, level_hit, score, reasons, plan))
+    STATE.mark_signal(bias, level_hit)
 
 
 def main():
     send_telegram(
         f"✅ {CFG.user_title} — Bot started\n"
         f"Rules:\n"
-        f"- Market: {CFG.spx_symbol}\n"
-        f"- Pre/After: {CFG.es_symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
+        f"- All Sessions: {CFG.es_symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
         f"- Hourly Update: ON\n"
         f"- Signals: Balanced score ≥ {CFG.score_threshold}"
     )
@@ -676,7 +625,6 @@ def main():
         try:
             evaluate_once()
         except Exception as e:
-            # Keep errors local, avoid Telegram spam
             print("[ERROR]", e)
         time.sleep(CFG.loop_sleep_seconds)
 
