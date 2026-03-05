@@ -1,14 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-ES Trading Bot — Hunter Smart + Smarter Liquidity Sweep + Trade Tracking
-+ Hourly Trade Status
-+ Daily Reset at Midnight (Riyadh) + No-Signal Window
-+ Market State (Trending/Range/Weak) via 1H ADX + Structure, updated every 15 min
-
+ES Trading Bot — Yahoo Finance (yfinance)
 (per Dr. Mohammed)
-Data: Yahoo Finance (yfinance)
-Symbol: ES=F always (Pre/Market/After)
-Adjustment: -10 points always (match TradingView baseline)
+
+Core rules:
+- Symbol ALWAYS: ES=F (Pre / Market / After)
+- Always adjust ES by -10 pts (match TradingView baseline)
+- Hourly Update: ON (no entry/targets inside hourly update)
+- Signals: Hunter Smart + Smarter Liquidity Sweep
+- Trade tracking: ON (entry trigger / stop confirm / targets / progress)
+- Daily Reset: 00:00 Riyadh, close any active trade, then No-Signal window (10m)
+
+New additions (as requested):
+- Market State: Trending/Range/Weak + Direction + ADX(1H), updated every 15 minutes
+- Liquidity state (Low/Normal/High/Extreme) using ES volume ratio
+- Level Now (current price at signal time)
+- Confidence % (score-based + small contextual nudges)
+- Probability to hit T1 and T2 (heuristic, bounded; not a promise)
+- Expected Move (1H) via ATR(1H)
+- ETA to T1 via velocity (recent 5m movement) + liquidity adjustment
 
 Railway env vars:
 - TELEGRAM_BOT_TOKEN
@@ -27,6 +37,7 @@ import yfinance as yf
 
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import EMAIndicator, MACD, ADXIndicator
+from ta.volatility import AverageTrueRange
 
 try:
     from zoneinfo import ZoneInfo
@@ -43,60 +54,69 @@ class Config:
     es_symbol: str = "ES=F"
     es_points_adjust: float = 10.0
 
-    # Pivots (1H)
+    # pivots
     pivot_left: int = 3
     pivot_right: int = 3
 
-    # Key levels
-    level_touch_tolerance: float = 0.0013       # 0.13%
+    # key levels
+    level_touch_tolerance: float = 0.0013
     level_cluster_tolerance: float = 0.0010
     max_levels: int = 6
 
-    # Hunter Smart
+    # signals / scoring
     signal_score_threshold: int = 3
     min_rr_to_t1: float = 1.6
     signal_cooldown_minutes: int = 20
 
-    # Trade tracking
-    progress_notify_frac: float = 0.50
-
-    # Smart stop confirmation
-    stop_confirm_seconds: int = 120
-    stop_stoch_confirm: bool = True
-
-    # Liquidity sweep
+    # liquidity sweep
     sweep_close_required: bool = True
     sweep_wick_min_points: float = 1.5
     sweep_stoch_confirm: bool = True
     sweep_priority: bool = True
 
-    # Hourly update
-    hourly_update: bool = True
+    # trade tracking
+    progress_notify_frac: float = 0.50
+    stop_confirm_seconds: int = 120
+    stop_stoch_confirm: bool = True
 
-    # Daily reset (Riyadh midnight)
+    # daily reset (Riyadh midnight)
     daily_reset_enabled: bool = True
     daily_reset_hour: int = 0
     daily_reset_minute: int = 0
-    daily_reset_window_minutes: int = 5   # if time is within first 5 minutes after midnight -> do reset once
+    daily_reset_window_minutes: int = 5
     no_signal_after_reset_minutes: int = 10
 
-    # Market State (fast update)
+    # market state
     market_state_update_minutes: int = 15
     adx_window: int = 14
     adx_trending_on: float = 25.0
     adx_range_on: float = 20.0
 
-    # Loop
+    # liquidity calc
+    liquidity_lookback_5m: int = 60  # last 60 candles = 5 hours
+    liquidity_state_thresholds: tuple = (0.60, 1.25, 2.00)  # low, normal, high, extreme via vol_ratio
+
+    # expected move (ATR)
+    expected_move_atr_window: int = 14
+
+    # ETA
+    eta_velocity_lookback_5m: int = 24  # last 24 candles = 2 hours
+    eta_min_velocity_pts_per_min: float = 0.15  # guardrail
+
+    # hourly update
+    hourly_update: bool = True
+
+    # loop
     loop_sleep_seconds: int = 30
 
-    # Telegram
+    # telegram
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Identity
+    # identity
     user_title: str = "دكتور محمد"
 
-    # Timezones
+    # timezones
     tz_riyadh: str = "Asia/Riyadh"
     tz_ny: str = "America/New_York"
 
@@ -145,7 +165,7 @@ def session_label() -> str:
 
 def send_telegram(text: str):
     if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
-        print("[WARN] Telegram env vars not set. Printing:\n", text)
+        print("[WARN] Telegram env vars not set. Printing message:\n", text)
         return
 
     url = f"https://api.telegram.org/bot{CFG.telegram_bot_token}/sendMessage"
@@ -155,6 +175,7 @@ def send_telegram(text: str):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
+
     for attempt in range(3):
         try:
             r = requests.post(url, json=payload, timeout=15)
@@ -167,7 +188,7 @@ def send_telegram(text: str):
 
 
 # =========================
-# Yahoo fetching (with retry)
+# Yahoo fetching (retry)
 # =========================
 
 def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
@@ -183,7 +204,7 @@ def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
                 threads=True
             )
             if df is None or df.empty:
-                raise RuntimeError(f"Yahoo empty data {symbol} interval={interval} period={period}")
+                raise RuntimeError(f"Yahoo empty data: {symbol} interval={interval} period={period}")
 
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0].lower() for c in df.columns]
@@ -192,7 +213,10 @@ def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
 
             for c in ["open", "high", "low", "close"]:
                 if c not in df.columns:
-                    raise RuntimeError(f"Missing column '{c}'")
+                    raise RuntimeError(f"Missing column '{c}' in Yahoo data")
+            if "volume" not in df.columns:
+                # some feeds may omit volume; we handle gracefully
+                df["volume"] = np.nan
 
             if df.index.tz is None:
                 df.index = df.index.tz_localize(timezone.utc)
@@ -215,8 +239,8 @@ def fetch_timeframes():
     df_15m = apply_es_adjustment(_yf_download(sym, "15m", "30d"))
     df_1h  = apply_es_adjustment(_yf_download(sym, "60m", "90d"))
 
-    agg = {"open":"first","high":"max","low":"min","close":"last"}
-    df_4h = df_1h.resample("4h").agg(agg).dropna()
+    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+    df_4h = df_1h.resample("4h").agg(agg).dropna(subset=["open","high","low","close"])
     return sym, df_4h, df_1h, df_15m, df_5m
 
 
@@ -323,7 +347,7 @@ def near_level(price: float, level: float, tol_frac: float) -> bool:
 # Indicators (5m)
 # =========================
 
-def compute_indicators(df_5m: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     out = df_5m.copy()
     out["rsi"] = RSIIndicator(close=out["close"], window=14).rsi()
     st = StochRSIIndicator(close=out["close"], window=14, smooth1=3, smooth2=3)
@@ -342,9 +366,9 @@ def stoch_cross(df_5m: pd.DataFrame, direction: str) -> bool:
     prev = k[-2] - d[-2]
     curr = k[-1] - d[-1]
     if direction == "BUY":
-        return prev < 0 and curr > 0 and np.min(k) < 0.25
+        return prev < 0 and curr > 0 and np.nanmin(k) < 0.25
     if direction == "SELL":
-        return prev > 0 and curr < 0 and np.max(k) > 0.75
+        return prev > 0 and curr < 0 and np.nanmax(k) > 0.75
     return False
 
 def momentum_shift(df_5m: pd.DataFrame, direction: str) -> bool:
@@ -473,7 +497,7 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list[float], level_hit: floa
 
 
 # =========================
-# Bot State
+# Bot state
 # =========================
 
 class BotState:
@@ -482,21 +506,17 @@ class BotState:
         self.last_signal_ts = {}
         self.active_trade = None
 
-        # daily reset
         self.last_reset_date_riyadh = None
         self.no_signal_until_utc = None
 
-        # market state cache
         self.market_state_last_calc_utc = None
         self.market_state_label = "Unknown"
         self.market_state_dir = "Neutral"
         self.market_state_adx = None
 
     def can_signal(self, key: str) -> bool:
-        # global no-signal window
         if self.no_signal_until_utc is not None and datetime.utcnow() < self.no_signal_until_utc:
             return False
-
         last = self.last_signal_ts.get(key)
         if last is None:
             return True
@@ -519,11 +539,9 @@ def maybe_daily_reset():
     t = now_riyadh()
     today = t.date()
 
-    # already reset today?
     if STATE.last_reset_date_riyadh == today:
         return
 
-    # within reset window after midnight
     is_midnight_window = (
         t.hour == CFG.daily_reset_hour and
         CFG.daily_reset_minute <= t.minute < (CFG.daily_reset_minute + CFG.daily_reset_window_minutes)
@@ -531,7 +549,6 @@ def maybe_daily_reset():
     if not is_midnight_window:
         return
 
-    # close any active trade
     if STATE.active_trade is not None:
         send_telegram(
             f"🛎️ {CFG.user_title} — Daily Reset (Riyadh)\n"
@@ -551,19 +568,10 @@ def maybe_daily_reset():
 
 
 # =========================
-# Market State (fast & stable)
+# Market State (fast + stable)
 # =========================
 
 def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
-    """
-    Fast driver: 1H ADX + structure direction
-    Anchor info: 4H bias (only informational)
-
-    Hysteresis:
-    - Enter Trending when ADX >= 25
-    - Enter Range when ADX <= 20
-    - Between: Weak/Transition unless keeping previous state
-    """
     if len(df_1h) < (CFG.adx_window + 5):
         return "Weak", "Neutral", None
 
@@ -582,13 +590,12 @@ def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
     if adx_val is None or np.isnan(adx_val):
         return "Weak", direction, None
 
-    # hysteresis logic
+    # hysteresis
     if adx_val >= CFG.adx_trending_on:
         label = "Trending"
     elif adx_val <= CFG.adx_range_on:
         label = "Range"
     else:
-        # in-between
         if prev == "Trending" and adx_val > CFG.adx_range_on:
             label = "Trending"
         elif prev == "Range" and adx_val < CFG.adx_trending_on:
@@ -616,7 +623,186 @@ def maybe_update_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
 
 
 # =========================
-# Trade status helpers
+# Liquidity + Expected Move + ETA + Probability
+# =========================
+
+def liquidity_state(df_5m_raw: pd.DataFrame) -> tuple[str, float | None]:
+    """
+    Uses volume ratio = current_volume / avg_volume(lookback).
+    Returns (state, ratio). If volume missing -> ("Normal", None).
+    """
+    if "volume" not in df_5m_raw.columns:
+        return "Normal", None
+
+    v = df_5m_raw["volume"].astype(float)
+    if v.isna().all():
+        return "Normal", None
+
+    look = min(CFG.liquidity_lookback_5m, len(v))
+    if look < 10:
+        return "Normal", None
+
+    avg = float(v.tail(look).mean())
+    cur = float(v.iloc[-1])
+    if not np.isfinite(avg) or avg <= 0 or not np.isfinite(cur):
+        return "Normal", None
+
+    ratio = cur / avg
+    t_low, t_high, t_ext = CFG.liquidity_state_thresholds
+    if ratio < t_low:
+        return "Low", ratio
+    if ratio < t_high:
+        return "Normal", ratio
+    if ratio < t_ext:
+        return "High", ratio
+    return "Extreme", ratio
+
+def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
+    """
+    Expected Move (1H) ≈ ATR(1H)
+    """
+    if len(df_1h) < (CFG.expected_move_atr_window + 5):
+        return None
+    atr = AverageTrueRange(
+        high=df_1h["high"], low=df_1h["low"], close=df_1h["close"],
+        window=CFG.expected_move_atr_window
+    ).average_true_range()
+    val = float(atr.iloc[-1])
+    if not np.isfinite(val) or val <= 0:
+        return None
+    return val
+
+def eta_to_t1_minutes(df_5m: pd.DataFrame, price_now: float, t1: float, direction: str, liq_state: str) -> tuple[int, int] | None:
+    """
+    ETA based on velocity of recent 5m price changes.
+    Return (min_eta, max_eta) in minutes.
+    """
+    if t1 is None or not np.isfinite(t1):
+        return None
+
+    look = min(CFG.eta_velocity_lookback_5m, len(df_5m))
+    if look < 8:
+        return None
+
+    closes = df_5m["close"].tail(look).astype(float)
+    diffs = closes.diff().abs().dropna()
+    if diffs.empty:
+        return None
+
+    # velocity: points per minute (5m candles => each diff roughly per 5 min)
+    avg_abs_move_per_5m = float(diffs.mean())
+    vel = max(avg_abs_move_per_5m / 5.0, CFG.eta_min_velocity_pts_per_min)
+
+    dist = (t1 - price_now) if direction == "BUY" else (price_now - t1)
+    dist = abs(float(dist))
+    if dist < 0.1:
+        return (1, 5)
+
+    base = dist / vel  # minutes
+
+    # liquidity adjustment
+    mult = 1.0
+    if liq_state == "Low":
+        mult = 1.35
+    elif liq_state == "Normal":
+        mult = 1.05
+    elif liq_state == "High":
+        mult = 0.90
+    elif liq_state == "Extreme":
+        mult = 0.80
+
+    eta = base * mult
+
+    # provide band (±25%)
+    lo = int(max(5, round(eta * 0.75)))
+    hi = int(max(lo + 5, round(eta * 1.25)))
+    return lo, hi
+
+def confidence_percent(score: int, direction: str, bias: str, session: str, market_state_label: str, liq_state: str) -> int:
+    """
+    Score-based confidence + small nudges. Bounded.
+    """
+    base = int(round((score / 6) * 100))
+    adj = 0
+
+    # with bias bonus
+    if (bias == "Bullish" and direction == "BUY") or (bias == "Bearish" and direction == "SELL"):
+        adj += 5
+
+    # session / liquidity nudges
+    if session in ("After-Hours", "Pre-Market"):
+        adj -= 5
+
+    if liq_state == "High":
+        adj += 3
+    elif liq_state == "Extreme":
+        adj += 5
+    elif liq_state == "Low":
+        adj -= 5
+
+    # market state nudges (soft)
+    if market_state_label == "Trending" and ((bias == "Bullish" and direction == "BUY") or (bias == "Bearish" and direction == "SELL")):
+        adj += 3
+    if market_state_label == "Range" and bias == "Weak":
+        adj += 2
+
+    val = max(5, min(95, base + adj))
+    return int(val)
+
+def probability_t1_t2(conf: int, rr: float | None, dist_t1: float | None, dist_t2: float | None,
+                     exp_move_1h: float | None, liq_state: str, market_state_label: str) -> tuple[int, int]:
+    """
+    Heuristic probability. Not a guarantee. Bounded 5..95.
+    """
+    t1 = float(conf)
+
+    # RR penalty (bigger RR means farther target)
+    if rr is not None and np.isfinite(rr):
+        if rr > 2.5:
+            t1 -= 8
+        elif rr > 2.0:
+            t1 -= 5
+        elif rr < 1.7:
+            t1 += 2
+
+    # liquidity effect
+    if liq_state == "Low":
+        t1 -= 5
+    elif liq_state == "High":
+        t1 += 2
+    elif liq_state == "Extreme":
+        t1 += 3
+
+    # market state effect (very light)
+    if market_state_label == "Range":
+        t1 += 2
+    elif market_state_label == "Trending":
+        t1 += 1
+
+    # expected move sanity
+    if exp_move_1h is not None and dist_t1 is not None and np.isfinite(dist_t1):
+        if dist_t1 > exp_move_1h * 1.20:
+            t1 -= 12
+        elif dist_t1 > exp_move_1h * 1.00:
+            t1 -= 6
+
+    t1 = max(5, min(95, int(round(t1))))
+
+    # T2 probability scales down
+    t2 = t1
+    if dist_t1 is not None and dist_t2 is not None and np.isfinite(dist_t1) and np.isfinite(dist_t2) and dist_t2 > 0:
+        ratio = max(1.0, dist_t2 / max(dist_t1, 1e-9))
+        # farther target => lower prob
+        t2 = int(round(t1 * (0.70 / ratio)))
+    else:
+        t2 = int(round(t1 * 0.65))
+
+    t2 = max(5, min(t1, min(90, t2)))
+    return int(t1), int(t2)
+
+
+# =========================
+# Trade tracking (events)
 # =========================
 
 def _fmt_level(x):
@@ -625,138 +811,6 @@ def _fmt_level(x):
     if isinstance(x, (int, float)):
         return f"{x:.1f}"
     return str(x)
-
-def trade_details_line(tr: dict | None, price: float) -> tuple[str, str]:
-    if not tr:
-        return "None", "-"
-
-    status = tr.get("status", "Unknown")
-    direction = tr.get("direction", "?")
-    entry = float(tr.get("entry", np.nan))
-    stop = float(tr.get("stop", np.nan))
-    t1 = tr.get("t1", None)
-    t2 = tr.get("t2", None)
-
-    d_to_entry = (price - entry) if direction == "BUY" else (entry - price)
-    d_to_t1 = None
-    if t1 is not None and np.isfinite(entry):
-        d_to_t1 = (t1 - price) if direction == "BUY" else (price - t1)
-
-    details = (
-        f"{direction} | E:{entry:.1f} SL:{stop:.1f} "
-        f"T1:{_fmt_level(t1)} T2:{_fmt_level(t2)} | "
-        f"ΔEntry:{d_to_entry:+.1f}"
-    )
-    if d_to_t1 is not None:
-        details += f" | ΔT1:{d_to_t1:+.1f}"
-
-    return status, details
-
-
-# =========================
-# Messages
-# =========================
-
-def hourly_msg(session: str, symbol: str, bias: str, levels: list[float], price: float) -> str:
-    tr = STATE.active_trade
-    status_line, details_line = trade_details_line(tr, price)
-
-    adx_txt = "N/A" if STATE.market_state_adx is None else f"{STATE.market_state_adx:.1f}"
-    mkt_txt = f"{STATE.market_state_label} | Dir: {STATE.market_state_dir} | ADX(1H): {adx_txt}"
-
-    reset_block = ""
-    if STATE.no_signal_until_utc is not None and datetime.utcnow() < STATE.no_signal_until_utc:
-        left = int((STATE.no_signal_until_utc - datetime.utcnow()).total_seconds() // 60)
-        reset_block = f"\n🧊 No-signal window: {left} min (after reset)"
-
-    return (
-        f"👋 {CFG.user_title}\n"
-        f"🕐 Hourly Update ({now_riyadh().strftime('%Y-%m-%d %H:%M')} Riyadh)\n"
-        f"🏷️ Session: {session}\n"
-        f"📌 Source: Yahoo | Symbol: {symbol}\n"
-        f"🧭 Bias (1H/4H): <b>{bias}</b>\n"
-        f"📈 Market State: <b>{mkt_txt}</b>{reset_block}\n"
-        f"💵 Price: {price:.1f}\n"
-        f"🧱 Key Levels: {fmt_levels(levels)}\n"
-        f"📌 Active Trade: <b>{status_line}</b>\n"
-        f"🧾 Trade: {details_line}\n"
-        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
-    )
-
-def signal_msg(session: str, symbol: str, bias: str, direction: str, level_hit: float, score: int, reasons: list[str], plan: dict, mode: str) -> str:
-    rr_txt = f"{plan['rr']:.2f}" if plan["rr"] is not None else "N/A"
-    t1_txt = f"{plan['t1']:.1f}" if plan["t1"] is not None else "N/A"
-    t2_txt = f"{plan['t2']:.1f}" if plan["t2"] is not None else "N/A"
-    adx_txt = "N/A" if STATE.market_state_adx is None else f"{STATE.market_state_adx:.1f}"
-    mkt_txt = f"{STATE.market_state_label} | {STATE.market_state_dir} | ADX(1H): {adx_txt}"
-
-    return (
-        f"🚨 {CFG.user_title} — فرصة دخول ({mode})\n"
-        f"🕒 Time: {now_riyadh().strftime('%Y-%m-%d %H:%M')} (Riyadh)\n"
-        f"🏷️ Session: {session}\n"
-        f"📌 Source: Yahoo | Symbol: {symbol}\n"
-        f"📈 Market State: <b>{mkt_txt}</b>\n"
-        f"📍 Direction: <b>{direction}</b>\n"
-        f"🧭 Context Bias (1H/4H): <b>{bias}</b>\n"
-        f"🧱 Level: {level_hit:.1f}\n\n"
-        f"✅ Entry: <b>{plan['entry']:.1f}</b>\n"
-        f"🛑 Stop: <b>{plan['stop']:.1f}</b>\n"
-        f"🎯 Target 1: <b>{t1_txt}</b>\n"
-        f"🎯 Target 2: <b>{t2_txt}</b>\n"
-        f"📐 RR (to T1): <b>{rr_txt}</b>\n\n"
-        f"⭐ Score: <b>{score}/6</b>\n"
-        f"🧠 Reason: {', '.join(reasons)}\n"
-        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
-    )
-
-
-# =========================
-# Scoring
-# =========================
-
-def score_setup(df_5m: pd.DataFrame, bias: str, level_hit: float, direction: str, is_sweep: bool) -> tuple[int, list[str], str]:
-    score = 0
-    reasons = []
-    trigger = None
-
-    if is_sweep:
-        score += 2
-        reasons.append("Liquidity Sweep")
-        trigger = "Sweep"
-
-    br = break_retest(df_5m, level_hit, direction)
-    rj = rejection_lite(df_5m, direction)
-
-    if br:
-        score += 2
-        reasons.append("Break&Retest")
-        trigger = trigger or "Break&Retest"
-    if rj:
-        score += 2
-        reasons.append("Rejection")
-        trigger = trigger or "Rejection"
-
-    if stoch_cross(df_5m, direction):
-        score += 1
-        reasons.append("Stoch RSI cross")
-    if momentum_shift(df_5m, direction):
-        score += 1
-        reasons.append("Momentum shift")
-
-    if (bias == "Bullish" and direction == "BUY") or (bias == "Bearish" and direction == "SELL"):
-        score += 1
-        reasons.append("Trend bonus")
-
-    score = min(score, 6)
-
-    if trigger is None:
-        return 0, ["No trigger"], "None"
-    return score, reasons, trigger
-
-
-# =========================
-# Trade tracking (events only)
-# =========================
 
 def update_active_trade(df_5m: pd.DataFrame, last_price: float):
     tr = STATE.active_trade
@@ -859,47 +913,178 @@ def update_active_trade(df_5m: pd.DataFrame, last_price: float):
 
 
 # =========================
+# Messages
+# =========================
+
+def hourly_msg(session: str, symbol: str, bias: str, levels: list[float], price: float) -> str:
+    adx_txt = "N/A" if STATE.market_state_adx is None else f"{STATE.market_state_adx:.1f}"
+    mkt_txt = f"{STATE.market_state_label} | {STATE.market_state_dir} | ADX(1H): {adx_txt}"
+
+    status = "None" if STATE.active_trade is None else STATE.active_trade.get("status", "Unknown")
+
+    reset_block = ""
+    if STATE.no_signal_until_utc is not None and datetime.utcnow() < STATE.no_signal_until_utc:
+        left = int((STATE.no_signal_until_utc - datetime.utcnow()).total_seconds() // 60)
+        reset_block = f"\n🧊 No-signal window: {left} min (after reset)"
+
+    return (
+        f"👋 {CFG.user_title}\n"
+        f"🕐 Hourly Update ({now_riyadh().strftime('%Y-%m-%d %H:%M')} Riyadh)\n"
+        f"🏷️ Session: {session}\n"
+        f"📌 Source: Yahoo | Symbol: {symbol}\n"
+        f"🧭 Bias (1H/4H): <b>{bias}</b>\n"
+        f"📈 Market State: <b>{mkt_txt}</b>{reset_block}\n"
+        f"💵 Price: {price:.1f}\n"
+        f"🧱 Key Levels: {fmt_levels(levels)}\n"
+        f"📌 Active Trade: <b>{status}</b>\n"
+        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
+    )
+
+def signal_msg_format(
+    session: str,
+    symbol: str,
+    market_state_str: str,
+    liquidity_str: str,
+    level_now: float,
+    direction: str,
+    bias: str,
+    level_hit: float,
+    plan: dict,
+    rr: float | None,
+    score: int,
+    confidence: int,
+    p_t1: int,
+    p_t2: int,
+    exp_move: float | None,
+    eta_band: tuple[int, int] | None,
+    reasons: list[str],
+) -> str:
+    t1_txt = f"{plan['t1']:.1f}" if plan["t1"] is not None else "N/A"
+    t2_txt = f"{plan['t2']:.1f}" if plan["t2"] is not None else "N/A"
+    rr_txt = f"{rr:.2f}" if rr is not None and np.isfinite(rr) else "N/A"
+    exp_txt = f"±{exp_move:.0f} pts" if exp_move is not None and np.isfinite(exp_move) else "N/A"
+    eta_txt = "N/A" if eta_band is None else f"{eta_band[0]}–{eta_band[1]} min"
+
+    return (
+        f"🚨 {CFG.user_title} — فرصة دخول (Hunter Smart)\n\n"
+        f"🕒 Time: {now_riyadh().strftime('%Y-%m-%d %H:%M')} (Riyadh)\n"
+        f"🏷️ Session: {session}\n"
+        f"📌 Source: Yahoo | Symbol: {symbol}\n\n"
+        f"📊 Market State: {market_state_str}\n"
+        f"💧 Liquidity: {liquidity_str}\n"
+        f"💰 Level Now: {level_now:.1f}\n\n"
+        f"📍 Direction: {direction}\n"
+        f"🧱 Level: {level_hit:.1f}\n\n"
+        f"✅ Entry: {plan['entry']:.1f}\n"
+        f"🛑 Stop: {plan['stop']:.1f}\n"
+        f"🎯 Target 1: {t1_txt}\n"
+        f"🎯 Target 2: {t2_txt}\n\n"
+        f"📐 RR: {rr_txt}\n"
+        f"⭐ Score: {score}/6\n"
+        f"🔎 Confidence: {confidence}%\n\n"
+        f"📊 Probability\n"
+        f"T1 Hit: {p_t1}%\n"
+        f"T2 Hit: {p_t2}%\n\n"
+        f"📈 Expected Move (1H): {exp_txt}\n"
+        f"⏱ ETA to T1: {eta_txt}\n\n"
+        f"🧠 Reason: {', '.join(reasons)}\n"
+        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
+    )
+
+
+# =========================
+# Scoring
+# =========================
+
+def score_setup(df_5m: pd.DataFrame, bias: str, level_hit: float, direction: str, is_sweep: bool) -> tuple[int, list[str], str]:
+    score = 0
+    reasons = []
+    trigger = None
+
+    if is_sweep:
+        score += 2
+        reasons.append("Liquidity Sweep")
+        trigger = "Sweep"
+
+    br = break_retest(df_5m, level_hit, direction)
+    rj = rejection_lite(df_5m, direction)
+
+    if br:
+        score += 2
+        reasons.append("Break&Retest")
+        trigger = trigger or "Break&Retest"
+    if rj:
+        score += 2
+        reasons.append("Rejection")
+        trigger = trigger or "Rejection"
+
+    if stoch_cross(df_5m, direction):
+        score += 1
+        reasons.append("Stoch RSI cross")
+    if momentum_shift(df_5m, direction):
+        score += 1
+        reasons.append("Momentum shift")
+
+    if (bias == "Bullish" and direction == "BUY") or (bias == "Bearish" and direction == "SELL"):
+        score += 1
+        reasons.append("Trend bonus")
+
+    score = min(score, 6)
+
+    if trigger is None:
+        return 0, ["No trigger"], "None"
+    return score, reasons, trigger
+
+
+# =========================
 # Main evaluation
 # =========================
 
 def evaluate_once():
-    # 1) Daily reset first (prevents signal/close loop)
+    # 1) daily reset first
     maybe_daily_reset()
 
     session = session_label()
     symbol, df_4h, df_1h, df_15m, df_5m_raw = fetch_timeframes()
-    df_5m = compute_indicators(df_5m_raw)
+    df_5m = compute_indicators_5m(df_5m_raw)
 
-    price = float(df_5m["close"].iloc[-1])
+    price_now = float(df_5m["close"].iloc[-1])
     bias = structure_bias(df_1h, df_4h)
     key_levels = extract_key_levels(df_15m, df_1h)
 
-    # 2) Market state update (every 15 min)
+    # 2) market state update
     maybe_update_market_state(df_1h, df_4h)
+    adx_txt = "N/A" if STATE.market_state_adx is None else f"{STATE.market_state_adx:.1f}"
+    market_state_str = f"{STATE.market_state_label} | {STATE.market_state_dir} | ADX(1H): {adx_txt}"
 
-    # 3) Track active trade (events)
-    update_active_trade(df_5m, price)
+    # 3) liquidity
+    liq_state, _liq_ratio = liquidity_state(df_5m_raw)
 
-    # 4) Hourly update (includes trade status + market state)
+    # 4) trade tracking
+    update_active_trade(df_5m, price_now)
+
+    # 5) hourly update
     if CFG.hourly_update:
         current_hour = now_riyadh().replace(minute=0, second=0, microsecond=0)
         if STATE.last_hour_sent is None or current_hour > STATE.last_hour_sent:
-            send_telegram(hourly_msg(session, symbol, bias, key_levels, price))
+            send_telegram(hourly_msg(session, symbol, bias, key_levels, price_now))
             STATE.last_hour_sent = current_hour
 
-    # 5) Respect no-signal window after reset
+    # 6) respect no-signal window after reset
     if STATE.no_signal_until_utc is not None and datetime.utcnow() < STATE.no_signal_until_utc:
         return
 
-    # 6) One trade at a time
+    # 7) one trade at a time
     if STATE.active_trade is not None:
         return
 
-    # ---------- Sweep-first logic ----------
+    # =========================
+    # Sweep-first logic
+    # =========================
     sweep_levels = compute_sweep_levels(df_1h, df_15m, key_levels)
     sweep_hit = None
     sweep_dir = ""
-    for lvl in sorted(sweep_levels, key=lambda x: abs(x - price))[:12]:
+    for lvl in sorted(sweep_levels, key=lambda x: abs(x - price_now))[:12]:
         is_sw, d = detect_sweep(df_5m, float(lvl))
         if is_sw:
             sweep_hit = float(lvl)
@@ -915,14 +1100,49 @@ def evaluate_once():
         direction = sweep_dir
         level_hit = sweep_hit
 
-        score, reasons, trigger = score_setup(df_5m, bias, level_hit, direction, is_sweep=True)
+        score, reasons, _trigger = score_setup(df_5m, bias, level_hit, direction, is_sweep=True)
         if score >= CFG.signal_score_threshold:
             plan = compute_trade_plan(df_5m, key_levels, level_hit, direction, trigger="Sweep")
-            if plan["rr"] is None or plan["rr"] >= CFG.min_rr_to_t1:
+            rr = plan["rr"]
+            if rr is None or rr >= CFG.min_rr_to_t1:
                 key = f"SWEEP:{direction}:{round(level_hit,1)}"
                 if STATE.can_signal(key):
-                    mode = "Counter-Trend Scalp" if ((bias == "Bearish" and direction == "BUY") or (bias == "Bullish" and direction == "SELL")) else "Hunter Smart"
-                    send_telegram(signal_msg(session, symbol, bias, direction, level_hit, score, reasons, plan, mode))
+                    # ---- metrics ----
+                    conf = confidence_percent(score, direction, bias, session, STATE.market_state_label, liq_state)
+                    exp = expected_move_1h(df_1h)
+
+                    dist_t1 = None
+                    dist_t2 = None
+                    if plan["t1"] is not None:
+                        dist_t1 = abs((plan["t1"] - price_now) if direction == "BUY" else (price_now - plan["t1"]))
+                    if plan["t2"] is not None:
+                        dist_t2 = abs((plan["t2"] - price_now) if direction == "BUY" else (price_now - plan["t2"]))
+
+                    p1, p2 = probability_t1_t2(conf, rr, dist_t1, dist_t2, exp, liq_state, STATE.market_state_label)
+                    eta = None
+                    if plan["t1"] is not None:
+                        eta = eta_to_t1_minutes(df_5m, price_now, float(plan["t1"]), direction, liq_state)
+
+                    msg = signal_msg_format(
+                        session=session,
+                        symbol=symbol,
+                        market_state_str=market_state_str,
+                        liquidity_str=liq_state,
+                        level_now=price_now,
+                        direction=direction,
+                        bias=bias,
+                        level_hit=level_hit,
+                        plan=plan,
+                        rr=rr,
+                        score=score,
+                        confidence=conf,
+                        p_t1=p1,
+                        p_t2=p2,
+                        exp_move=exp,
+                        eta_band=eta,
+                        reasons=reasons,
+                    )
+                    send_telegram(msg)
                     STATE.mark_signal(key)
                     STATE.active_trade = {
                         "direction": direction,
@@ -936,16 +1156,18 @@ def evaluate_once():
                     }
         return
 
-    # ---------- Normal logic: must be near a key level ----------
+    # =========================
+    # Normal logic: must be near a key level
+    # =========================
     if not key_levels:
         return
 
-    nearby = [lvl for lvl in key_levels if near_level(price, lvl, CFG.level_touch_tolerance)]
+    nearby = [lvl for lvl in key_levels if near_level(price_now, lvl, CFG.level_touch_tolerance)]
     if not nearby:
         return
-    level_hit = float(min(nearby, key=lambda x: abs(x - price)))
+    level_hit = float(min(nearby, key=lambda x: abs(x - price_now)))
 
-    # Direction: prefer bias, else micro drift
+    # direction preference
     if bias == "Bullish":
         direction = "BUY"
     elif bias == "Bearish":
@@ -960,14 +1182,51 @@ def evaluate_once():
         return
 
     plan = compute_trade_plan(df_5m, key_levels, level_hit, direction, trigger=trigger)
-    if plan["rr"] is not None and plan["rr"] < CFG.min_rr_to_t1:
+    rr = plan["rr"]
+    if rr is not None and rr < CFG.min_rr_to_t1:
         return
 
     key = f"NORM:{direction}:{round(level_hit,1)}"
     if not STATE.can_signal(key):
         return
 
-    send_telegram(signal_msg(session, symbol, bias, direction, level_hit, score, reasons, plan, "Hunter Smart"))
+    # ---- metrics ----
+    conf = confidence_percent(score, direction, bias, session, STATE.market_state_label, liq_state)
+    exp = expected_move_1h(df_1h)
+
+    dist_t1 = None
+    dist_t2 = None
+    if plan["t1"] is not None:
+        dist_t1 = abs((plan["t1"] - price_now) if direction == "BUY" else (price_now - plan["t1"]))
+    if plan["t2"] is not None:
+        dist_t2 = abs((plan["t2"] - price_now) if direction == "BUY" else (price_now - plan["t2"]))
+
+    p1, p2 = probability_t1_t2(conf, rr, dist_t1, dist_t2, exp, liq_state, STATE.market_state_label)
+
+    eta = None
+    if plan["t1"] is not None:
+        eta = eta_to_t1_minutes(df_5m, price_now, float(plan["t1"]), direction, liq_state)
+
+    msg = signal_msg_format(
+        session=session,
+        symbol=symbol,
+        market_state_str=market_state_str,
+        liquidity_str=liq_state,
+        level_now=price_now,
+        direction=direction,
+        bias=bias,
+        level_hit=level_hit,
+        plan=plan,
+        rr=rr,
+        score=score,
+        confidence=conf,
+        p_t1=p1,
+        p_t2=p2,
+        exp_move=exp,
+        eta_band=eta,
+        reasons=reasons,
+    )
+    send_telegram(msg)
     STATE.mark_signal(key)
 
     STATE.active_trade = {
@@ -987,12 +1246,11 @@ def main():
         f"✅ {CFG.user_title} — Bot started\n"
         f"Rules:\n"
         f"- All Sessions: {CFG.es_symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
-        f"- Hourly Update: ON (includes Active Trade + Market State)\n"
-        f"- Market State: ADX(1H)+Structure, updated every {CFG.market_state_update_minutes}m\n"
+        f"- Hourly Update: ON\n"
+        f"- Market State: ADX(1H)+Structure, update {CFG.market_state_update_minutes}m\n"
         f"- Daily Reset: {CFG.daily_reset_hour:02d}:{CFG.daily_reset_minute:02d} Riyadh + No-signal {CFG.no_signal_after_reset_minutes}m\n"
-        f"- Signals: Hunter Smart (Score ≥ {CFG.signal_score_threshold}, RR ≥ {CFG.min_rr_to_t1})\n"
-        f"- Sweep: Smarter + Stoch confirm\n"
-        f"- Trade Tracking: ON"
+        f"- Signals: Score ≥ {CFG.signal_score_threshold}, RR ≥ {CFG.min_rr_to_t1}\n"
+        f"- Extras: Liquidity + Level Now + Confidence + Prob(T1/T2) + Expected Move + ETA"
     )
 
     while True:
