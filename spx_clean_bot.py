@@ -1,28 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-ES Trading Bot — Hunter Smart + Smarter Liquidity Sweep + Trade Tracking + Hourly Trade Status + Daily Stats
-(per Dr. Mohammed)
+ES Trading Bot — Hunter Smart + Smarter Liquidity Sweep + Trade Tracking
++ Hourly Trade Status
++ Daily Reset at Midnight (Riyadh) + No-Signal Window
++ Market State (Trending/Range/Weak) via 1H ADX + Structure, updated every 15 min
 
+(per Dr. Mohammed)
 Data: Yahoo Finance (yfinance)
 Symbol: ES=F always (Pre/Market/After)
 Adjustment: -10 points always (match TradingView baseline)
 
-Timeframes:
-- 1H + 4H: context/structure + swings
-- 15m: key levels + 24h highs/lows
-- 5m: entries + confirmations + sweep detection + trade tracking
-
 Railway env vars:
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
-
-requirements.txt:
-yfinance
-pandas
-numpy
-requests
-ta
-tzdata
 """
 
 import os
@@ -36,7 +26,7 @@ import requests
 import yfinance as yf
 
 from ta.momentum import RSIIndicator, StochRSIIndicator
-from ta.trend import EMAIndicator, MACD
+from ta.trend import EMAIndicator, MACD, ADXIndicator
 
 try:
     from zoneinfo import ZoneInfo
@@ -69,13 +59,12 @@ class Config:
 
     # Trade tracking
     progress_notify_frac: float = 0.50
-    tracking_poll_seconds: int = 30
 
-    # Smart stop confirmation (reduce false "stop hit")
+    # Smart stop confirmation
     stop_confirm_seconds: int = 120
     stop_stoch_confirm: bool = True
 
-    # Liquidity sweep (smarter)
+    # Liquidity sweep
     sweep_close_required: bool = True
     sweep_wick_min_points: float = 1.5
     sweep_stoch_confirm: bool = True
@@ -84,10 +73,18 @@ class Config:
     # Hourly update
     hourly_update: bool = True
 
-    # Trade lifetime controls
-    expire_at_rth_close: bool = True            # close trade at NY 16:00
-    max_pending_minutes: int = 120              # cancel pending after X minutes
-    max_live_hours: int = 8                     # safety: close live trade after X hours
+    # Daily reset (Riyadh midnight)
+    daily_reset_enabled: bool = True
+    daily_reset_hour: int = 0
+    daily_reset_minute: int = 0
+    daily_reset_window_minutes: int = 5   # if time is within first 5 minutes after midnight -> do reset once
+    no_signal_after_reset_minutes: int = 10
+
+    # Market State (fast update)
+    market_state_update_minutes: int = 15
+    adx_window: int = 14
+    adx_trending_on: float = 25.0
+    adx_range_on: float = 20.0
 
     # Loop
     loop_sleep_seconds: int = 30
@@ -128,14 +125,6 @@ def now_riyadh() -> datetime:
 
 def now_ny() -> datetime:
     return datetime.now(TZ_NY)
-
-def rth_close_dt_ny(ref: datetime | None = None) -> datetime:
-    """RTH close = 16:00 New York time (same calendar day)."""
-    t = ref or now_ny()
-    return t.replace(hour=16, minute=0, second=0, microsecond=0)
-
-def is_after_rth_close() -> bool:
-    return now_ny() >= rth_close_dt_ny()
 
 def session_label() -> str:
     t = now_ny()
@@ -232,7 +221,7 @@ def fetch_timeframes():
 
 
 # =========================
-# Pivots / structure
+# Structure / pivots
 # =========================
 
 def find_pivots(series: pd.Series, left: int, right: int):
@@ -307,27 +296,13 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list[float]
     range_hi = float(recent["high"].max())
     range_lo = float(recent["low"].min())
 
-    # Prev day hi/lo (Riyadh date)
-    prev = df_15m.tail(96*2).copy()
-    prev_local = prev.copy()
-    prev_local.index = prev_local.index.tz_convert(TZ_RIYADH)
-    prev_local["date"] = prev_local.index.date
-    dates = sorted(prev_local["date"].unique())
-    prev_day = dates[-2] if len(dates) >= 2 else dates[-1]
-    prev_day_df = prev_local[prev_local["date"] == prev_day]
-    prev_day_hi = float(prev_day_df["high"].max()) if len(prev_day_df) else np.nan
-    prev_day_lo = float(prev_day_df["low"].min()) if len(prev_day_df) else np.nan
-
     candidates = []
     candidates += swing_highs + swing_lows
     candidates += [range_hi, range_lo]
-    if np.isfinite(prev_day_hi): candidates.append(prev_day_hi)
-    if np.isfinite(prev_day_lo): candidates.append(prev_day_lo)
 
     candidates = [float(x) for x in candidates if np.isfinite(x)]
     merged = cluster_levels(candidates, CFG.level_cluster_tolerance, price)
 
-    # keep around current price + extremes
     merged = sorted(merged, key=lambda x: abs(x - price))
     merged = merged[: max(CFG.max_levels * 2, 12)]
     merged = sorted(cluster_levels(merged, CFG.level_cluster_tolerance, price))
@@ -432,20 +407,16 @@ def compute_sweep_levels(df_1h: pd.DataFrame, df_15m: pd.DataFrame, key_levels: 
     return clustered
 
 def detect_sweep(df_5m: pd.DataFrame, level: float) -> tuple[bool, str]:
-    """
-    Sweep Up -> SELL idea: wick above level then close back below/at level
-    Sweep Down -> BUY idea: wick below level then close back above/at level
-    """
     c = df_5m.iloc[-1]
     h, l, cl = float(c["high"]), float(c["low"]), float(c["close"])
     min_wick = CFG.sweep_wick_min_points
 
-    # Sweep Up
+    # Sweep Up -> SELL
     if h >= level + min_wick:
         if (not CFG.sweep_close_required) or (cl <= level):
             return True, "SELL"
 
-    # Sweep Down
+    # Sweep Down -> BUY
     if l <= level - min_wick:
         if (not CFG.sweep_close_required) or (cl >= level):
             return True, "BUY"
@@ -483,7 +454,6 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list[float], level_hit: floa
             entry = float(last["low"] - buffer)
             stop  = float(max(last["high"], level_hit) + buffer)
     else:
-        # Break&Retest
         if direction == "BUY":
             entry = float(max(price, level_hit + buffer))
             stop  = float(level_hit - (price * 0.0015) - buffer)
@@ -503,7 +473,7 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list[float], level_hit: floa
 
 
 # =========================
-# State (cooldown, active trade, daily stats)
+# Bot State
 # =========================
 
 class BotState:
@@ -512,14 +482,21 @@ class BotState:
         self.last_signal_ts = {}
         self.active_trade = None
 
-        self.last_day = now_riyadh().date()
-        self.daily_trades = 0
-        self.daily_wins = 0
-        self.daily_losses = 0
-        self.daily_rr_sum = 0.0
-        self.daily_rr_count = 0
+        # daily reset
+        self.last_reset_date_riyadh = None
+        self.no_signal_until_utc = None
+
+        # market state cache
+        self.market_state_last_calc_utc = None
+        self.market_state_label = "Unknown"
+        self.market_state_dir = "Neutral"
+        self.market_state_adx = None
 
     def can_signal(self, key: str) -> bool:
+        # global no-signal window
+        if self.no_signal_until_utc is not None and datetime.utcnow() < self.no_signal_until_utc:
+            return False
+
         last = self.last_signal_ts.get(key)
         if last is None:
             return True
@@ -528,35 +505,114 @@ class BotState:
     def mark_signal(self, key: str):
         self.last_signal_ts[key] = datetime.utcnow()
 
-    def roll_day_if_needed(self):
-        today = now_riyadh().date()
-        if today != self.last_day:
-            self.send_daily_report(self.last_day)
-            self.last_day = today
-            self.daily_trades = 0
-            self.daily_wins = 0
-            self.daily_losses = 0
-            self.daily_rr_sum = 0.0
-            self.daily_rr_count = 0
-
-    def send_daily_report(self, day_date):
-        trades = self.daily_trades
-        wins = self.daily_wins
-        losses = self.daily_losses
-        winrate = (wins / trades * 100.0) if trades > 0 else 0.0
-        avg_rr = (self.daily_rr_sum / self.daily_rr_count) if self.daily_rr_count > 0 else 0.0
-
-        msg = (
-            f"📊 {CFG.user_title} — تقرير اليوم ({day_date})\n"
-            f"Trades: {trades}\n"
-            f"Wins: {wins}\n"
-            f"Losses: {losses}\n"
-            f"Winrate: {winrate:.0f}%\n"
-            f"Avg RR (to T1): {avg_rr:.2f}"
-        )
-        send_telegram(msg)
-
 STATE = BotState()
+
+
+# =========================
+# Daily reset (Riyadh midnight)
+# =========================
+
+def maybe_daily_reset():
+    if not CFG.daily_reset_enabled:
+        return
+
+    t = now_riyadh()
+    today = t.date()
+
+    # already reset today?
+    if STATE.last_reset_date_riyadh == today:
+        return
+
+    # within reset window after midnight
+    is_midnight_window = (
+        t.hour == CFG.daily_reset_hour and
+        CFG.daily_reset_minute <= t.minute < (CFG.daily_reset_minute + CFG.daily_reset_window_minutes)
+    )
+    if not is_midnight_window:
+        return
+
+    # close any active trade
+    if STATE.active_trade is not None:
+        send_telegram(
+            f"🛎️ {CFG.user_title} — Daily Reset (Riyadh)\n"
+            f"السبب: منتصف الليل بتوقيت السعودية.\n"
+            f"تم إغلاق الصفقة لتفادي التعليق وبداية يوم جديد."
+        )
+    else:
+        send_telegram(
+            f"🛎️ {CFG.user_title} — Daily Reset (Riyadh)\n"
+            f"السبب: منتصف الليل بتوقيت السعودية.\n"
+            f"لا توجد صفقة فعّالة — تم بدء يوم جديد."
+        )
+
+    STATE.active_trade = None
+    STATE.last_reset_date_riyadh = today
+    STATE.no_signal_until_utc = datetime.utcnow() + timedelta(minutes=CFG.no_signal_after_reset_minutes)
+
+
+# =========================
+# Market State (fast & stable)
+# =========================
+
+def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+    """
+    Fast driver: 1H ADX + structure direction
+    Anchor info: 4H bias (only informational)
+
+    Hysteresis:
+    - Enter Trending when ADX >= 25
+    - Enter Range when ADX <= 20
+    - Between: Weak/Transition unless keeping previous state
+    """
+    if len(df_1h) < (CFG.adx_window + 5):
+        return "Weak", "Neutral", None
+
+    adx = ADXIndicator(high=df_1h["high"], low=df_1h["low"], close=df_1h["close"], window=CFG.adx_window).adx()
+    adx_val = float(adx.iloc[-1]) if adx is not None and len(adx) else None
+
+    bias = structure_bias(df_1h, df_4h)
+    direction = "Neutral"
+    if bias == "Bullish":
+        direction = "Bullish"
+    elif bias == "Bearish":
+        direction = "Bearish"
+
+    prev = STATE.market_state_label
+
+    if adx_val is None or np.isnan(adx_val):
+        return "Weak", direction, None
+
+    # hysteresis logic
+    if adx_val >= CFG.adx_trending_on:
+        label = "Trending"
+    elif adx_val <= CFG.adx_range_on:
+        label = "Range"
+    else:
+        # in-between
+        if prev == "Trending" and adx_val > CFG.adx_range_on:
+            label = "Trending"
+        elif prev == "Range" and adx_val < CFG.adx_trending_on:
+            label = "Range"
+        else:
+            label = "Weak"
+
+    return label, direction, adx_val
+
+def maybe_update_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+    nowu = datetime.utcnow()
+    if STATE.market_state_last_calc_utc is None:
+        should = True
+    else:
+        should = (nowu - STATE.market_state_last_calc_utc) >= timedelta(minutes=CFG.market_state_update_minutes)
+
+    if not should:
+        return
+
+    label, direction, adx_val = compute_market_state(df_1h, df_4h)
+    STATE.market_state_label = label
+    STATE.market_state_dir = direction
+    STATE.market_state_adx = adx_val
+    STATE.market_state_last_calc_utc = nowu
 
 
 # =========================
@@ -571,11 +627,6 @@ def _fmt_level(x):
     return str(x)
 
 def trade_details_line(tr: dict | None, price: float) -> tuple[str, str]:
-    """
-    Returns:
-      status_line: "None" or "pending/live/..."
-      details_line: short details
-    """
     if not tr:
         return "None", "-"
 
@@ -586,7 +637,6 @@ def trade_details_line(tr: dict | None, price: float) -> tuple[str, str]:
     t1 = tr.get("t1", None)
     t2 = tr.get("t2", None)
 
-    # distances
     d_to_entry = (price - entry) if direction == "BUY" else (entry - price)
     d_to_t1 = None
     if t1 is not None and np.isfinite(entry):
@@ -611,9 +661,13 @@ def hourly_msg(session: str, symbol: str, bias: str, levels: list[float], price:
     tr = STATE.active_trade
     status_line, details_line = trade_details_line(tr, price)
 
-    extra = ""
-    if CFG.expire_at_rth_close:
-        extra = f"\n⏳ Trade auto-close: RTH 16:00 NY"
+    adx_txt = "N/A" if STATE.market_state_adx is None else f"{STATE.market_state_adx:.1f}"
+    mkt_txt = f"{STATE.market_state_label} | Dir: {STATE.market_state_dir} | ADX(1H): {adx_txt}"
+
+    reset_block = ""
+    if STATE.no_signal_until_utc is not None and datetime.utcnow() < STATE.no_signal_until_utc:
+        left = int((STATE.no_signal_until_utc - datetime.utcnow()).total_seconds() // 60)
+        reset_block = f"\n🧊 No-signal window: {left} min (after reset)"
 
     return (
         f"👋 {CFG.user_title}\n"
@@ -621,10 +675,11 @@ def hourly_msg(session: str, symbol: str, bias: str, levels: list[float], price:
         f"🏷️ Session: {session}\n"
         f"📌 Source: Yahoo | Symbol: {symbol}\n"
         f"🧭 Bias (1H/4H): <b>{bias}</b>\n"
+        f"📈 Market State: <b>{mkt_txt}</b>{reset_block}\n"
         f"💵 Price: {price:.1f}\n"
         f"🧱 Key Levels: {fmt_levels(levels)}\n"
         f"📌 Active Trade: <b>{status_line}</b>\n"
-        f"🧾 Trade: {details_line}{extra}\n"
+        f"🧾 Trade: {details_line}\n"
         f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
     )
 
@@ -632,11 +687,15 @@ def signal_msg(session: str, symbol: str, bias: str, direction: str, level_hit: 
     rr_txt = f"{plan['rr']:.2f}" if plan["rr"] is not None else "N/A"
     t1_txt = f"{plan['t1']:.1f}" if plan["t1"] is not None else "N/A"
     t2_txt = f"{plan['t2']:.1f}" if plan["t2"] is not None else "N/A"
+    adx_txt = "N/A" if STATE.market_state_adx is None else f"{STATE.market_state_adx:.1f}"
+    mkt_txt = f"{STATE.market_state_label} | {STATE.market_state_dir} | ADX(1H): {adx_txt}"
+
     return (
         f"🚨 {CFG.user_title} — فرصة دخول ({mode})\n"
         f"🕒 Time: {now_riyadh().strftime('%Y-%m-%d %H:%M')} (Riyadh)\n"
         f"🏷️ Session: {session}\n"
         f"📌 Source: Yahoo | Symbol: {symbol}\n"
+        f"📈 Market State: <b>{mkt_txt}</b>\n"
         f"📍 Direction: <b>{direction}</b>\n"
         f"🧭 Context Bias (1H/4H): <b>{bias}</b>\n"
         f"🧱 Level: {level_hit:.1f}\n\n"
@@ -652,7 +711,7 @@ def signal_msg(session: str, symbol: str, bias: str, direction: str, level_hit: 
 
 
 # =========================
-# Scoring (trend = bonus only)
+# Scoring
 # =========================
 
 def score_setup(df_5m: pd.DataFrame, bias: str, level_hit: float, direction: str, is_sweep: bool) -> tuple[int, list[str], str]:
@@ -696,51 +755,7 @@ def score_setup(df_5m: pd.DataFrame, bias: str, level_hit: float, direction: str
 
 
 # =========================
-# Expiry rules (NEW)
-# =========================
-
-def expire_trade_if_needed():
-    tr = STATE.active_trade
-    if not tr:
-        return
-
-    # 1) Cancel long pending trades
-    if tr.get("status") == "pending":
-        created = tr.get("created_ts")
-        if created and (datetime.utcnow() - created) >= timedelta(minutes=CFG.max_pending_minutes):
-            send_telegram(
-                f"⌛️ {CFG.user_title} — Trade Expired (Pending too long)\n"
-                f"سبب: لم يتم تفعيل الدخول خلال {CFG.max_pending_minutes} دقيقة.\n"
-                f"تم إلغاء الصفقة لتفادي تعليق البوت."
-            )
-            STATE.active_trade = None
-            return
-
-    # 2) Safety: cancel too-long live trades
-    if tr.get("status") == "live":
-        live_since = tr.get("live_since_ts")
-        if live_since and (datetime.utcnow() - live_since) >= timedelta(hours=CFG.max_live_hours):
-            send_telegram(
-                f"🧯 {CFG.user_title} — Trade Closed (Time Limit)\n"
-                f"سبب: تجاوزت الصفقة حد الزمن ({CFG.max_live_hours} ساعات).\n"
-                f"تم الإغلاق لتفادي التعليق."
-            )
-            STATE.active_trade = None
-            return
-
-    # 3) Expire at RTH close (NY 16:00)
-    if CFG.expire_at_rth_close and is_after_rth_close():
-        send_telegram(
-            f"🛎️ {CFG.user_title} — Trade Closed (Market Close)\n"
-            f"سبب: إغلاق السوق (RTH 16:00 NY).\n"
-            f"ملاحظة: تم إنهاء الصفقة لتفادي تعليق البوت."
-        )
-        STATE.active_trade = None
-        return
-
-
-# =========================
-# Trade tracking
+# Trade tracking (events only)
 # =========================
 
 def update_active_trade(df_5m: pd.DataFrame, last_price: float):
@@ -786,7 +801,6 @@ def update_active_trade(df_5m: pd.DataFrame, last_price: float):
     if tr.get("stop_pending"):
         inside = (last_price > stop) if direction == "BUY" else (last_price < stop)
         if inside:
-            # recovered back inside -> likely sweep
             tr["stop_pending"] = False
             tr.pop("stop_first_breach_ts", None)
         else:
@@ -796,13 +810,6 @@ def update_active_trade(df_5m: pd.DataFrame, last_price: float):
                 if CFG.stop_stoch_confirm:
                     stoch_ok = stoch_cross(df_5m, "SELL" if direction == "BUY" else "BUY")
                 if stoch_ok:
-                    STATE.daily_trades += 1
-                    STATE.daily_losses += 1
-                    rr = tr.get("rr_to_t1")
-                    if rr is not None:
-                        STATE.daily_rr_sum += float(rr)
-                        STATE.daily_rr_count += 1
-
                     send_telegram(
                         f"❌ {CFG.user_title} — وقف الخسارة تأكد\n"
                         f"Stop Hit ✅ | Direction: {direction}\n"
@@ -826,13 +833,6 @@ def update_active_trade(df_5m: pd.DataFrame, last_price: float):
         hit_t2 = (last_price >= t2) if direction == "BUY" else (last_price <= t2)
         if hit_t2:
             tr["t2_hit"] = True
-            STATE.daily_trades += 1
-            STATE.daily_wins += 1
-            rr = tr.get("rr_to_t1")
-            if rr is not None:
-                STATE.daily_rr_sum += float(rr)
-                STATE.daily_rr_count += 1
-
             send_telegram(
                 f"🏆 {CFG.user_title} — Target 2 Hit\n"
                 f"T2: {t2:.1f}\n"
@@ -863,7 +863,8 @@ def update_active_trade(df_5m: pd.DataFrame, last_price: float):
 # =========================
 
 def evaluate_once():
-    STATE.roll_day_if_needed()
+    # 1) Daily reset first (prevents signal/close loop)
+    maybe_daily_reset()
 
     session = session_label()
     symbol, df_4h, df_1h, df_15m, df_5m_raw = fetch_timeframes()
@@ -873,20 +874,24 @@ def evaluate_once():
     bias = structure_bias(df_1h, df_4h)
     key_levels = extract_key_levels(df_15m, df_1h)
 
-    # Expire trade if needed (NEW)
-    expire_trade_if_needed()
+    # 2) Market state update (every 15 min)
+    maybe_update_market_state(df_1h, df_4h)
 
-    # Track active trade (always)
+    # 3) Track active trade (events)
     update_active_trade(df_5m, price)
 
-    # Hourly update (includes trade status)
+    # 4) Hourly update (includes trade status + market state)
     if CFG.hourly_update:
         current_hour = now_riyadh().replace(minute=0, second=0, microsecond=0)
         if STATE.last_hour_sent is None or current_hour > STATE.last_hour_sent:
             send_telegram(hourly_msg(session, symbol, bias, key_levels, price))
             STATE.last_hour_sent = current_hour
 
-    # One trade at a time
+    # 5) Respect no-signal window after reset
+    if STATE.no_signal_until_utc is not None and datetime.utcnow() < STATE.no_signal_until_utc:
+        return
+
+    # 6) One trade at a time
     if STATE.active_trade is not None:
         return
 
@@ -895,7 +900,7 @@ def evaluate_once():
     sweep_hit = None
     sweep_dir = ""
     for lvl in sorted(sweep_levels, key=lambda x: abs(x - price))[:12]:
-        is_sw, d = detect_sweep(df_5m, lvl)
+        is_sw, d = detect_sweep(df_5m, float(lvl))
         if is_sw:
             sweep_hit = float(lvl)
             sweep_dir = d
@@ -926,7 +931,6 @@ def evaluate_once():
                         "stop": float(plan["stop"]),
                         "t1": None if plan["t1"] is None else float(plan["t1"]),
                         "t2": None if plan["t2"] is None else float(plan["t2"]),
-                        "rr_to_t1": None if plan["rr"] is None else float(plan["rr"]),
                         "status": "pending",
                         "created_ts": datetime.utcnow(),
                     }
@@ -973,7 +977,6 @@ def evaluate_once():
         "stop": float(plan["stop"]),
         "t1": None if plan["t1"] is None else float(plan["t1"]),
         "t2": None if plan["t2"] is None else float(plan["t2"]),
-        "rr_to_t1": None if plan["rr"] is None else float(plan["rr"]),
         "status": "pending",
         "created_ts": datetime.utcnow(),
     }
@@ -984,12 +987,12 @@ def main():
         f"✅ {CFG.user_title} — Bot started\n"
         f"Rules:\n"
         f"- All Sessions: {CFG.es_symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
-        f"- Hourly Update: ON (includes Active Trade status)\n"
+        f"- Hourly Update: ON (includes Active Trade + Market State)\n"
+        f"- Market State: ADX(1H)+Structure, updated every {CFG.market_state_update_minutes}m\n"
+        f"- Daily Reset: {CFG.daily_reset_hour:02d}:{CFG.daily_reset_minute:02d} Riyadh + No-signal {CFG.no_signal_after_reset_minutes}m\n"
         f"- Signals: Hunter Smart (Score ≥ {CFG.signal_score_threshold}, RR ≥ {CFG.min_rr_to_t1})\n"
-        f"- Sweep: Smarter (1H swings + 24h HL) + Stoch confirm\n"
-        f"- Trade Tracking: ON (Entry/T1/T2/Stop confirm)\n"
-        f"- Trade Expiry: Pending>{CFG.max_pending_minutes}m, RTH close auto-close\n"
-        f"- Daily Stats: ON"
+        f"- Sweep: Smarter + Stoch confirm\n"
+        f"- Trade Tracking: ON"
     )
 
     while True:
