@@ -348,6 +348,15 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list[float]
 def fmt_levels(levels: list[float]) -> str:
     return ", ".join([f"{x:.1f}" for x in levels])
 
+# ✅ Added exactly as requested
+def safe_f1(x, default="N/A"):
+    try:
+        if x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
+            return default
+        return f"{float(x):.1f}"
+    except Exception:
+        return default
+
 def near_level(price: float, level: float, tol_frac: float) -> bool:
     return abs(price - level) / max(price, 1e-9) <= tol_frac
 
@@ -758,7 +767,8 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
     status = "None" if active_trade is None else active_trade.get("status", "Unknown")
     trade_line = "-"
     if active_trade is not None:
-        trade_line = f"{active_trade.get('direction','?')} | Entry {active_trade.get('entry',0):.1f} | Stop {active_trade.get('stop',0):.1f}"
+        # ✅ Changed exactly as requested
+        trade_line = f"{active_trade.get('direction','?')} | Entry {safe_f1(active_trade.get('entry'))} | Stop {safe_f1(active_trade.get('stop'))}"
 
     reset_line = ""
     if STATE.no_signal_until_utc is not None and datetime.utcnow() < STATE.no_signal_until_utc:
@@ -941,12 +951,17 @@ def update_active_trade(df_5m: pd.DataFrame, last_price: float):
         if triggered:
             tr["status"] = "live"
             tr["live_since_utc"] = datetime.utcnow()
+
+            # ✅ FIX (previous): avoid invalid format specifier in f-string
+            t1_txt = f"{t1:.1f}" if t1 is not None else "N/A"
+            t2_txt = f"{t2:.1f}" if t2 is not None else "N/A"
+
             send_telegram(
                 f"📍 {CFG.user_title} — الصفقة تفعلت\n"
                 f"Direction: {direction}\n"
                 f"Entry Triggered @ {last_price:.1f}\n"
                 f"Stop: {stop:.1f}\n"
-                f"T1: {t1:.1f if t1 is not None else 'N/A'} | T2: {t2:.1f if t2 is not None else 'N/A'}"
+                f"T1: {t1_txt} | T2: {t2_txt}"
             )
         return
 
