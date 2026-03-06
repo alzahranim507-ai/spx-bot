@@ -1,6 +1,7 @@
-yfinance
+git+https://github.com/rongardF/tvdatafeed.git
 pandas
 numpy
-requests
 ta
-tzdata
+requests
+websocket-client
+setuptools
