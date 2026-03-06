@@ -1,27 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-ES Trading Bot (Hunter Smart v4 - Reaction Zones)
+ES Trading Bot (Hunter Smart v5 - Reaction Zones)
 For: دكتور محمد
 
-Core logic:
+Main idea:
 - Symbol ALWAYS: ES=F
-- ES prices adjusted by -10 points (to match TradingView baseline if needed)
-- Direction decision starts from 1H/4H bias
-- Reaction Zones built from:
-    * Equal Highs / Equal Lows
-    * Wick Clusters
-    * Sweep + Reclaim
-    * Strong displacement after touch
-- Uses zones, not only single levels
-- Blocks BUY inside strong resistance zone with upper-wick cluster
-- Blocks SELL inside strong support zone with lower-wick cluster
-- Keeps:
-    * Confidence
-    * RR
-    * Probability T1/T2
-    * Expected Move
-    * ETA
-    * Active trade tracking
+- ES Adjust: -10 points
+- Reaction Zones instead of rigid Support/Resistance naming
+- Direction starts from 1H/4H Bias
+- Then confirms by:
+    * Wick cluster near zone
+    * Sweep + reclaim
+    * Stoch RSI cross
+    * Momentum shift
+    * Break & Retest
+- Confidence / RR / Probability / Expected Move / ETA remain
+- Mid-range trades are still allowed IF score/confidence support them
+- Fixes:
+    * break_retest function included
+    * safer formatting
+    * safer Telegram/network handling
 
 Railway env vars:
 - TELEGRAM_BOT_TOKEN
@@ -70,14 +68,14 @@ class Config:
     pivot_left: int = 3
     pivot_right: int = 3
 
-    # Zone building
-    zone_lookback_5m: int = 120               # recent zones only
-    eq_tolerance_pts: float = 2.0             # equal highs/lows tolerance
-    zone_merge_tolerance_pts: float = 3.0     # merge nearby levels into zone
-    min_zone_reactions: int = 2               # minimum hits to trust a zone
-    max_zones_per_side: int = 3               # support/resistance shown/used
-    strong_move_min_pts: float = 10.0         # displacement after reaction
-    max_zone_distance_pts: float = 80.0       # avoid absurdly far zones
+    # Reaction zones
+    zone_lookback_5m: int = 150
+    eq_tolerance_pts: float = 2.0
+    zone_merge_tolerance_pts: float = 3.0
+    min_zone_reactions: int = 2
+    max_zone_distance_pts: float = 80.0
+    max_zones_total: int = 6
+    strong_move_min_pts: float = 10.0
 
     # Wick cluster
     wick_cluster_lookback_5m: int = 12
@@ -89,7 +87,7 @@ class Config:
     sweep_min_break_pts: float = 1.0
     reclaim_required: bool = True
 
-    # Signal / scoring
+    # Scoring
     score_threshold: int = 3
     min_rr_to_t1: float = 1.35
     signal_cooldown_minutes: int = 15
@@ -210,7 +208,7 @@ def send_telegram(text: str):
     payload = {
         "chat_id": CFG.telegram_chat_id,
         "text": text,
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
     }
 
     for attempt in range(3):
@@ -276,6 +274,7 @@ def fetch_timeframes():
     df_5m_raw = apply_es_adjustment(_yf_download(sym, "5m", "7d"))
     df_15m = apply_es_adjustment(_yf_download(sym, "15m", "30d"))
     df_1h = apply_es_adjustment(_yf_download(sym, "60m", "90d"))
+
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     df_4h = df_1h.resample("4h").agg(agg).dropna(subset=["open", "high", "low", "close"])
     return sym, df_4h, df_1h, df_15m, df_5m_raw
@@ -343,6 +342,32 @@ def rejection_lite(df_5m: pd.DataFrame, direction: str) -> bool:
         return (lower / rng) >= 0.25
     if direction == "SELL":
         return (upper / rng) >= 0.25
+    return False
+
+def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
+    if len(df_5m) < 8:
+        return False
+
+    price = float(df_5m["close"].iloc[-1])
+    window = df_5m.tail(8)
+    tol = max(CFG.eq_tolerance_pts, 1.0)
+
+    if direction == "BUY":
+        broke = (window["close"] > level).any()
+        retest = (
+            abs(price - level) <= tol or
+            abs(float(window["low"].min()) - level) <= tol
+        )
+        return bool(broke and retest and price >= level)
+
+    if direction == "SELL":
+        broke = (window["close"] < level).any()
+        retest = (
+            abs(price - level) <= tol or
+            abs(float(window["high"].max()) - level) <= tol
+        )
+        return bool(broke and retest and price <= level)
+
     return False
 
 
@@ -548,8 +573,20 @@ def merge_levels_to_zones(levels: list[float], merge_tolerance_pts: float) -> li
 def zone_mid(zone: tuple[float, float]) -> float:
     return (zone[0] + zone[1]) / 2.0
 
-def zone_width(zone: tuple[float, float]) -> float:
-    return zone[1] - zone[0]
+def fmt_zones(zones: list[tuple[float, float]]) -> str:
+    if not zones:
+        return "-"
+    return ", ".join([f"{z[0]:.1f}-{z[1]:.1f}" for z in zones])
+
+def nearest_zone(price: float, zones: list[tuple[float, float]]) -> tuple[float, float] | None:
+    if not zones:
+        return None
+    return min(zones, key=lambda z: abs(zone_mid(z) - price))
+
+def price_inside_zone(price: float, zone: tuple[float, float] | None) -> bool:
+    if zone is None:
+        return False
+    return zone[0] <= price <= zone[1]
 
 def build_equal_high_low_candidates(df_5m: pd.DataFrame) -> tuple[list[float], list[float]]:
     w = df_5m.tail(min(CFG.zone_lookback_5m, len(df_5m))).copy()
@@ -559,7 +596,6 @@ def build_equal_high_low_candidates(df_5m: pd.DataFrame) -> tuple[list[float], l
     eq_highs = []
     eq_lows = []
 
-    # crude but robust grouping by tolerance
     used_hi = np.zeros(len(highs), dtype=bool)
     for i in range(len(highs)):
         if used_hi[i]:
@@ -590,7 +626,6 @@ def build_equal_high_low_candidates(df_5m: pd.DataFrame) -> tuple[list[float], l
 
 def build_wick_candidates(df_5m: pd.DataFrame) -> tuple[list[float], list[float]]:
     w = df_5m.tail(min(CFG.zone_lookback_5m, len(df_5m))).copy()
-
     upper_levels = []
     lower_levels = []
 
@@ -600,26 +635,22 @@ def build_wick_candidates(df_5m: pd.DataFrame) -> tuple[list[float], list[float]
         l = float(r["low"])
         c = float(r["close"])
         rng = max(h - l, 1e-9)
+
         upper = h - max(o, c)
         lower = min(o, c) - l
 
         if upper >= CFG.wick_min_abs_pts and (upper / rng) >= CFG.wick_ratio_strong:
             upper_levels.append(h)
-
         if lower >= CFG.wick_min_abs_pts and (lower / rng) >= CFG.wick_ratio_strong:
             lower_levels.append(l)
 
     return upper_levels, lower_levels
 
 def zone_has_displacement(df_5m: pd.DataFrame, zone: tuple[float, float], side: str) -> bool:
-    """
-    side='resistance' or 'support'
-    looks for reaction then move away by strong_move_min_pts
-    """
     w = df_5m.tail(min(CFG.zone_lookback_5m, len(df_5m))).copy()
     z_low, z_high = zone
-
     touched_indices = []
+
     for i in range(len(w)):
         h = float(w["high"].iloc[i])
         l = float(w["low"].iloc[i])
@@ -637,7 +668,7 @@ def zone_has_displacement(df_5m: pd.DataFrame, zone: tuple[float, float], side: 
         if future.empty:
             continue
 
-        if side == "resistance":
+        if side == "upper":
             move = float(w["close"].iloc[idx] - future["low"].min())
             if move >= CFG.strong_move_min_pts:
                 return True
@@ -648,66 +679,35 @@ def zone_has_displacement(df_5m: pd.DataFrame, zone: tuple[float, float], side: 
 
     return False
 
-def detect_reaction_zones(df_5m: pd.DataFrame, price_now: float) -> dict:
+def detect_reaction_zones(df_5m: pd.DataFrame, price_now: float) -> list[tuple[float, float]]:
     eq_highs, eq_lows = build_equal_high_low_candidates(df_5m)
     wick_highs, wick_lows = build_wick_candidates(df_5m)
 
-    resistance_raw = eq_highs + wick_highs
-    support_raw = eq_lows + wick_lows
+    raw_levels = eq_highs + eq_lows + wick_highs + wick_lows
+    raw_levels = [x for x in raw_levels if abs(x - price_now) <= CFG.max_zone_distance_pts]
 
-    resistance_zones = merge_levels_to_zones(resistance_raw, CFG.zone_merge_tolerance_pts)
-    support_zones = merge_levels_to_zones(support_raw, CFG.zone_merge_tolerance_pts)
+    zones = merge_levels_to_zones(raw_levels, CFG.zone_merge_tolerance_pts)
 
-    # filter by real reaction/displacement + distance
-    res_filtered = []
-    for z in resistance_zones:
-        mid = zone_mid(z)
-        if abs(mid - price_now) <= CFG.max_zone_distance_pts and zone_has_displacement(df_5m, z, "resistance"):
-            res_filtered.append(z)
-
-    sup_filtered = []
-    for z in support_zones:
-        mid = zone_mid(z)
-        if abs(mid - price_now) <= CFG.max_zone_distance_pts and zone_has_displacement(df_5m, z, "support"):
-            sup_filtered.append(z)
-
-    res_filtered = sorted(res_filtered, key=lambda z: abs(zone_mid(z) - price_now))[:CFG.max_zones_per_side]
-    sup_filtered = sorted(sup_filtered, key=lambda z: abs(zone_mid(z) - price_now))[:CFG.max_zones_per_side]
-
-    return {
-        "resistance_zones": res_filtered,
-        "support_zones": sup_filtered,
-    }
-
-def fmt_zones(zones: list[tuple[float, float]]) -> str:
-    if not zones:
-        return "-"
-    parts = []
+    filtered = []
     for z in zones:
-        parts.append(f"{z[0]:.1f}-{z[1]:.1f}")
-    return ", ".join(parts)
+        if zone_has_displacement(df_5m, z, "upper") or zone_has_displacement(df_5m, z, "lower"):
+            filtered.append(z)
 
-def nearest_zone(price: float, zones: list[tuple[float, float]]) -> tuple[float, float] | None:
-    if not zones:
-        return None
-    return min(zones, key=lambda z: abs(zone_mid(z) - price))
-
-def price_inside_zone(price: float, zone: tuple[float, float] | None) -> bool:
-    if zone is None:
-        return False
-    return zone[0] <= price <= zone[1]
+    filtered = sorted(filtered, key=lambda z: abs(zone_mid(z) - price_now))
+    return filtered[:CFG.max_zones_total]
 
 
 # =========================
-# Wick Cluster / Sweep on chosen zone
+# Zone Behavior
 # =========================
 
-def wick_cluster_on_zone(df_5m: pd.DataFrame, zone: tuple[float, float], side: str) -> tuple[bool, int]:
+def wick_cluster_on_zone(df_5m: pd.DataFrame, zone: tuple[float, float]) -> tuple[bool, bool, int, int]:
     if zone is None:
-        return False, 0
+        return False, False, 0, 0
 
     w = df_5m.tail(min(CFG.wick_cluster_lookback_5m, len(df_5m))).copy()
-    hits = 0
+    upper_hits = 0
+    lower_hits = 0
     z_low, z_high = zone
 
     for _, r in w.iterrows():
@@ -719,18 +719,23 @@ def wick_cluster_on_zone(df_5m: pd.DataFrame, zone: tuple[float, float], side: s
         upper = h - max(o, c)
         lower = min(o, c) - l
 
-        if side == "resistance":
-            touched = (h >= z_low and h <= z_high + CFG.eq_tolerance_pts) or (z_low <= c <= z_high)
-            if touched and upper >= CFG.wick_min_abs_pts and (upper / rng) >= CFG.wick_ratio_strong:
-                hits += 1
-        else:
-            touched = (l <= z_high and l >= z_low - CFG.eq_tolerance_pts) or (z_low <= c <= z_high)
-            if touched and lower >= CFG.wick_min_abs_pts and (lower / rng) >= CFG.wick_ratio_strong:
-                hits += 1
+        touched = (l <= z_high and h >= z_low) or (z_low <= c <= z_high)
+        if not touched:
+            continue
 
-    return hits >= CFG.wick_cluster_min_hits, hits
+        if upper >= CFG.wick_min_abs_pts and (upper / rng) >= CFG.wick_ratio_strong:
+            upper_hits += 1
+        if lower >= CFG.wick_min_abs_pts and (lower / rng) >= CFG.wick_ratio_strong:
+            lower_hits += 1
 
-def sweep_reclaim_on_zone(df_5m: pd.DataFrame, zone: tuple[float, float], side: str) -> bool:
+    return (
+        upper_hits >= CFG.wick_cluster_min_hits,
+        lower_hits >= CFG.wick_cluster_min_hits,
+        upper_hits,
+        lower_hits
+    )
+
+def sweep_reclaim_on_zone(df_5m: pd.DataFrame, zone: tuple[float, float], mode: str) -> bool:
     if zone is None or len(df_5m) < 2:
         return False
 
@@ -740,7 +745,7 @@ def sweep_reclaim_on_zone(df_5m: pd.DataFrame, zone: tuple[float, float], side: 
     c = float(r["close"])
     z_low, z_high = zone
 
-    if side == "resistance":
+    if mode == "upper":
         broke = h >= (z_high + CFG.sweep_min_break_pts)
         reclaim = c <= z_high if CFG.reclaim_required else True
         return bool(broke and reclaim)
@@ -754,14 +759,16 @@ def sweep_reclaim_on_zone(df_5m: pd.DataFrame, zone: tuple[float, float], side: 
 # Trade plan / targets
 # =========================
 
-def pick_targets_from_zones(entry: float, direction: str, support_zones: list, resistance_zones: list):
+def pick_targets_from_zones(entry: float, direction: str, zones: list[tuple[float, float]]):
+    mids = sorted([zone_mid(z) for z in zones])
+
     if direction == "BUY":
-        above = sorted([zone_mid(z) for z in resistance_zones if zone_mid(z) > entry])
+        above = [x for x in mids if x > entry]
         t1 = above[0] if len(above) >= 1 else None
         t2 = above[1] if len(above) >= 2 else None
         return t1, t2
 
-    below = sorted([zone_mid(z) for z in support_zones if zone_mid(z) < entry], reverse=True)
+    below = sorted([x for x in mids if x < entry], reverse=True)
     t1 = below[0] if len(below) >= 1 else None
     t2 = below[1] if len(below) >= 2 else None
     return t1, t2
@@ -771,8 +778,7 @@ def compute_trade_plan(
     direction: str,
     acting_zone: tuple[float, float],
     trigger: str,
-    support_zones: list,
-    resistance_zones: list
+    zones: list[tuple[float, float]]
 ):
     last = df_5m.iloc[-1]
     price = float(last["close"])
@@ -795,13 +801,13 @@ def compute_trade_plan(
             entry = float(min(price, z_mid - buffer))
             stop = float(z_high + buffer)
 
-    t1, t2 = pick_targets_from_zones(entry, direction, support_zones, resistance_zones)
+    t1, t2 = pick_targets_from_zones(entry, direction, zones)
 
     rr = None
     if t1 is not None:
         risk = abs(entry - stop)
         reward = abs(t1 - entry)
-        rr = (reward / risk) if risk > 0 else None
+        rr = reward / risk if risk > 0 else None
 
     return {"entry": entry, "stop": stop, "t1": t1, "t2": t2, "rr": rr}
 
@@ -898,7 +904,6 @@ def signal_message(
     liq_state: str,
     level_now: float,
     direction: str,
-    zone_label: str,
     acting_zone: tuple[float, float],
     plan: dict,
     score: int,
@@ -922,7 +927,7 @@ def signal_message(
         f"💧 Liquidity: {liq_state}\n"
         f"💰 Level Now: {safe_f1(level_now)}\n\n"
         f"📍 Direction: {direction}\n"
-        f"🧱 {zone_label}: {zone_txt}\n\n"
+        f"🧱 Reaction Zone: {zone_txt}\n\n"
         f"✅ Entry: {safe_f1(plan.get('entry'))}\n"
         f"🛑 Stop: {safe_f1(plan.get('stop'))}\n"
         f"🎯 Target 1: {safe_f1(plan.get('t1'))}\n"
@@ -940,7 +945,7 @@ def signal_message(
     )
 
 def hourly_update_message(session: str, symbol: str, bias: str, market_state_str: str,
-                          support_zones: list, resistance_zones: list, price: float, active_trade):
+                          zones: list[tuple[float, float]], price: float, active_trade):
     status = "None" if active_trade is None else active_trade.get("status", "Unknown")
     trade_line = "-"
     if active_trade is not None:
@@ -958,8 +963,7 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
         f"🧭 Bias (1H/4H): {bias}\n"
         f"📊 Market State: {market_state_str}\n"
         f"💵 Price: {safe_f1(price)}\n"
-        f"🟩 Support Zones: {fmt_zones(support_zones)}\n"
-        f"🟥 Resistance Zones: {fmt_zones(resistance_zones)}\n"
+        f"🧱 Key Reaction Zones: {fmt_zones(zones)}\n"
         f"📌 Active Trade: {status}\n"
         f"🧾 Trade: {trade_line}\n"
         f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
@@ -975,10 +979,8 @@ class BotState:
         self.last_hour_sent = None
         self.last_signal_ts = {}
         self.active_trade = None
-
         self.last_reset_date_riyadh = None
         self.no_signal_until_utc = None
-
         self.market_state_last_calc_utc = None
         self.market_label = "Unknown"
         self.market_dir = "Neutral"
@@ -1149,10 +1151,7 @@ def update_active_trade(df_5m: pd.DataFrame, last_price: float):
                     f"اقتراح: نقل الستوب إلى Entry (BE) لحماية الربح."
                 )
             else:
-                send_telegram(
-                    f"🎯 {CFG.user_title} — Target 1 Hit\n"
-                    f"T1: {safe_f1(t1)}"
-                )
+                send_telegram(f"🎯 {CFG.user_title} — Target 1 Hit\nT1: {safe_f1(t1)}")
 
     if t2 is not None and not tr.get("t2_hit"):
         hit_t2 = (last_price >= float(t2)) if direction == "BUY" else (last_price <= float(t2))
@@ -1188,8 +1187,6 @@ def evaluate_once():
     bias = structure_bias(df_1h, df_4h)
 
     zones = detect_reaction_zones(df_5m, price_now)
-    support_zones = zones["support_zones"]
-    resistance_zones = zones["resistance_zones"]
 
     if STATE.active_trade is not None:
         update_active_trade(df_5m, price_now)
@@ -1203,8 +1200,7 @@ def evaluate_once():
                     symbol=symbol,
                     bias=bias,
                     market_state_str=market_state_str,
-                    support_zones=support_zones,
-                    resistance_zones=resistance_zones,
+                    zones=zones,
                     price=price_now,
                     active_trade=STATE.active_trade,
                 )
@@ -1217,74 +1213,52 @@ def evaluate_once():
     if STATE.active_trade is not None:
         return
 
-    if not support_zones and not resistance_zones:
+    if not zones:
         return
 
-    # 1) Base direction from bias
+    # base direction
     if bias == "Bullish":
         direction = "BUY"
     elif bias == "Bearish":
         direction = "SELL"
     else:
-        # keep mid-range trades possible via momentum
         direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
 
-    nearest_support = nearest_zone(price_now, support_zones)
-    nearest_resistance = nearest_zone(price_now, resistance_zones)
+    acting_zone = nearest_zone(price_now, zones)
+    if acting_zone is None:
+        return
 
-    support_inside = price_inside_zone(price_now, nearest_support)
-    resistance_inside = price_inside_zone(price_now, nearest_resistance)
-
-    wick_sup, wick_sup_hits = wick_cluster_on_zone(df_5m, nearest_support, "support") if nearest_support else (False, 0)
-    wick_res, wick_res_hits = wick_cluster_on_zone(df_5m, nearest_resistance, "resistance") if nearest_resistance else (False, 0)
-
-    sweep_sup = sweep_reclaim_on_zone(df_5m, nearest_support, "support") if nearest_support else False
-    sweep_res = sweep_reclaim_on_zone(df_5m, nearest_resistance, "resistance") if nearest_resistance else False
+    inside = price_inside_zone(price_now, acting_zone)
+    upper_cluster, lower_cluster, upper_hits, lower_hits = wick_cluster_on_zone(df_5m, acting_zone)
+    sweep_upper = sweep_reclaim_on_zone(df_5m, acting_zone, "upper")
+    sweep_lower = sweep_reclaim_on_zone(df_5m, acting_zone, "lower")
 
     reasons = []
     score = 0
     trigger = None
-    acting_zone = None
-    zone_label = "Zone"
 
-    # 2) Zone rules / overrides
-    # prevent BUY in resistance with upper wick cluster
-    if direction == "BUY" and resistance_inside and wick_res:
+    # role by behavior, not by fixed naming
+    if direction == "BUY" and inside and upper_cluster:
         direction = "SELL"
-
-    # prevent SELL in support with lower wick cluster
-    if direction == "SELL" and support_inside and wick_sup:
+    if direction == "SELL" and inside and lower_cluster:
         direction = "BUY"
 
-    # 3) Choose acting zone
+    # scoring
     if direction == "BUY":
-        if nearest_support is not None:
-            acting_zone = nearest_support
-            zone_label = "Support Zone"
-    else:
-        if nearest_resistance is not None:
-            acting_zone = nearest_resistance
-            zone_label = "Resistance Zone"
-
-    if acting_zone is None:
-        return
-
-    # 4) Score
-    if direction == "BUY":
-        if wick_sup:
+        if lower_cluster:
             score += 3
-            reasons.append(f"Lower-wick cluster near support {safe_f1(zone_mid(acting_zone))}")
+            reasons.append(f"Lower-wick cluster near zone {safe_f1(zone_mid(acting_zone))}")
             trigger = "Wick Rejection near Zone"
-        if sweep_sup:
+        if sweep_lower:
             score += 2
             reasons.append("Sweep + Reclaim")
             trigger = trigger or "Sweep + Reclaim"
     else:
-        if wick_res:
+        if upper_cluster:
             score += 3
             reasons.append(f"Upper-wick rejection cluster near {safe_f1(zone_mid(acting_zone))}")
             trigger = "Wick Rejection near Zone"
-        if sweep_res:
+        if sweep_upper:
             score += 2
             reasons.append("Sweep + Reclaim")
             trigger = trigger or "Sweep + Reclaim"
@@ -1298,23 +1272,19 @@ def evaluate_once():
         score += 2
         reasons.append("Break&Retest")
         trigger = trigger or "Break&Retest"
-
     if rj:
         score += 2
         reasons.append("Rejection")
         trigger = trigger or "Rejection"
-
     if st:
         score += 1
         reasons.append("Stoch RSI cross")
-
     if ms:
         score += 1
         reasons.append("Momentum shift")
 
     score = int(min(score, 6))
 
-    # keep mid-range trades possible only if they still score enough
     if score < CFG.score_threshold:
         return
 
@@ -1323,8 +1293,7 @@ def evaluate_once():
         direction=direction,
         acting_zone=acting_zone,
         trigger=trigger or "Zone",
-        support_zones=support_zones,
-        resistance_zones=resistance_zones,
+        zones=zones,
     )
 
     rr = plan.get("rr")
@@ -1360,7 +1329,6 @@ def evaluate_once():
         liq_state=liq_state,
         level_now=price_now,
         direction=direction,
-        zone_label=zone_label,
         acting_zone=acting_zone,
         plan=plan,
         score=score,
@@ -1393,7 +1361,7 @@ def main():
         f"- All Sessions: {CFG.symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
         f"- Direction: Bias(1H/4H) + Reaction Zones\n"
         f"- Zones: Equal High/Low + Wick Clusters + Sweep + Displacement\n"
-        f"- Mid-range trades still possible if confidence/score support them\n"
+        f"- Mid-range trades still possible if score/confidence support them\n"
         f"- Stop: HardStop({CFG.hard_stop_buffer_pts:.1f} pts) + 5m close confirm\n"
         f"- Extras: Confidence + RR + Probability + Expected Move + ETA"
     )
