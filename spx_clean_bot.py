@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-ES Trading Bot (Hunter WICK PRO) — Yahoo Finance (yfinance)
+SPX500 Trading Bot (Hunter WICK PRO - FOREXCOM/TradingView)
 For: دكتور محمد
 
-Built from Hunter WICK base with these improvements:
-- Key Levels remain the main engine
-- Bias(1H/4H) -> wick behavior near important level
+Data source:
+- TradingView via tvdatafeed
+- Symbol: FOREXCOM:SPX500
+- No Yahoo
+- No ES points adjustment
+
+Core idea:
+- Keep the original Hunter WICK style logic
+- Structure / levels / indicators all come from FOREXCOM:SPX500
+- Bias(1H/4H) -> wick behavior near important key level
 - ATR fallback targets if levels are insufficient
 - T3 optional for stronger setups
 - Trade classification: Weak / Standard / Strong
@@ -13,8 +20,14 @@ Built from Hunter WICK base with these improvements:
 - Better level selection (importance-weighted, not nearest only)
 - Better entry logic (less late on strong rejection setups)
 - Full safe formatting
-- Session filter for weak off-hours setups
+- Session filter for weaker off-hours signals
 - Improved active trade management
+
+Env vars:
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+- TV_USERNAME   (optional)
+- TV_PASSWORD   (optional)
 """
 
 import os
@@ -25,7 +38,8 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
+
+from tvDatafeed import TvDatafeed, Interval
 
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import EMAIndicator, MACD, ADXIndicator
@@ -43,9 +57,11 @@ except ImportError:
 
 @dataclass
 class Config:
-    # Symbol
-    symbol: str = "ES=F"
-    es_points_adjust: float = 10.0
+    # TradingView source
+    tv_symbol: str = "SPX500"
+    tv_exchange: str = "FOREXCOM"
+    tv_username: str = os.getenv("TV_USERNAME", "")
+    tv_password: str = os.getenv("TV_PASSWORD", "")
 
     # Telegram
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -59,7 +75,7 @@ class Config:
     # Loop
     loop_sleep_seconds: int = 25
 
-    # Pivots / structure
+    # Structure / pivots
     pivot_left: int = 3
     pivot_right: int = 3
 
@@ -79,11 +95,11 @@ class Config:
     adx_trending_on: float = 25.0
     adx_range_on: float = 20.0
 
-    # Liquidity ratio (5m volume)
+    # Liquidity (if volume available from TradingView feed)
     liquidity_lookback_5m: int = 60
-    liquidity_thresholds: tuple = (0.60, 1.25, 2.00)  # low, normal, high, extreme
+    liquidity_thresholds: tuple = (0.60, 1.25, 2.00)
 
-    # Expected Move
+    # Expected move
     expected_move_atr_window: int = 14
 
     # ETA
@@ -129,15 +145,32 @@ class Config:
     offhours_min_score: int = 4
     offhours_block_weak: bool = True
 
-    # Daily reset (Riyadh midnight)
+    # Daily reset
     daily_reset_enabled: bool = True
     daily_reset_hour: int = 0
     daily_reset_minute: int = 0
     daily_reset_window_minutes: int = 5
     no_signal_after_reset_minutes: int = 8
 
+    # Bars to fetch
+    bars_5m: int = 1500
+    bars_15m: int = 1200
+    bars_1h: int = 1200
+
 
 CFG = Config()
+
+
+# =========================
+# TradingView client
+# =========================
+
+def make_tv_client() -> TvDatafeed:
+    if CFG.tv_username and CFG.tv_password:
+        return TvDatafeed(CFG.tv_username, CFG.tv_password)
+    return TvDatafeed()
+
+TV = make_tv_client()
 
 
 # =========================
@@ -217,8 +250,10 @@ def send_telegram(text: str):
     if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
         print("[WARN] Telegram env vars not set. Printing:\n", text)
         return
+
     url = f"https://api.telegram.org/bot{CFG.telegram_bot_token}/sendMessage"
     payload = {"chat_id": CFG.telegram_chat_id, "text": text, "disable_web_page_preview": True}
+
     for attempt in range(3):
         try:
             r = requests.post(url, json=payload, timeout=15)
@@ -231,59 +266,57 @@ def send_telegram(text: str):
 
 
 # =========================
-# Yahoo fetching
+# TradingView fetching
 # =========================
 
-def _yf_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    last_err = None
-    for attempt in range(3):
-        try:
-            df = yf.download(
-                tickers=symbol,
-                interval=interval,
-                period=period,
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-            )
-            if df is None or df.empty:
-                raise RuntimeError(f"Yahoo empty data: {symbol} interval={interval} period={period}")
+def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) -> pd.DataFrame:
+    df = TV.get_hist(
+        symbol=symbol,
+        exchange=exchange,
+        interval=interval,
+        n_bars=n_bars,
+    )
 
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0].lower() for c in df.columns]
-            else:
-                df.columns = [c.lower() for c in df.columns]
+    if df is None or df.empty:
+        raise RuntimeError(f"TradingView empty data: {exchange}:{symbol} interval={interval} n_bars={n_bars}")
 
-            for c in ["open", "high", "low", "close"]:
-                if c not in df.columns:
-                    raise RuntimeError(f"Missing column '{c}' in Yahoo data")
-
-            if "volume" not in df.columns:
-                df["volume"] = np.nan
-
-            if df.index.tz is None:
-                df.index = df.index.tz_localize(timezone.utc)
-
-            return df
-        except Exception as e:
-            last_err = e
-            time.sleep(1.4 * (attempt + 1))
-    raise RuntimeError(f"Yahoo download failed after retries: {repr(last_err)}")
-
-def apply_es_adjustment(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    for col in ["open", "high", "low", "close"]:
-        out[col] = out[col].astype(float) - CFG.es_points_adjust
+
+    # Standardize column names
+    out.columns = [str(c).lower() for c in out.columns]
+
+    for c in ["open", "high", "low", "close"]:
+        if c not in out.columns:
+            raise RuntimeError(f"Missing column '{c}' in TradingView data")
+
+    if "volume" not in out.columns:
+        out["volume"] = np.nan
+
+    out = out.sort_index()
+
+    # Make index tz-aware UTC if needed
+    if getattr(out.index, "tz", None) is None:
+        out.index = out.index.tz_localize("UTC")
+
+    # numeric sanitize
+    for c in ["open", "high", "low", "close", "volume"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out.dropna(subset=["open", "high", "low", "close"])
     return out
 
 def fetch_timeframes():
-    sym = CFG.symbol
-    df_5m_raw = apply_es_adjustment(_yf_download(sym, "5m", "7d"))
-    df_15m = apply_es_adjustment(_yf_download(sym, "15m", "30d"))
-    df_1h = apply_es_adjustment(_yf_download(sym, "60m", "90d"))
+    symbol = CFG.tv_symbol
+    exchange = CFG.tv_exchange
+
+    df_5m = _tv_get_hist(symbol, exchange, Interval.in_5_minute, CFG.bars_5m)
+    df_15m = _tv_get_hist(symbol, exchange, Interval.in_15_minute, CFG.bars_15m)
+    df_1h = _tv_get_hist(symbol, exchange, Interval.in_1_hour, CFG.bars_1h)
+
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     df_4h = df_1h.resample("4h").agg(agg).dropna(subset=["open", "high", "low", "close"])
-    return sym, df_4h, df_1h, df_15m, df_5m_raw
+
+    return f"{exchange}:{symbol}", df_4h, df_1h, df_15m, df_5m
 
 
 # =========================
@@ -455,19 +488,24 @@ def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
 # Liquidity state
 # =========================
 
-def liquidity_state(df_5m_raw: pd.DataFrame) -> tuple[str, float | None]:
-    if "volume" not in df_5m_raw.columns:
+def liquidity_state(df_5m: pd.DataFrame) -> tuple[str, float | None]:
+    if "volume" not in df_5m.columns:
         return "Normal", None
-    v = df_5m_raw["volume"].astype(float)
+
+    v = df_5m["volume"].astype(float)
     if v.isna().all():
         return "Normal", None
+
     look = min(CFG.liquidity_lookback_5m, len(v))
     if look < 10:
         return "Normal", None
+
     avg = float(v.tail(look).mean())
     cur = float(v.iloc[-1])
+
     if not np.isfinite(avg) or avg <= 0 or not np.isfinite(cur):
         return "Normal", None
+
     ratio = cur / avg
     t_low, t_high, t_ext = CFG.liquidity_thresholds
     if ratio < t_low:
@@ -480,7 +518,7 @@ def liquidity_state(df_5m_raw: pd.DataFrame) -> tuple[str, float | None]:
 
 
 # =========================
-# Market State (ADX + structure)
+# Market State
 # =========================
 
 def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, prev_label: str):
@@ -607,7 +645,7 @@ def wick_cluster_near_level(df_5m: pd.DataFrame, level: float) -> dict:
 
 
 # =========================
-# Level importance selection
+# Level importance
 # =========================
 
 def score_level_importance(df_5m: pd.DataFrame, level_now: float, level: float) -> float:
@@ -618,11 +656,9 @@ def score_level_importance(df_5m: pd.DataFrame, level_now: float, level: float) 
     score += max(0.0, 20.0 - distance_pts) * 0.15
     score += float(wick_info["upper_hits"] + wick_info["lower_hits"]) * 1.4
 
-    # extra if price is truly near the level
     if near_level(level_now, level, CFG.level_touch_tolerance_frac):
         score += 2.0
 
-    # bucketed importance by recent touches
     recent = df_5m.tail(30)
     touches = 0
     for _, r in recent.iterrows():
@@ -648,7 +684,7 @@ def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: list) -
 
 
 # =========================
-# Trade strength / target helpers
+# Trade strength / targets
 # =========================
 
 def classify_trade_strength(score: int, conf: int) -> str:
@@ -719,7 +755,6 @@ def compute_trade_plan(
     last_low = float(last["low"])
     buffer = max(price * 0.0002, 0.5)
 
-    # improved entry logic
     if trigger == "Wick Rejection near Level":
         if direction == "BUY":
             if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
@@ -751,7 +786,6 @@ def compute_trade_plan(
 
     t1, t2 = pick_targets(levels, entry, direction)
 
-    # ATR fallback
     atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val, trade_type)
 
     if t1 is None:
@@ -871,7 +905,7 @@ def signal_message(
         f"🚨 {CFG.user_title} — فرصة دخول (Hunter Smart)\n\n"
         f"🕒 Time: {now_riyadh().strftime('%Y-%m-%d %H:%M')} (Riyadh)\n"
         f"🏷️ Session: {session}\n"
-        f"📌 Source: Yahoo | Symbol: {symbol}\n\n"
+        f"📌 Source: TradingView | Symbol: {symbol}\n\n"
         f"📊 Market State: {market_state_str}\n"
         f"💧 Liquidity: {liq_state}\n"
         f"💰 Level Now: {safe_f1(level_now)}\n\n"
@@ -891,8 +925,7 @@ def signal_message(
         f"T2 Hit: {p_t2}%\n\n"
         f"📈 Expected Move (1H): {exp_txt}\n"
         f"⏱ ETA to T1: {eta_txt}\n\n"
-        f"🧠 Reason: {', '.join(reasons)}\n"
-        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
+        f"🧠 Reason: {', '.join(reasons)}"
     )
 
 def hourly_update_message(session: str, symbol: str, bias: str, market_state_str: str,
@@ -912,14 +945,13 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
         f"👋 {CFG.user_title}\n"
         f"🕐 Hourly Update ({now_riyadh().strftime('%Y-%m-%d %H:%M')} Riyadh)\n"
         f"🏷️ Session: {session}\n"
-        f"📌 Source: Yahoo | Symbol: {symbol}\n"
+        f"📌 Source: TradingView | Symbol: {symbol}\n"
         f"🧭 Bias (1H/4H): {bias}\n"
         f"📊 Market State: {market_state_str}\n"
         f"💵 Price: {safe_f1(price)}\n"
         f"🧱 Key Levels: {fmt_levels(levels)}\n"
         f"📌 Active Trade: {status}\n"
-        f"🧾 Trade: {trade_line}\n"
-        f"🧾 Note: ES adjusted -{CFG.es_points_adjust:.0f} pts (match TradingView)"
+        f"🧾 Trade: {trade_line}"
     )
 
 
@@ -967,7 +999,10 @@ def maybe_daily_reset():
     if STATE.last_reset_date_riyadh == today:
         return
 
-    is_window = (t.hour == CFG.daily_reset_hour and CFG.daily_reset_minute <= t.minute < (CFG.daily_reset_minute + CFG.daily_reset_window_minutes))
+    is_window = (
+        t.hour == CFG.daily_reset_hour and
+        CFG.daily_reset_minute <= t.minute < (CFG.daily_reset_minute + CFG.daily_reset_window_minutes)
+    )
     if not is_window:
         return
 
@@ -1175,8 +1210,8 @@ def evaluate_once():
     maybe_daily_reset()
 
     session = session_label()
-    symbol, df_4h, df_1h, df_15m, df_5m_raw = fetch_timeframes()
-    df_5m = compute_indicators_5m(df_5m_raw)
+    symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
+    df_5m = compute_indicators_5m(df_5m)
 
     level_now = float(df_5m["close"].iloc[-1])
 
@@ -1184,7 +1219,7 @@ def evaluate_once():
     adx_txt = "N/A" if STATE.market_adx is None else safe_f1(STATE.market_adx)
     market_state_str = f"{STATE.market_label} | {STATE.market_dir} | ADX(1H): {adx_txt}"
 
-    liq_state, _ = liquidity_state(df_5m_raw)
+    liq_state, _ = liquidity_state(df_5m)
     bias = structure_bias(df_1h, df_4h)
     key_levels = extract_key_levels(df_15m, df_1h)
     exp_move_val = expected_move_1h(df_1h)
@@ -1209,7 +1244,6 @@ def evaluate_once():
 
     level_hit, wick_info = choose_best_level(df_5m, level_now, key_levels)
 
-    # ===== Direction decision =====
     if bias == "Bullish":
         direction = "BUY"
     elif bias == "Bearish":
@@ -1217,26 +1251,22 @@ def evaluate_once():
     else:
         direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
 
-    # safer flip logic
     sell_confirm = momentum_shift(df_5m, "SELL") or stoch_cross(df_5m, "SELL") or break_retest(df_5m, level_hit, "SELL")
     buy_confirm = momentum_shift(df_5m, "BUY") or stoch_cross(df_5m, "BUY") or break_retest(df_5m, level_hit, "BUY")
 
     blocked = False
-    blocked_reason = None
 
     if direction == "BUY" and wick_info.get("upper_cluster"):
         if sell_confirm:
             direction = "SELL"
         else:
             blocked = True
-            blocked_reason = "BUY blocked: upper-wick cluster at level without enough bullish confirmation"
 
     if direction == "SELL" and wick_info.get("lower_cluster"):
         if buy_confirm:
             direction = "BUY"
         else:
             blocked = True
-            blocked_reason = "SELL blocked: lower-wick cluster at level without enough bearish confirmation"
 
     if blocked:
         return
@@ -1248,7 +1278,6 @@ def evaluate_once():
     conf = confidence_percent(score, direction, bias, session, STATE.market_label, liq_state)
     trade_type = classify_trade_strength(score, conf)
 
-    # session filter
     if session in ("After-Hours", "Pre-Market"):
         if score < CFG.offhours_min_score:
             return
@@ -1324,7 +1353,7 @@ def main():
     send_telegram(
         f"✅ {CFG.user_title} — Bot started\n"
         f"Rules:\n"
-        f"- All Sessions: {CFG.symbol} (adjust -{CFG.es_points_adjust:.0f})\n"
+        f"- Source: TradingView ({CFG.tv_exchange}:{CFG.tv_symbol})\n"
         f"- Direction: Bias(1H/4H) ➜ Wick-Cluster near Key Level\n"
         f"- Strongest Reason: Wick Rejection near Level\n"
         f"- Trade Types: Weak / Standard / Strong\n"
