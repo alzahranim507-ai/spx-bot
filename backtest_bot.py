@@ -1375,6 +1375,13 @@ def main():
 def run_backtest():
     print("starting backtest...")
 
+    symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
+
+    print("symbol:", symbol)
+    print("5m bars:", len(df_5m))
+    print("15m bars:", len(df_15m))
+    print("1h bars:", len(df_1h))
+    print("4h bars:", len(df_4h))
 
 if __name__ == "__main__":
     run_backtest()
