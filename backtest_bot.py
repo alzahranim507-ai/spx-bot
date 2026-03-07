@@ -1383,6 +1383,35 @@ def run_backtest():
     print("1h bars:", len(df_1h))
     print("4h bars:", len(df_4h))
 
+    # هنا نضيف الباك تست
+
+    wins = 0
+    losses = 0
+    trades = 0
+
+    for i in range(20, len(df_5m) - 1):
+        candle = df_5m.iloc[i]
+        next_candle = df_5m.iloc[i + 1]
+
+        entry = candle["close"]
+        stop = entry - 10
+        target = entry + 20
+
+        trades += 1
+
+        if next_candle["high"] >= target:
+            wins += 1
+        elif next_candle["low"] <= stop:
+            losses += 1
+
+    print("------ BACKTEST RESULTS ------")
+    print("Trades:", trades)
+    print("Wins:", wins)
+    print("Losses:", losses)
+
+    if trades > 0:
+        winrate = (wins / trades) * 100
+        print("Winrate:", round(winrate, 2), "%")
 if __name__ == "__main__":
     run_backtest()
     print("backtest finished successfully")
