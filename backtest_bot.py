@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 backtest_bot.py
-Hunter Smart Dual-Engine Backtest (3 Months)
+Hunter Smart - Range Reversal Backtest (3 Months)
 For: دكتور محمد
 
 Logic:
 - Source: TradingView via tvdatafeed
 - Symbol: FOREXCOM:SPX500
 - Test window: ~3 months
-- Session filter: 07:30 NY to 16:00 NY
-- Market regime:
-    * SQUEEZE   -> no trade
-    * RANGE     -> reversal engine only
-    * EXPANSION -> breakout engine only
+- Trade only in RANGE market
+- Reversal only:
+    * clear level
+    * wick rejection near level
+    * confirmation candle
 - Strong trades only
-- Confirmation candle required
+- Session filter: 07:30 NY to 16:00 NY
 - Conservative simulation:
     if stop and target touched in same candle after trigger -> stop first
 """
@@ -30,7 +30,7 @@ from tvDatafeed import TvDatafeed, Interval
 
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import EMAIndicator, MACD, ADXIndicator
-from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volatility import AverageTrueRange
 
 try:
     from zoneinfo import ZoneInfo
@@ -63,8 +63,8 @@ class Config:
 
     # Market state
     adx_window: int = 14
-    adx_trending_on: float = 25.0
     adx_range_on: float = 20.0
+    adx_hard_max_for_range: float = 24.0
 
     # Liquidity
     liquidity_lookback_5m: int = 60
@@ -87,15 +87,14 @@ class Config:
     # Trade strength thresholds
     strong_score_threshold: int = 6
     strong_conf_threshold: int = 78
-    standard_conf_threshold: int = 62
 
     # ATR fallback targets
     enable_t3: bool = True
-    atr_fallback_t1_mult_standard: float = 0.35
-    atr_fallback_t2_mult_standard: float = 0.65
-    atr_fallback_t3_mult_strong: float = 1.00
+    atr_fallback_t1_mult: float = 0.35
+    atr_fallback_t2_mult: float = 0.65
+    atr_fallback_t3_mult: float = 1.00
 
-    # Fetch sizes (~3 months)
+    # Fetch sizes (~3 months, practical from tvdatafeed may be less on 5m)
     bars_5m: int = 6500
     bars_15m: int = 2500
     bars_1h: int = 1800
@@ -250,6 +249,31 @@ def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
         return "Range"
     return "Weak"
 
+def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+    if len(df_1h) < (CFG.adx_window + 5):
+        return "Weak", None
+
+    adx = ADXIndicator(
+        high=df_1h["high"],
+        low=df_1h["low"],
+        close=df_1h["close"],
+        window=CFG.adx_window
+    ).adx()
+
+    adx_val = float(adx.iloc[-1]) if len(adx) else None
+    if adx_val is None or np.isnan(adx_val):
+        return "Weak", None
+
+    if adx_val <= CFG.adx_range_on:
+        return "Range", adx_val
+
+    if adx_val <= CFG.adx_hard_max_for_range:
+        bias = structure_bias(df_1h, df_4h)
+        if bias in ("Weak", "Range"):
+            return "Range", adx_val
+
+    return "Trending", adx_val
+
 def cluster_levels(levels: list, tol_frac: float, price_ref: float) -> list:
     if not levels:
         return []
@@ -313,14 +337,6 @@ def compute_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     ).average_true_range()
     out["atr_5m"] = atr
 
-    bb = BollingerBands(close=out["close"], window=20, window_dev=2)
-    out["bb_high"] = bb.bollinger_hband()
-    out["bb_low"] = bb.bollinger_lband()
-    out["bb_mid"] = bb.bollinger_mavg()
-    out["bb_width"] = (out["bb_high"] - out["bb_low"]) / out["bb_mid"].replace(0, np.nan)
-
-    out["atr5m_mean50"] = out["atr_5m"].rolling(50).mean()
-
     return out
 
 def stoch_cross(df_5m: pd.DataFrame, direction: str) -> bool:
@@ -366,28 +382,6 @@ def rejection_lite(df_5m: pd.DataFrame, direction: str) -> bool:
         return upper / rng >= 0.25
     return False
 
-def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
-    price = float(df_5m["close"].iloc[-1])
-    window = df_5m.tail(8)
-
-    if direction == "BUY":
-        broke = (window["close"] > level).any()
-        retest = (
-            near_level(price, level, CFG.level_touch_tolerance_frac)
-            or near_level(float(window["low"].min()), level, CFG.level_touch_tolerance_frac)
-        )
-        return bool(broke and retest and price >= level)
-
-    if direction == "SELL":
-        broke = (window["close"] < level).any()
-        retest = (
-            near_level(price, level, CFG.level_touch_tolerance_frac)
-            or near_level(float(window["high"].max()), level, CFG.level_touch_tolerance_frac)
-        )
-        return bool(broke and retest and price <= level)
-
-    return False
-
 def liquidity_state(df_5m: pd.DataFrame) -> tuple[str, float | None]:
     if "volume" not in df_5m.columns:
         return "Normal", None
@@ -429,51 +423,6 @@ def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
     if not np.isfinite(val) or val <= 0:
         return None
     return val
-
-
-# =========================
-# Market regime
-# =========================
-
-def detect_market_regime(df_5m: pd.DataFrame, df_1h: pd.DataFrame, df_4h: pd.DataFrame):
-    """
-    Returns:
-    - SQUEEZE
-    - RANGE
-    - EXPANSION
-    """
-    if len(df_5m) < 60:
-        return "RANGE", {}
-
-    last = df_5m.iloc[-1]
-
-    bb_width = float(last["bb_width"]) if pd.notna(last["bb_width"]) else np.nan
-    atr_now = float(last["atr_5m"]) if pd.notna(last["atr_5m"]) else np.nan
-    atr_mean = float(last["atr5m_mean50"]) if pd.notna(last["atr5m_mean50"]) else np.nan
-
-    adx = ADXIndicator(
-        high=df_1h["high"], low=df_1h["low"], close=df_1h["close"], window=CFG.adx_window
-    ).adx()
-    adx_val = float(adx.iloc[-1]) if len(adx) else np.nan
-
-    info = {
-        "bb_width": bb_width,
-        "atr_now": atr_now,
-        "atr_mean": atr_mean,
-        "adx": adx_val,
-    }
-
-    bb_squeeze = np.isfinite(bb_width) and bb_width < 0.0035
-    atr_compressed = np.isfinite(atr_now) and np.isfinite(atr_mean) and atr_now < (atr_mean * 0.82)
-    atr_expanding = np.isfinite(atr_now) and np.isfinite(atr_mean) and atr_now > (atr_mean * 1.15)
-
-    if bb_squeeze and atr_compressed:
-        return "SQUEEZE", info
-
-    if np.isfinite(adx_val) and adx_val >= CFG.adx_trending_on and atr_expanding:
-        return "EXPANSION", info
-
-    return "RANGE", info
 
 
 # =========================
@@ -570,15 +519,8 @@ def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: list) -
 
 
 # =========================
-# Scoring / confidence
+# Reversal scoring / confirmation
 # =========================
-
-def classify_trade_strength(score: int, confidence: int) -> str:
-    if score >= CFG.strong_score_threshold or confidence >= CFG.strong_conf_threshold:
-        return "Strong"
-    if confidence >= CFG.standard_conf_threshold or score >= 5:
-        return "Standard"
-    return "Weak"
 
 def weighted_reversal_score(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict):
     score = 0
@@ -619,37 +561,6 @@ def weighted_reversal_score(df_5m: pd.DataFrame, level_hit: float, direction: st
     conf = int(round((score / 10) * 100))
     return score, conf, reasons, trigger, wick_ok
 
-def weighted_breakout_score(df_5m: pd.DataFrame, level_hit: float, direction: str):
-    score = 0
-    reasons = []
-    trigger = None
-
-    br = break_retest(df_5m, level_hit, direction)
-    ms = momentum_shift(df_5m, direction)
-    st = stoch_cross(df_5m, direction)
-
-    if br:
-        score += 5
-        reasons.append("Break&Retest")
-        trigger = "Break&Retest"
-
-    if ms:
-        score += 2
-        reasons.append("Momentum shift")
-
-    if st:
-        score += 1
-        reasons.append("Stoch RSI cross")
-
-    score = max(0, min(score, 10))
-    conf = int(round((score / 10) * 100))
-    return score, conf, reasons, trigger, br
-
-
-# =========================
-# Confirmation
-# =========================
-
 def reversal_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
     if len(df_5m) < 3:
         return False
@@ -662,16 +573,10 @@ def reversal_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
         return float(last["close"]) > float(prev["high"]) or float(last["close"]) > ema
     return float(last["close"]) < float(prev["low"]) or float(last["close"]) < ema
 
-def breakout_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
-    if len(df_5m) < 3:
-        return False
-
-    last = df_5m.iloc[-1]
-    ema = float(df_5m["ema20"].iloc[-1])
-
-    if direction == "BUY":
-        return float(last["close"]) > ema
-    return float(last["close"]) < ema
+def classify_trade_strength(score: int, confidence: int) -> str:
+    if score >= CFG.strong_score_threshold or confidence >= CFG.strong_conf_threshold:
+        return "Strong"
+    return "Weak"
 
 
 # =========================
@@ -689,13 +594,13 @@ def pick_targets(levels: list, entry: float, direction: str):
     below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
     return (below[0] if len(below) >= 1 else None, below[1] if len(below) >= 2 else None)
 
-def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | None, trade_type: str):
+def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | None):
     if exp_move_val is None or not np.isfinite(exp_move_val):
         return None, None, None
 
-    d1 = exp_move_val * CFG.atr_fallback_t1_mult_standard
-    d2 = exp_move_val * CFG.atr_fallback_t2_mult_standard
-    d3 = exp_move_val * CFG.atr_fallback_t3_mult_strong if (trade_type == "Strong" and CFG.enable_t3) else None
+    d1 = exp_move_val * CFG.atr_fallback_t1_mult
+    d2 = exp_move_val * CFG.atr_fallback_t2_mult
+    d3 = exp_move_val * CFG.atr_fallback_t3_mult if CFG.enable_t3 else None
 
     if direction == "BUY":
         return (
@@ -709,8 +614,7 @@ def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | Non
         entry - d3 if d3 is not None else None,
     )
 
-def compute_trade_plan(df_5m: pd.DataFrame, levels: list, level_hit: float, direction: str, trigger: str,
-                       trade_type: str, exp_move_val: float | None):
+def compute_trade_plan(df_5m: pd.DataFrame, levels: list, level_hit: float, direction: str, exp_move_val: float | None):
     last = df_5m.iloc[-1]
     price = float(last["close"])
     last_high = float(last["high"])
@@ -718,39 +622,21 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list, level_hit: float, dire
     atr5 = float(df_5m["atr_5m"].iloc[-1]) if "atr_5m" in df_5m.columns and pd.notna(df_5m["atr_5m"].iloc[-1]) else 2.5
     buffer = max(price * 0.0002, 0.5)
 
-    if trigger == "Wick Rejection near Level":
-        if direction == "BUY":
-            entry = float(max(price, last_high))
-            stop = float(min(last_low, level_hit) - max(buffer, atr5 * 0.35))
-        else:
-            entry = float(min(price, last_low))
-            stop = float(max(last_high, level_hit) + max(buffer, atr5 * 0.35))
-
-    elif trigger == "Break&Retest":
-        if direction == "BUY":
-            entry = float(max(price, level_hit + buffer))
-            stop = float(level_hit - max(buffer, atr5 * 0.50))
-        else:
-            entry = float(min(price, level_hit - buffer))
-            stop = float(level_hit + max(buffer, atr5 * 0.50))
-
+    if direction == "BUY":
+        entry = float(max(price, last_high))
+        stop = float(min(last_low, level_hit) - max(buffer, atr5 * 0.35))
     else:
-        if direction == "BUY":
-            entry = float(max(price, last_high))
-            stop = float(min(last_low, level_hit) - max(buffer, atr5 * 0.35))
-        else:
-            entry = float(min(price, last_low))
-            stop = float(max(last_high, level_hit) + max(buffer, atr5 * 0.35))
+        entry = float(min(price, last_low))
+        stop = float(max(last_high, level_hit) + max(buffer, atr5 * 0.35))
 
     t1, t2 = pick_targets(levels, entry, direction)
-    atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val, trade_type)
+    atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val)
 
     if t1 is None:
         t1 = atr_t1
     if t2 is None:
         t2 = atr_t2
-
-    t3 = atr_t3 if trade_type == "Strong" else None
+    t3 = atr_t3
 
     rr = None
     if t1 is not None:
@@ -765,7 +651,6 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list, level_hit: float, dire
         "t2": t2,
         "t3": t3,
         "rr": rr,
-        "trade_type": trade_type,
     }
 
 
@@ -786,45 +671,36 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
     session = session_label_from_ts(current_ts)
     level_now = float(df_5m["close"].iloc[-1])
 
-    bias = structure_bias(df_1h, df_4h)
+    market_label, adx_val = compute_market_state(df_1h, df_4h)
+    if market_label != "Range":
+        return None
+
     liq_state, _ = liquidity_state(df_5m)
+    if liq_state == "Low":
+        return None
+
     key_levels = extract_key_levels(df_15m, df_1h)
     exp_move_val = expected_move_1h(df_1h)
-    regime, regime_info = detect_market_regime(df_5m, df_1h, df_4h)
-
-    if regime == "SQUEEZE":
-        return None
 
     if not key_levels:
         return None
 
     level_hit, wick_info = choose_best_level(df_5m, level_now, key_levels)
 
-    if bias == "Bullish":
+    # In range, direction is chosen from rejection side of the wick cluster near level
+    if wick_info.get("lower_cluster"):
         direction = "BUY"
-    elif bias == "Bearish":
+    elif wick_info.get("upper_cluster"):
         direction = "SELL"
     else:
-        direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
+        return None
 
-    if regime == "RANGE":
-        score, conf, reasons, trigger, wick_ok = weighted_reversal_score(df_5m, level_hit, direction, wick_info)
+    score, conf, reasons, trigger, wick_ok = weighted_reversal_score(df_5m, level_hit, direction, wick_info)
 
-        if trigger is None or not wick_ok:
-            return None
+    if trigger is None or not wick_ok:
+        return None
 
-        if not reversal_confirmation_passed(df_5m, direction):
-            return None
-
-    elif regime == "EXPANSION":
-        score, conf, reasons, trigger, br = weighted_breakout_score(df_5m, level_hit, direction)
-
-        if trigger is None or not br:
-            return None
-
-        if not breakout_confirmation_passed(df_5m, direction):
-            return None
-    else:
+    if not reversal_confirmation_passed(df_5m, direction):
         return None
 
     trade_type = classify_trade_strength(score, conf)
@@ -837,8 +713,6 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
         levels=key_levels,
         level_hit=level_hit,
         direction=direction,
-        trigger=trigger,
-        trade_type=trade_type,
         exp_move_val=exp_move_val,
     )
 
@@ -849,7 +723,8 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
     return {
         "time": current_ts,
         "session": session,
-        "regime": regime,
+        "market_label": market_label,
+        "adx": adx_val,
         "direction": direction,
         "level_now": level_now,
         "level": float(level_hit),
@@ -1069,7 +944,7 @@ def run_backtest():
         results.append({
             "time": signal["time"],
             "session": signal["session"],
-            "regime": signal["regime"],
+            "market_label": signal["market_label"],
             "direction": signal["direction"],
             "trade_type": signal["trade_type"],
             "score": signal["score"],
@@ -1132,16 +1007,16 @@ def run_backtest():
     print("Average score:", avg_score)
     print("Net R result:", net_r)
 
-    print("\nBy regime:")
-    for rg in ["SQUEEZE", "RANGE", "EXPANSION"]:
-        sub = res[res["regime"] == rg]
+    print("\nBy market label:")
+    for ml in ["Range"]:
+        sub = res[res["market_label"] == ml]
         if len(sub) == 0:
             continue
         sub_triggered = int(sub["triggered"].sum())
         sub_wins = int(((sub["t1_hit"] == True) | (sub["status"].isin(["T2", "T3", "T1_ONLY_TIMEOUT"]))).sum())
         sub_net_r = round(float(sub["r_result"].sum()), 2)
         wr = round((sub_wins / sub_triggered) * 100, 2) if sub_triggered > 0 else 0.0
-        print(f"{rg}: signals={len(sub)}, triggered={sub_triggered}, winrate={wr}%, netR={sub_net_r}")
+        print(f"{ml}: signals={len(sub)}, triggered={sub_triggered}, winrate={wr}%, netR={sub_net_r}")
 
     out_path = "backtest_results.csv"
     res.to_csv(out_path, index=False)
