@@ -1,1 +1,2 @@
-worker: python backtest_bot.py
+worker: python spx_clean_bot.py
+
