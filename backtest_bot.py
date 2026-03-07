@@ -1,33 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 backtest_bot.py
-Backtest for Hunter WICK PRO logic on TradingView FOREXCOM:SPX500
+Hunter Smart Elite - Selective Backtest
+For: دكتور محمد
 
-What it does:
-- Uses the SAME core logic as the live bot:
-  * structure bias
-  * key levels
-  * wick rejection near level
-  * break & retest
-  * rejection
-  * momentum shift
-  * stoch cross
-  * confidence / trade type
-- Simulates one trade at a time over historical 5m candles
-- Prints summary:
-  * total signals
-  * triggered trades
-  * stop hits
-  * T1/T2/T3 hits
-  * no-trigger trades
-  * win rate
-
-Notes:
-- Conservative candle handling:
-  if stop and target are both touched in the same candle after entry,
-  stop is assumed first.
-- No Telegram here
-- No infinite loop
+Backtest rules:
+- Source: TradingView via tvdatafeed
+- Symbol: FOREXCOM:SPX500
+- Test window: last ~3 months using 5m / 15m / 1h / 4h data
+- Session filter: 07:30 NY to 16:00 NY only
+- Strong trades only
+- Market context first:
+    * Trending -> breakout / break&retest continuation only
+    * Range -> reversal / wick rejection only
+- Wick rejection requires confirmation candle
+- Conservative simulation:
+    if stop and target touched in same candle after trigger -> stop first
 """
 
 import os
@@ -60,8 +48,6 @@ class Config:
     tv_username: str = os.getenv("TV_USERNAME", "")
     tv_password: str = os.getenv("TV_PASSWORD", "")
 
-    user_title: str = "دكتور محمد"
-
     tz_riyadh: str = "Asia/Riyadh"
     tz_ny: str = "America/New_York"
 
@@ -73,10 +59,6 @@ class Config:
     level_touch_tolerance_frac: float = 0.0013
     level_cluster_tolerance_frac: float = 0.0010
     max_key_levels: int = 6
-
-    # Scoring / quality
-    score_threshold: int = 3
-    min_rr_to_t1: float = 1.35
 
     # Market state
     adx_window: int = 14
@@ -97,34 +79,33 @@ class Config:
     wick_near_level_tolerance_frac: float = 0.0010
     wick_min_abs_pts: float = 1.2
 
-    # Trade strength
-    strong_score_threshold: int = 5
-    strong_conf_threshold: int = 62
-    standard_conf_threshold: int = 50
+    # Quality filters
+    min_rr_to_t1: float = 1.35
+    require_strong_only: bool = True
 
-    # Dynamic targets
+    # Trade strength thresholds
+    strong_score_threshold: int = 5
+    strong_conf_threshold: int = 72
+    standard_conf_threshold: int = 58
+
+    # ATR fallback targets
     enable_t3: bool = True
-    atr_fallback_t1_mult_weak: float = 0.28
-    atr_fallback_t2_mult_weak: float = 0.45
     atr_fallback_t1_mult_standard: float = 0.35
     atr_fallback_t2_mult_standard: float = 0.65
     atr_fallback_t3_mult_strong: float = 1.00
 
     # Entry logic
-    aggressive_entry_for_strong_wick: bool = True
+    aggressive_entry_for_strong_wick: bool = False
 
-    # Session filter
-    offhours_min_score: int = 4
-    offhours_block_weak: bool = True
-
-    # Bars to fetch
-    bars_5m: int = 4500
-    bars_15m: int = 1800
+    # Fetch sizes
+    # ~3 months on 5m needs a lot. If TradingView/free limits, reduce if needed.
+    bars_5m: int = 6500
+    bars_15m: int = 2500
     bars_1h: int = 1800
 
     # Backtest behavior
-    warmup_5m_bars: int = 500
-    max_future_bars: int = 72   # 72 x 5m = 6 hours to resolve a trade
+    warmup_5m_bars: int = 600
+    max_future_bars: int = 96   # 96 x 5m = 8 hours max trade life
 
 
 CFG = Config()
@@ -158,14 +139,14 @@ def tzinfo(name: str):
 TZ_RIYADH = tzinfo(CFG.tz_riyadh)
 TZ_NY = tzinfo(CFG.tz_ny)
 
-def now_ny_from_ts(ts: pd.Timestamp) -> datetime:
+def to_ny(ts: pd.Timestamp) -> datetime:
     dt = ts.to_pydatetime()
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(TZ_NY)
 
 def session_label_from_ts(ts: pd.Timestamp) -> str:
-    t = now_ny_from_ts(ts)
+    t = to_ny(ts)
     hm = t.hour * 60 + t.minute
     pre_start = 4 * 60
     rth_start = 9 * 60 + 30
@@ -175,6 +156,14 @@ def session_label_from_ts(ts: pd.Timestamp) -> str:
     if rth_start <= hm < rth_end:
         return "Market"
     return "After-Hours"
+
+def is_allowed_session(ts: pd.Timestamp) -> bool:
+    """
+    Allow from 07:30 NY to 16:00 NY
+    """
+    t = to_ny(ts)
+    hm = t.hour * 60 + t.minute
+    return (7 * 60 + 30) <= hm <= (16 * 60)
 
 
 # =========================
@@ -251,7 +240,7 @@ def fetch_timeframes():
 
 
 # =========================
-# Core analysis functions
+# Core analysis
 # =========================
 
 def find_pivots(series: pd.Series, left: int, right: int):
@@ -296,6 +285,43 @@ def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
     if b1 == "Weak" and b4 == "Weak":
         return "Range"
     return "Weak"
+
+def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, prev_label: str = "Range"):
+    if len(df_1h) < (CFG.adx_window + 5):
+        return "Weak", "Neutral", None
+
+    adx = ADXIndicator(
+        high=df_1h["high"],
+        low=df_1h["low"],
+        close=df_1h["close"],
+        window=CFG.adx_window
+    ).adx()
+
+    adx_val = float(adx.iloc[-1]) if len(adx) else None
+    bias = structure_bias(df_1h, df_4h)
+
+    direction = "Neutral"
+    if bias == "Bullish":
+        direction = "Bullish"
+    elif bias == "Bearish":
+        direction = "Bearish"
+
+    if adx_val is None or np.isnan(adx_val):
+        return "Weak", direction, None
+
+    if adx_val >= CFG.adx_trending_on:
+        label = "Trending"
+    elif adx_val <= CFG.adx_range_on:
+        label = "Range"
+    else:
+        if prev_label == "Trending" and adx_val > CFG.adx_range_on:
+            label = "Trending"
+        elif prev_label == "Range" and adx_val < CFG.adx_trending_on:
+            label = "Range"
+        else:
+            label = "Weak"
+
+    return label, direction, adx_val
 
 def cluster_levels(levels: list, tol_frac: float, price_ref: float) -> list:
     if not levels:
@@ -434,52 +460,15 @@ def liquidity_state(df_5m: pd.DataFrame) -> tuple[str, float | None]:
         return "Normal", None
 
     ratio = cur / avg
-    t_low, t_high, t_ext = CFG.liquidity_thresholds
+    low_t, high_t, ext_t = CFG.liquidity_thresholds
 
-    if ratio < t_low:
+    if ratio < low_t:
         return "Low", ratio
-    if ratio < t_high:
+    if ratio < high_t:
         return "Normal", ratio
-    if ratio < t_ext:
+    if ratio < ext_t:
         return "High", ratio
     return "Extreme", ratio
-
-def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, prev_label: str = "Range"):
-    if len(df_1h) < (CFG.adx_window + 5):
-        return "Weak", "Neutral", None
-
-    adx = ADXIndicator(
-        high=df_1h["high"],
-        low=df_1h["low"],
-        close=df_1h["close"],
-        window=CFG.adx_window
-    ).adx()
-
-    adx_val = float(adx.iloc[-1]) if adx is not None and len(adx) else None
-    bias = structure_bias(df_1h, df_4h)
-
-    direction = "Neutral"
-    if bias == "Bullish":
-        direction = "Bullish"
-    elif bias == "Bearish":
-        direction = "Bearish"
-
-    if adx_val is None or np.isnan(adx_val):
-        return "Weak", direction, None
-
-    if adx_val >= CFG.adx_trending_on:
-        label = "Trending"
-    elif adx_val <= CFG.adx_range_on:
-        label = "Range"
-    else:
-        if prev_label == "Trending" and adx_val > CFG.adx_range_on:
-            label = "Trending"
-        elif prev_label == "Range" and adx_val < CFG.adx_trending_on:
-            label = "Range"
-        else:
-            label = "Weak"
-
-    return label, direction, adx_val
 
 def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
     if len(df_1h) < (CFG.expected_move_atr_window + 5):
@@ -489,7 +478,7 @@ def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
         high=df_1h["high"],
         low=df_1h["low"],
         close=df_1h["close"],
-        window=CFG.expected_move_atr_window,
+        window=CFG.expected_move_atr_window
     ).average_true_range()
 
     val = float(atr.iloc[-1])
@@ -578,29 +567,103 @@ def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: list) -
     chosen = near_candidates[0] if near_candidates else ranked[0]
     return chosen[1], chosen[2]
 
-def classify_trade_strength(score: int, conf: int) -> str:
-    if score >= CFG.strong_score_threshold or conf >= CFG.strong_conf_threshold:
+
+# =========================
+# Weighted confidence / score
+# =========================
+
+def weighted_signal_score(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict, market_label: str):
+    score = 0
+    reasons = []
+    trigger = None
+
+    br = break_retest(df_5m, level_hit, direction)
+    rj = rejection_lite(df_5m, direction)
+    st = stoch_cross(df_5m, direction)
+    ms = momentum_shift(df_5m, direction)
+
+    wick_ok = False
+    if direction == "BUY" and wick_info.get("lower_cluster"):
+        wick_ok = True
+        score += 3
+        reasons.append(f"Lower-wick cluster near {wick_info.get('bucket','N/A')}")
+        trigger = "Wick Rejection near Level"
+
+    if direction == "SELL" and wick_info.get("upper_cluster"):
+        wick_ok = True
+        score += 3
+        reasons.append(f"Upper-wick rejection cluster near {wick_info.get('bucket','N/A')}")
+        trigger = "Wick Rejection near Level"
+
+    if br:
+        score += 3 if market_label == "Trending" else 2
+        reasons.append("Break&Retest")
+        trigger = trigger or "Break&Retest"
+
+    if rj:
+        score += 2
+        reasons.append("Rejection")
+        trigger = trigger or "Rejection"
+
+    if ms:
+        score += 1
+        reasons.append("Momentum shift")
+
+    if st:
+        score += 1
+        reasons.append("Stoch RSI cross")
+
+    # hard context filter scoring
+    if market_label == "Trending":
+        # prefer breakout / continuation
+        if trigger == "Wick Rejection near Level" and not br:
+            score -= 3
+    elif market_label == "Range":
+        # prefer reversal
+        if br and not wick_ok and not rj:
+            score -= 3
+
+    score = max(0, min(score, 10))
+    confidence = int(round((score / 10) * 100))
+
+    return score, confidence, reasons, trigger, br, rj, ms, st, wick_ok
+
+
+# =========================
+# Trade strength / targets
+# =========================
+
+def classify_trade_strength(score: int, confidence: int) -> str:
+    if score >= CFG.strong_score_threshold or confidence >= CFG.strong_conf_threshold:
         return "Strong"
-    if conf >= CFG.standard_conf_threshold or score >= 4:
+    if confidence >= CFG.standard_conf_threshold or score >= 4:
         return "Standard"
     return "Weak"
+
+def pick_targets(levels: list, entry: float, direction: str):
+    if not levels:
+        return None, None
+
+    if direction == "BUY":
+        above = sorted([lvl for lvl in levels if lvl > entry])
+        return (
+            above[0] if len(above) >= 1 else None,
+            above[1] if len(above) >= 2 else None,
+        )
+
+    below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
+    return (
+        below[0] if len(below) >= 1 else None,
+        below[1] if len(below) >= 2 else None,
+    )
 
 def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | None, trade_type: str):
     if exp_move_val is None or not np.isfinite(exp_move_val):
         return None, None, None
 
-    if trade_type == "Weak":
-        d1 = exp_move_val * CFG.atr_fallback_t1_mult_weak
-        d2 = exp_move_val * CFG.atr_fallback_t2_mult_weak
-        d3 = None
-    elif trade_type == "Standard":
-        d1 = exp_move_val * CFG.atr_fallback_t1_mult_standard
-        d2 = exp_move_val * CFG.atr_fallback_t2_mult_standard
-        d3 = None
-    else:
-        d1 = exp_move_val * CFG.atr_fallback_t1_mult_standard
-        d2 = exp_move_val * CFG.atr_fallback_t2_mult_standard
-        d3 = exp_move_val * CFG.atr_fallback_t3_mult_strong if CFG.enable_t3 else None
+    d1 = exp_move_val * CFG.atr_fallback_t1_mult_standard
+    d2 = exp_move_val * CFG.atr_fallback_t2_mult_standard
+    d3 = exp_move_val * CFG.atr_fallback_t3_mult_strong if (trade_type == "Strong" and CFG.enable_t3) else None
 
     if direction == "BUY":
         return (
@@ -608,29 +671,12 @@ def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | Non
             entry + d2 if d2 is not None else None,
             entry + d3 if d3 is not None else None,
         )
-    else:
-        return (
-            entry - d1 if d1 is not None else None,
-            entry - d2 if d2 is not None else None,
-            entry - d3 if d3 is not None else None,
-        )
 
-def pick_targets(levels: list, entry: float, direction: str):
-    if not levels:
-        return None, None
-    if direction == "BUY":
-        above = sorted([lvl for lvl in levels if lvl > entry])
-        return (
-            above[0] if len(above) >= 1 else None,
-            above[1] if len(above) >= 2 else None
-        )
-    if direction == "SELL":
-        below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
-        return (
-            below[0] if len(below) >= 1 else None,
-            below[1] if len(below) >= 2 else None
-        )
-    return None, None
+    return (
+        entry - d1 if d1 is not None else None,
+        entry - d2 if d2 is not None else None,
+        entry - d3 if d3 is not None else None,
+    )
 
 def compute_trade_plan(
     df_5m: pd.DataFrame,
@@ -649,32 +695,27 @@ def compute_trade_plan(
 
     if trigger == "Wick Rejection near Level":
         if direction == "BUY":
-            if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
-                entry = float(max(price, level_hit + buffer * 0.4))
-            else:
-                entry = float(max(price, (last_high + level_hit) / 2.0))
+            entry = float(max(price, last_high))
             stop = float(min(last_low, level_hit) - buffer)
         else:
-            if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
-                entry = float(min(price, level_hit - buffer * 0.4))
-            else:
-                entry = float(min(price, (last_low + level_hit) / 2.0))
+            entry = float(min(price, last_low))
             stop = float(max(last_high, level_hit) + buffer)
 
-    elif trigger == "Rejection":
-        if direction == "BUY":
-            entry = float(max(price, last_high - buffer * 0.4))
-            stop = float(min(last_low, level_hit) - buffer)
-        else:
-            entry = float(min(price, last_low + buffer * 0.4))
-            stop = float(max(last_high, level_hit) + buffer)
-    else:
+    elif trigger == "Break&Retest":
         if direction == "BUY":
             entry = float(max(price, level_hit + buffer))
-            stop = float(level_hit - (price * 0.0013) - buffer)
+            stop = float(level_hit - (price * 0.0012) - buffer)
         else:
             entry = float(min(price, level_hit - buffer))
-            stop = float(level_hit + (price * 0.0013) + buffer)
+            stop = float(level_hit + (price * 0.0012) + buffer)
+
+    else:
+        if direction == "BUY":
+            entry = float(max(price, last_high))
+            stop = float(min(last_low, level_hit) - buffer)
+        else:
+            entry = float(min(price, last_low))
+            stop = float(max(last_high, level_hit) + buffer)
 
     t1, t2 = pick_targets(levels, entry, direction)
     atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val, trade_type)
@@ -702,72 +743,32 @@ def compute_trade_plan(
         "trade_type": trade_type,
     }
 
-def confidence_percent(score: int, direction: str, bias: str, session: str, market_label: str, liq_state: str) -> int:
-    base = int(round((score / 6) * 100))
-    adj = 0
 
-    if (bias == "Bullish" and direction == "BUY") or (bias == "Bearish" and direction == "SELL"):
-        adj += 6
-    if session in ("After-Hours", "Pre-Market"):
-        adj -= 5
-    if liq_state == "Low":
-        adj -= 6
-    elif liq_state == "High":
-        adj += 3
-    elif liq_state == "Extreme":
-        adj += 5
-    if market_label == "Trending":
-        adj += 2
-    if market_label == "Range":
-        adj += 1
+# =========================
+# Confirmation logic
+# =========================
 
-    return int(max(5, min(95, base + adj)))
+def wick_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
+    """
+    Require the last candle to confirm the rejection:
+    BUY: close > previous candle high or close > ema20
+    SELL: close < previous candle low or close < ema20
+    """
+    if len(df_5m) < 3:
+        return False
 
-def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict) -> tuple[int, list[str], str]:
-    score = 0
-    reasons: list[str] = []
-    trigger = None
+    last = df_5m.iloc[-1]
+    prev = df_5m.iloc[-2]
+    ema = float(df_5m["ema20"].iloc[-1])
 
-    wick_reason = None
-    if wick_info.get("upper_cluster") and direction == "SELL":
-        wick_reason = f"Upper-wick rejection cluster near {wick_info.get('bucket','N/A')}"
-    if wick_info.get("lower_cluster") and direction == "BUY":
-        wick_reason = f"Lower-wick cluster near support {wick_info.get('bucket','N/A')}"
-
-    if wick_reason:
-        score += 3
-        reasons.append("Wick Rejection near Level")
-        reasons.append(wick_reason)
-        trigger = "Wick Rejection near Level"
-
-    br = break_retest(df_5m, level_hit, direction)
-    rj = rejection_lite(df_5m, direction)
-    st = stoch_cross(df_5m, direction)
-    ms = momentum_shift(df_5m, direction)
-
-    if br:
-        score += 2
-        reasons.append("Break&Retest")
-        trigger = trigger or "Break&Retest"
-    if rj:
-        score += 2
-        reasons.append("Rejection")
-        trigger = trigger or "Rejection"
-    if st:
-        score += 1
-        reasons.append("Stoch RSI cross")
-    if ms:
-        score += 1
-        reasons.append("Momentum shift")
-
-    score = int(min(score, 6))
-    if trigger is None:
-        return 0, ["No trigger"], "None"
-    return score, reasons, trigger
+    if direction == "BUY":
+        return float(last["close"]) > float(prev["high"]) or float(last["close"]) > ema
+    else:
+        return float(last["close"]) < float(prev["low"]) or float(last["close"]) < ema
 
 
 # =========================
-# Signal generator from real bot logic
+# Signal generator
 # =========================
 
 def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
@@ -776,10 +777,14 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
 
     df_5m = compute_indicators_5m(df_5m)
     current_ts = df_5m.index[-1]
+
+    if not is_allowed_session(current_ts):
+        return None
+
     session = session_label_from_ts(current_ts)
     level_now = float(df_5m["close"].iloc[-1])
 
-    market_label, _, _ = compute_market_state(df_1h, df_4h, "Range")
+    market_label, _, market_adx = compute_market_state(df_1h, df_4h, "Range")
     liq_state, _ = liquidity_state(df_5m)
     bias = structure_bias(df_1h, df_4h)
     key_levels = extract_key_levels(df_15m, df_1h)
@@ -797,46 +802,33 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
     else:
         direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
 
-    sell_confirm = (
-        momentum_shift(df_5m, "SELL")
-        or stoch_cross(df_5m, "SELL")
-        or break_retest(df_5m, level_hit, "SELL")
-    )
-    buy_confirm = (
-        momentum_shift(df_5m, "BUY")
-        or stoch_cross(df_5m, "BUY")
-        or break_retest(df_5m, level_hit, "BUY")
+    score, confidence, reasons, trigger, br, rj, ms, st, wick_ok = weighted_signal_score(
+        df_5m, level_hit, direction, wick_info, market_label
     )
 
-    blocked = False
-
-    if direction == "BUY" and wick_info.get("upper_cluster"):
-        if sell_confirm:
-            direction = "SELL"
-        else:
-            blocked = True
-
-    if direction == "SELL" and wick_info.get("lower_cluster"):
-        if buy_confirm:
-            direction = "BUY"
-        else:
-            blocked = True
-
-    if blocked:
+    if score <= 0 or trigger is None:
         return None
 
-    score, reasons, trigger = score_setup(df_5m, level_hit, direction, wick_info)
-    if score <= 0 or score < CFG.score_threshold:
+    # Context enforcement
+    if market_label == "Trending":
+        # only continuation / breakout style
+        if not br:
+            return None
+
+    elif market_label == "Range":
+        # only reversal style
+        if trigger != "Wick Rejection near Level" and not rj:
+            return None
+
+    # confirmation after wick rejection
+    if trigger == "Wick Rejection near Level":
+        if not wick_confirmation_passed(df_5m, direction):
+            return None
+
+    trade_type = classify_trade_strength(score, confidence)
+
+    if CFG.require_strong_only and trade_type != "Strong":
         return None
-
-    conf = confidence_percent(score, direction, bias, session, market_label, liq_state)
-    trade_type = classify_trade_strength(score, conf)
-
-    if session in ("After-Hours", "Pre-Market"):
-        if score < CFG.offhours_min_score:
-            return None
-        if CFG.offhours_block_weak and trade_type == "Weak":
-            return None
 
     plan = compute_trade_plan(
         df_5m=df_5m,
@@ -854,6 +846,11 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
 
     return {
         "time": current_ts,
+        "session": session,
+        "market_label": market_label,
+        "market_adx": market_adx,
+        "liq_state": liq_state,
+        "bias": bias,
         "direction": direction,
         "level_now": level_now,
         "level": float(level_hit),
@@ -864,13 +861,10 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
         "t3": None if plan.get("t3") is None else float(plan["t3"]),
         "rr": None if plan.get("rr") is None else float(plan["rr"]),
         "score": int(score),
-        "confidence": int(conf),
+        "confidence": int(confidence),
         "trade_type": trade_type,
         "trigger": trigger,
         "reasons": reasons,
-        "session": session,
-        "market_label": market_label,
-        "liq_state": liq_state,
     }
 
 
@@ -878,12 +872,7 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
 # Trade simulator
 # =========================
 
-def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int = 72):
-    """
-    Conservative handling:
-    - pending until entry touched
-    - once live, if stop and target touched in same candle => stop first
-    """
+def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int = 96):
     direction = trade["direction"]
     entry = trade["entry"]
     stop = trade["stop"]
@@ -899,7 +888,6 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
     bars_to_check = future_5m.head(max_bars)
 
     for idx, (_, row) in enumerate(bars_to_check.iterrows(), start=1):
-        o = float(row["open"])
         h = float(row["high"])
         l = float(row["low"])
         c = float(row["close"])
@@ -916,9 +904,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                 else:
                     continue
 
-        # Once trade is live, conservative intrabar order:
-        # assume stop first if both touched in same candle
-
+        # conservative: stop first if same candle ambiguity
         if direction == "BUY":
             if l <= stop:
                 return {
@@ -943,7 +929,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "triggered": True,
                     "t1_hit": t1_hit,
                     "t2_hit": t2_hit,
-                    "t3_hit": t3_hit,
+                    "t3_hit": True,
                     "exit_bar": idx,
                     "exit_price": t3,
                     "r_result": 3.0,
@@ -954,14 +940,14 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "status": "T2",
                     "triggered": True,
                     "t1_hit": t1_hit,
-                    "t2_hit": t2_hit,
+                    "t2_hit": True,
                     "t3_hit": t3_hit,
                     "exit_bar": idx,
                     "exit_price": t2,
                     "r_result": 2.0,
                 }
 
-        else:  # SELL
+        else:
             if h >= stop:
                 return {
                     "status": "STOP",
@@ -985,7 +971,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "triggered": True,
                     "t1_hit": t1_hit,
                     "t2_hit": t2_hit,
-                    "t3_hit": t3_hit,
+                    "t3_hit": True,
                     "exit_bar": idx,
                     "exit_price": t3,
                     "r_result": 3.0,
@@ -996,7 +982,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "status": "T2",
                     "triggered": True,
                     "t1_hit": t1_hit,
-                    "t2_hit": t2_hit,
+                    "t2_hit": True,
                     "t3_hit": t3_hit,
                     "exit_bar": idx,
                     "exit_price": t2,
@@ -1077,6 +1063,7 @@ def run_backtest():
         results.append({
             "time": signal["time"],
             "session": signal["session"],
+            "market_label": signal["market_label"],
             "direction": signal["direction"],
             "trade_type": signal["trade_type"],
             "score": signal["score"],
@@ -1086,6 +1073,7 @@ def run_backtest():
             "t1": signal["t1"],
             "t2": signal["t2"],
             "t3": signal["t3"],
+            "rr": signal["rr"],
             "status": outcome["status"],
             "triggered": outcome["triggered"],
             "t1_hit": outcome["t1_hit"],
@@ -1095,7 +1083,6 @@ def run_backtest():
             "bars_in_trade": outcome["exit_bar"],
         })
 
-        # one trade at a time: jump forward until this trade resolves
         i += max(1, outcome["exit_bar"])
 
     res = pd.DataFrame(results)
@@ -1139,18 +1126,17 @@ def run_backtest():
     print("Average score:", avg_score)
     print("Net R result:", net_r)
 
-    print("\nBy trade type:")
-    for tt in ["Weak", "Standard", "Strong"]:
-        sub = res[res["trade_type"] == tt]
+    print("\nBy market label:")
+    for ml in ["Trending", "Range", "Weak"]:
+        sub = res[res["market_label"] == ml]
         if len(sub) == 0:
             continue
         sub_triggered = int(sub["triggered"].sum())
         sub_wins = int(((sub["t1_hit"] == True) | (sub["status"].isin(["T2", "T3", "T1_ONLY_TIMEOUT"]))).sum())
         sub_net_r = round(float(sub["r_result"].sum()), 2)
         wr = round((sub_wins / sub_triggered) * 100, 2) if sub_triggered > 0 else 0.0
-        print(f"{tt}: signals={len(sub)}, triggered={sub_triggered}, winrate={wr}%, netR={sub_net_r}")
+        print(f"{ml}: signals={len(sub)}, triggered={sub_triggered}, winrate={wr}%, netR={sub_net_r}")
 
-    # optional: save results
     out_path = "backtest_results.csv"
     res.to_csv(out_path, index=False)
     print("\nSaved detailed results to:", out_path)
