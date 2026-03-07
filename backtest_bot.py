@@ -1157,5 +1157,10 @@ def run_backtest():
 
 
 if __name__ == "__main__":
-    run_backtest()
-    print("backtest finished successfully")
+    try:
+        run_backtest()
+        print("backtest finished successfully")
+    except Exception as e:
+        import traceback
+        print("[BACKTEST ERROR]", repr(e))
+        traceback.print_exc()
