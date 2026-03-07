@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 backtest_bot.py
-Hunter Smart - Best Baseline + Stricter Confirmation
+Hunter Smart - Balanced Confirmation Backtest
 For: دكتور محمد
 
 Philosophy:
-- This version is based on the best-performing baseline seen so far
-  (the one that produced roughly +15R on recent testing).
-- We keep the same broad logic:
-    * 4h / 1h = context
+- Based on the best baseline seen so far
+- Keep the profitable core logic:
+    * 4h / 1h = market context
     * 15m = key levels
     * 5m = execution
     * Range -> reversal bias
     * Trending -> breakout / continuation bias
-- Only ONE deliberate upgrade is applied here:
-    * stricter confirmation before entry
 - Strong trades only
 - Session filter: 07:30 NY to 16:00 NY
+- Balanced confirmation:
+    stricter than the loose version,
+    looser than the very strict version
 - Conservative backtest:
     if stop and target touched in same candle after trigger -> stop first
 """
@@ -97,18 +97,18 @@ class Config:
     atr_fallback_t2_mult_standard: float = 0.65
     atr_fallback_t3_mult_strong: float = 1.00
 
-    # Fetch sizes (~3 months practical with current source behavior)
+    # Fetch sizes (~3 months practical with current source)
     bars_5m: int = 6500
     bars_15m: int = 2500
     bars_1h: int = 1800
 
     # Backtest behavior
     warmup_5m_bars: int = 600
-    max_future_bars: int = 96   # 96 x 5m = 8 hours max trade life
+    max_future_bars: int = 96   # 8 hours max trade life
 
-    # Confirmation strictness
-    min_body_ratio_confirm: float = 0.35
-    max_opposite_wick_ratio_confirm: float = 0.35
+    # Balanced confirmation
+    min_body_ratio_confirm: float = 0.25
+    max_opposite_wick_ratio_confirm: float = 0.45
 
 
 CFG = Config()
@@ -161,16 +161,13 @@ def session_label_from_ts(ts: pd.Timestamp) -> str:
     return "After-Hours"
 
 def is_allowed_session(ts: pd.Timestamp) -> bool:
-    """
-    Allow from 07:30 NY to 16:00 NY
-    """
     t = to_ny(ts)
     hm = t.hour * 60 + t.minute
     return (7 * 60 + 30) <= hm <= (16 * 60)
 
 
 # =========================
-# Safe formatting
+# Utilities
 # =========================
 
 def level_bucket_x(level: float) -> str:
@@ -180,18 +177,16 @@ def level_bucket_x(level: float) -> str:
     except Exception:
         return "N/A"
 
+def near_level(price: float, level: float, tol_frac: float) -> bool:
+    return abs(price - level) / max(price, 1e-9) <= tol_frac
+
 
 # =========================
 # TradingView fetching
 # =========================
 
 def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) -> pd.DataFrame:
-    df = TV.get_hist(
-        symbol=symbol,
-        exchange=exchange,
-        interval=interval,
-        n_bars=n_bars,
-    )
+    df = TV.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
 
     if df is None or df.empty:
         raise RuntimeError(f"TradingView empty data: {exchange}:{symbol} interval={interval} n_bars={n_bars}")
@@ -232,7 +227,7 @@ def fetch_timeframes():
 
 
 # =========================
-# Core analysis functions
+# Market structure / context
 # =========================
 
 def find_pivots(series: pd.Series, left: int, right: int):
@@ -289,7 +284,7 @@ def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, prev_label: s
         window=CFG.adx_window
     ).adx()
 
-    adx_val = float(adx.iloc[-1]) if adx is not None and len(adx) else None
+    adx_val = float(adx.iloc[-1]) if len(adx) else None
     bias = structure_bias(df_1h, df_4h)
 
     direction = "Neutral"
@@ -351,8 +346,10 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list:
 
     return merged
 
-def near_level(price: float, level: float, tol_frac: float) -> bool:
-    return abs(price - level) / max(price, 1e-9) <= tol_frac
+
+# =========================
+# Indicators
+# =========================
 
 def compute_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     out = df_5m.copy()
@@ -478,13 +475,18 @@ def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
         high=df_1h["high"],
         low=df_1h["low"],
         close=df_1h["close"],
-        window=CFG.expected_move_atr_window,
+        window=CFG.expected_move_atr_window
     ).average_true_range()
 
     val = float(atr.iloc[-1])
     if not np.isfinite(val) or val <= 0:
         return None
     return val
+
+
+# =========================
+# Levels / wick analysis
+# =========================
 
 def wick_cluster_near_level(df_5m: pd.DataFrame, level: float) -> dict:
     w = df_5m.tail(min(CFG.wick_cluster_lookback_5m, len(df_5m))).copy()
@@ -569,7 +571,7 @@ def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: list) -
 
 
 # =========================
-# Weighted confidence / score
+# Signal scoring
 # =========================
 
 def weighted_signal_score(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict, market_label: str):
@@ -742,7 +744,7 @@ def compute_trade_plan(
 
 
 # =========================
-# Stricter confirmation
+# Balanced confirmation
 # =========================
 
 def candle_quality_ok(candle: pd.Series, direction: str) -> bool:
@@ -762,13 +764,11 @@ def candle_quality_ok(candle: pd.Series, direction: str) -> bool:
         return False
 
     if direction == "BUY":
-        # confirmation candle should not have a large upper indecision wick
         if (upper / rng) > CFG.max_opposite_wick_ratio_confirm:
             return False
         return c > o
 
     if direction == "SELL":
-        # confirmation candle should not have a large lower indecision wick
         if (lower / rng) > CFG.max_opposite_wick_ratio_confirm:
             return False
         return c < o
@@ -777,15 +777,13 @@ def candle_quality_ok(candle: pd.Series, direction: str) -> bool:
 
 def reversal_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
     """
-    Stricter than before:
+    Balanced reversal confirmation:
     BUY:
-      - last close > previous high
-      - last close > EMA20
       - bullish confirmation candle quality
+      - and (close > prev high OR close > EMA20)
     SELL:
-      - last close < previous low
-      - last close < EMA20
       - bearish confirmation candle quality
+      - and (close < prev low OR close < EMA20)
     """
     if len(df_5m) < 3:
         return False
@@ -794,32 +792,31 @@ def reversal_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
     prev = df_5m.iloc[-2]
     ema = float(df_5m["ema20"].iloc[-1])
 
+    if not candle_quality_ok(last, direction):
+        return False
+
     if direction == "BUY":
         return (
             float(last["close"]) > float(prev["high"])
-            and float(last["close"]) > ema
-            and candle_quality_ok(last, "BUY")
+            or float(last["close"]) > ema
         )
 
     return (
         float(last["close"]) < float(prev["low"])
-        and float(last["close"]) < ema
-        and candle_quality_ok(last, "SELL")
+        or float(last["close"]) < ema
     )
 
 def breakout_confirmation_passed(df_5m: pd.DataFrame, direction: str, level_hit: float) -> bool:
     """
-    Stricter breakout confirmation:
+    Balanced breakout confirmation:
     BUY:
-      - close > EMA20
-      - close > level_hit
       - bullish confirmation candle quality
-      - momentum shift present
+      - momentum shift
+      - and (close > level_hit OR close > EMA20)
     SELL:
-      - close < EMA20
-      - close < level_hit
       - bearish confirmation candle quality
-      - momentum shift present
+      - momentum shift
+      - and (close < level_hit OR close < EMA20)
     """
     if len(df_5m) < 3:
         return False
@@ -827,19 +824,24 @@ def breakout_confirmation_passed(df_5m: pd.DataFrame, direction: str, level_hit:
     last = df_5m.iloc[-1]
     ema = float(df_5m["ema20"].iloc[-1])
 
+    if not candle_quality_ok(last, direction):
+        return False
+
     if direction == "BUY":
         return (
-            float(last["close"]) > ema
-            and float(last["close"]) > level_hit
-            and candle_quality_ok(last, "BUY")
-            and momentum_shift(df_5m, "BUY")
+            momentum_shift(df_5m, "BUY")
+            and (
+                float(last["close"]) > level_hit
+                or float(last["close"]) > ema
+            )
         )
 
     return (
-        float(last["close"]) < ema
-        and float(last["close"]) < level_hit
-        and candle_quality_ok(last, "SELL")
-        and momentum_shift(df_5m, "SELL")
+        momentum_shift(df_5m, "SELL")
+        and (
+            float(last["close"]) < level_hit
+            or float(last["close"]) < ema
+        )
     )
 
 
@@ -885,9 +887,7 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
     if score <= 0 or trigger is None:
         return None
 
-    # Context enforcement
     if market_label == "Trending":
-        # continuation / breakout style only
         if not br:
             return None
 
@@ -895,7 +895,6 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
             return None
 
     elif market_label == "Range":
-        # reversal style only
         if trigger != "Wick Rejection near Level" and not rj:
             return None
 
@@ -984,7 +983,6 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                 else:
                     continue
 
-        # conservative: stop first if same-candle ambiguity
         if direction == "BUY":
             if l <= stop:
                 return {
@@ -1170,7 +1168,6 @@ def run_backtest():
             "bars_in_trade": outcome["exit_bar"],
         })
 
-        # one trade at a time
         i += max(1, outcome["exit_bar"])
 
     res = pd.DataFrame(results)
