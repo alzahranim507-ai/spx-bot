@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 backtest_bot.py
-Hunter Smart - Range Reversal Backtest (3 Months)
+Hunter Smart - Best Baseline + Stricter Confirmation
 For: دكتور محمد
 
-Logic:
-- Source: TradingView via tvdatafeed
-- Symbol: FOREXCOM:SPX500
-- Test window: ~3 months
-- Trade only in RANGE market
-- Reversal only:
-    * clear level
-    * wick rejection near level
-    * confirmation candle
+Philosophy:
+- This version is based on the best-performing baseline seen so far
+  (the one that produced roughly +15R on recent testing).
+- We keep the same broad logic:
+    * 4h / 1h = context
+    * 15m = key levels
+    * 5m = execution
+    * Range -> reversal bias
+    * Trending -> breakout / continuation bias
+- Only ONE deliberate upgrade is applied here:
+    * stricter confirmation before entry
 - Strong trades only
 - Session filter: 07:30 NY to 16:00 NY
-- Conservative simulation:
+- Conservative backtest:
     if stop and target touched in same candle after trigger -> stop first
 """
 
@@ -57,14 +59,14 @@ class Config:
     pivot_right: int = 3
 
     # Level detection / clustering
-    level_touch_tolerance_frac: float = 0.0012
-    level_cluster_tolerance_frac: float = 0.0009
+    level_touch_tolerance_frac: float = 0.0013
+    level_cluster_tolerance_frac: float = 0.0010
     max_key_levels: int = 6
 
     # Market state
     adx_window: int = 14
+    adx_trending_on: float = 25.0
     adx_range_on: float = 20.0
-    adx_hard_max_for_range: float = 24.0
 
     # Liquidity
     liquidity_lookback_5m: int = 60
@@ -77,7 +79,7 @@ class Config:
     wick_cluster_lookback_5m: int = 10
     wick_ratio_strong: float = 0.45
     wick_cluster_min_hits: int = 3
-    wick_near_level_tolerance_frac: float = 0.0009
+    wick_near_level_tolerance_frac: float = 0.0010
     wick_min_abs_pts: float = 1.2
 
     # Quality filters
@@ -85,23 +87,28 @@ class Config:
     require_strong_only: bool = True
 
     # Trade strength thresholds
-    strong_score_threshold: int = 6
-    strong_conf_threshold: int = 78
+    strong_score_threshold: int = 5
+    strong_conf_threshold: int = 72
+    standard_conf_threshold: int = 58
 
     # ATR fallback targets
     enable_t3: bool = True
-    atr_fallback_t1_mult: float = 0.35
-    atr_fallback_t2_mult: float = 0.65
-    atr_fallback_t3_mult: float = 1.00
+    atr_fallback_t1_mult_standard: float = 0.35
+    atr_fallback_t2_mult_standard: float = 0.65
+    atr_fallback_t3_mult_strong: float = 1.00
 
-    # Fetch sizes (~3 months, practical from tvdatafeed may be less on 5m)
+    # Fetch sizes (~3 months practical with current source behavior)
     bars_5m: int = 6500
     bars_15m: int = 2500
     bars_1h: int = 1800
 
     # Backtest behavior
-    warmup_5m_bars: int = 700
-    max_future_bars: int = 96   # 8 hours max trade life
+    warmup_5m_bars: int = 600
+    max_future_bars: int = 96   # 96 x 5m = 8 hours max trade life
+
+    # Confirmation strictness
+    min_body_ratio_confirm: float = 0.35
+    max_opposite_wick_ratio_confirm: float = 0.35
 
 
 CFG = Config()
@@ -120,7 +127,7 @@ TV = make_tv_client()
 
 
 # =========================
-# Timezone helpers
+# TZ helpers
 # =========================
 
 def tzinfo(name: str):
@@ -154,17 +161,38 @@ def session_label_from_ts(ts: pd.Timestamp) -> str:
     return "After-Hours"
 
 def is_allowed_session(ts: pd.Timestamp) -> bool:
+    """
+    Allow from 07:30 NY to 16:00 NY
+    """
     t = to_ny(ts)
     hm = t.hour * 60 + t.minute
     return (7 * 60 + 30) <= hm <= (16 * 60)
 
 
 # =========================
-# Fetching
+# Safe formatting
+# =========================
+
+def level_bucket_x(level: float) -> str:
+    try:
+        b = int(float(level) // 10) * 10
+        return f"{b}x"
+    except Exception:
+        return "N/A"
+
+
+# =========================
+# TradingView fetching
 # =========================
 
 def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) -> pd.DataFrame:
-    df = TV.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
+    df = TV.get_hist(
+        symbol=symbol,
+        exchange=exchange,
+        interval=interval,
+        n_bars=n_bars,
+    )
+
     if df is None or df.empty:
         raise RuntimeError(f"TradingView empty data: {exchange}:{symbol} interval={interval} n_bars={n_bars}")
 
@@ -179,6 +207,7 @@ def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) ->
         out["volume"] = np.nan
 
     out = out.sort_index()
+
     if getattr(out.index, "tz", None) is None:
         out.index = out.index.tz_localize("UTC")
 
@@ -203,7 +232,7 @@ def fetch_timeframes():
 
 
 # =========================
-# Core utilities
+# Core analysis functions
 # =========================
 
 def find_pivots(series: pd.Series, left: int, right: int):
@@ -249,9 +278,9 @@ def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
         return "Range"
     return "Weak"
 
-def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, prev_label: str = "Range"):
     if len(df_1h) < (CFG.adx_window + 5):
-        return "Weak", None
+        return "Weak", "Neutral", None
 
     adx = ADXIndicator(
         high=df_1h["high"],
@@ -260,19 +289,31 @@ def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
         window=CFG.adx_window
     ).adx()
 
-    adx_val = float(adx.iloc[-1]) if len(adx) else None
+    adx_val = float(adx.iloc[-1]) if adx is not None and len(adx) else None
+    bias = structure_bias(df_1h, df_4h)
+
+    direction = "Neutral"
+    if bias == "Bullish":
+        direction = "Bullish"
+    elif bias == "Bearish":
+        direction = "Bearish"
+
     if adx_val is None or np.isnan(adx_val):
-        return "Weak", None
+        return "Weak", direction, None
 
-    if adx_val <= CFG.adx_range_on:
-        return "Range", adx_val
+    if adx_val >= CFG.adx_trending_on:
+        label = "Trending"
+    elif adx_val <= CFG.adx_range_on:
+        label = "Range"
+    else:
+        if prev_label == "Trending" and adx_val > CFG.adx_range_on:
+            label = "Trending"
+        elif prev_label == "Range" and adx_val < CFG.adx_trending_on:
+            label = "Range"
+        else:
+            label = "Weak"
 
-    if adx_val <= CFG.adx_hard_max_for_range:
-        bias = structure_bias(df_1h, df_4h)
-        if bias in ("Weak", "Range"):
-            return "Range", adx_val
-
-    return "Trending", adx_val
+    return label, direction, adx_val
 
 def cluster_levels(levels: list, tol_frac: float, price_ref: float) -> list:
     if not levels:
@@ -313,14 +354,8 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list:
 def near_level(price: float, level: float, tol_frac: float) -> bool:
     return abs(price - level) / max(price, 1e-9) <= tol_frac
 
-
-# =========================
-# Indicators
-# =========================
-
 def compute_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     out = df_5m.copy()
-
     out["rsi"] = RSIIndicator(close=out["close"], window=14).rsi()
 
     st = StochRSIIndicator(close=out["close"], window=14, smooth1=3, smooth2=3)
@@ -332,10 +367,12 @@ def compute_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     macd = MACD(close=out["close"], window_slow=26, window_fast=12, window_sign=9)
     out["macd_hist"] = macd.macd_diff()
 
-    atr = AverageTrueRange(
-        high=out["high"], low=out["low"], close=out["close"], window=14
+    out["atr_5m"] = AverageTrueRange(
+        high=out["high"],
+        low=out["low"],
+        close=out["close"],
+        window=14
     ).average_true_range()
-    out["atr_5m"] = atr
 
     return out
 
@@ -382,6 +419,28 @@ def rejection_lite(df_5m: pd.DataFrame, direction: str) -> bool:
         return upper / rng >= 0.25
     return False
 
+def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
+    price = float(df_5m["close"].iloc[-1])
+    window = df_5m.tail(8)
+
+    if direction == "BUY":
+        broke = (window["close"] > level).any()
+        retest = (
+            near_level(price, level, CFG.level_touch_tolerance_frac)
+            or near_level(float(window["low"].min()), level, CFG.level_touch_tolerance_frac)
+        )
+        return bool(broke and retest and price >= level)
+
+    if direction == "SELL":
+        broke = (window["close"] < level).any()
+        retest = (
+            near_level(price, level, CFG.level_touch_tolerance_frac)
+            or near_level(float(window["high"].max()), level, CFG.level_touch_tolerance_frac)
+        )
+        return bool(broke and retest and price <= level)
+
+    return False
+
 def liquidity_state(df_5m: pd.DataFrame) -> tuple[str, float | None]:
     if "volume" not in df_5m.columns:
         return "Normal", None
@@ -416,25 +475,16 @@ def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
         return None
 
     atr = AverageTrueRange(
-        high=df_1h["high"], low=df_1h["low"], close=df_1h["close"], window=CFG.expected_move_atr_window
+        high=df_1h["high"],
+        low=df_1h["low"],
+        close=df_1h["close"],
+        window=CFG.expected_move_atr_window,
     ).average_true_range()
 
     val = float(atr.iloc[-1])
     if not np.isfinite(val) or val <= 0:
         return None
     return val
-
-
-# =========================
-# Level / wick engine
-# =========================
-
-def level_bucket_x(level: float) -> str:
-    try:
-        b = int(float(level) // 10) * 10
-        return f"{b}x"
-    except Exception:
-        return "N/A"
 
 def wick_cluster_near_level(df_5m: pd.DataFrame, level: float) -> dict:
     w = df_5m.tail(min(CFG.wick_cluster_lookback_5m, len(df_5m))).copy()
@@ -519,14 +569,15 @@ def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: list) -
 
 
 # =========================
-# Reversal scoring / confirmation
+# Weighted confidence / score
 # =========================
 
-def weighted_reversal_score(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict):
+def weighted_signal_score(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict, market_label: str):
     score = 0
     reasons = []
     trigger = None
 
+    br = break_retest(df_5m, level_hit, direction)
     rj = rejection_lite(df_5m, direction)
     st = stoch_cross(df_5m, direction)
     ms = momentum_shift(df_5m, direction)
@@ -534,15 +585,20 @@ def weighted_reversal_score(df_5m: pd.DataFrame, level_hit: float, direction: st
     wick_ok = False
     if direction == "BUY" and wick_info.get("lower_cluster"):
         wick_ok = True
-        score += 4
+        score += 3
         reasons.append(f"Lower-wick cluster near {wick_info.get('bucket','N/A')}")
         trigger = "Wick Rejection near Level"
 
     if direction == "SELL" and wick_info.get("upper_cluster"):
         wick_ok = True
-        score += 4
+        score += 3
         reasons.append(f"Upper-wick rejection cluster near {wick_info.get('bucket','N/A')}")
         trigger = "Wick Rejection near Level"
+
+    if br:
+        score += 3 if market_label == "Trending" else 2
+        reasons.append("Break&Retest")
+        trigger = trigger or "Break&Retest"
 
     if rj:
         score += 2
@@ -557,31 +613,29 @@ def weighted_reversal_score(df_5m: pd.DataFrame, level_hit: float, direction: st
         score += 1
         reasons.append("Stoch RSI cross")
 
+    if market_label == "Trending":
+        if trigger == "Wick Rejection near Level" and not br:
+            score -= 3
+    elif market_label == "Range":
+        if br and not wick_ok and not rj:
+            score -= 3
+
     score = max(0, min(score, 10))
-    conf = int(round((score / 10) * 100))
-    return score, conf, reasons, trigger, wick_ok
+    confidence = int(round((score / 10) * 100))
 
-def reversal_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
-    if len(df_5m) < 3:
-        return False
+    return score, confidence, reasons, trigger, br, rj, ms, st, wick_ok
 
-    last = df_5m.iloc[-1]
-    prev = df_5m.iloc[-2]
-    ema = float(df_5m["ema20"].iloc[-1])
 
-    if direction == "BUY":
-        return float(last["close"]) > float(prev["high"]) or float(last["close"]) > ema
-    return float(last["close"]) < float(prev["low"]) or float(last["close"]) < ema
+# =========================
+# Trade strength / targets
+# =========================
 
 def classify_trade_strength(score: int, confidence: int) -> str:
     if score >= CFG.strong_score_threshold or confidence >= CFG.strong_conf_threshold:
         return "Strong"
+    if confidence >= CFG.standard_conf_threshold or score >= 4:
+        return "Standard"
     return "Weak"
-
-
-# =========================
-# Targets / trade plan
-# =========================
 
 def pick_targets(levels: list, entry: float, direction: str):
     if not levels:
@@ -589,18 +643,24 @@ def pick_targets(levels: list, entry: float, direction: str):
 
     if direction == "BUY":
         above = sorted([lvl for lvl in levels if lvl > entry])
-        return (above[0] if len(above) >= 1 else None, above[1] if len(above) >= 2 else None)
+        return (
+            above[0] if len(above) >= 1 else None,
+            above[1] if len(above) >= 2 else None,
+        )
 
     below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
-    return (below[0] if len(below) >= 1 else None, below[1] if len(below) >= 2 else None)
+    return (
+        below[0] if len(below) >= 1 else None,
+        below[1] if len(below) >= 2 else None,
+    )
 
-def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | None):
+def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | None, trade_type: str):
     if exp_move_val is None or not np.isfinite(exp_move_val):
         return None, None, None
 
-    d1 = exp_move_val * CFG.atr_fallback_t1_mult
-    d2 = exp_move_val * CFG.atr_fallback_t2_mult
-    d3 = exp_move_val * CFG.atr_fallback_t3_mult if CFG.enable_t3 else None
+    d1 = exp_move_val * CFG.atr_fallback_t1_mult_standard
+    d2 = exp_move_val * CFG.atr_fallback_t2_mult_standard
+    d3 = exp_move_val * CFG.atr_fallback_t3_mult_strong if (trade_type == "Strong" and CFG.enable_t3) else None
 
     if direction == "BUY":
         return (
@@ -608,35 +668,61 @@ def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | Non
             entry + d2 if d2 is not None else None,
             entry + d3 if d3 is not None else None,
         )
+
     return (
         entry - d1 if d1 is not None else None,
         entry - d2 if d2 is not None else None,
         entry - d3 if d3 is not None else None,
     )
 
-def compute_trade_plan(df_5m: pd.DataFrame, levels: list, level_hit: float, direction: str, exp_move_val: float | None):
+def compute_trade_plan(
+    df_5m: pd.DataFrame,
+    levels: list,
+    level_hit: float,
+    direction: str,
+    trigger: str,
+    trade_type: str,
+    exp_move_val: float | None,
+):
     last = df_5m.iloc[-1]
     price = float(last["close"])
     last_high = float(last["high"])
     last_low = float(last["low"])
-    atr5 = float(df_5m["atr_5m"].iloc[-1]) if "atr_5m" in df_5m.columns and pd.notna(df_5m["atr_5m"].iloc[-1]) else 2.5
     buffer = max(price * 0.0002, 0.5)
 
-    if direction == "BUY":
-        entry = float(max(price, last_high))
-        stop = float(min(last_low, level_hit) - max(buffer, atr5 * 0.35))
+    if trigger == "Wick Rejection near Level":
+        if direction == "BUY":
+            entry = float(max(price, last_high))
+            stop = float(min(last_low, level_hit) - buffer)
+        else:
+            entry = float(min(price, last_low))
+            stop = float(max(last_high, level_hit) + buffer)
+
+    elif trigger == "Break&Retest":
+        if direction == "BUY":
+            entry = float(max(price, level_hit + buffer))
+            stop = float(level_hit - (price * 0.0012) - buffer)
+        else:
+            entry = float(min(price, level_hit - buffer))
+            stop = float(level_hit + (price * 0.0012) + buffer)
+
     else:
-        entry = float(min(price, last_low))
-        stop = float(max(last_high, level_hit) + max(buffer, atr5 * 0.35))
+        if direction == "BUY":
+            entry = float(max(price, last_high))
+            stop = float(min(last_low, level_hit) - buffer)
+        else:
+            entry = float(min(price, last_low))
+            stop = float(max(last_high, level_hit) + buffer)
 
     t1, t2 = pick_targets(levels, entry, direction)
-    atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val)
+    atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val, trade_type)
 
     if t1 is None:
         t1 = atr_t1
     if t2 is None:
         t2 = atr_t2
-    t3 = atr_t3
+
+    t3 = atr_t3 if trade_type == "Strong" else None
 
     rr = None
     if t1 is not None:
@@ -651,7 +737,110 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list, level_hit: float, dire
         "t2": t2,
         "t3": t3,
         "rr": rr,
+        "trade_type": trade_type,
     }
+
+
+# =========================
+# Stricter confirmation
+# =========================
+
+def candle_quality_ok(candle: pd.Series, direction: str) -> bool:
+    o = float(candle["open"])
+    h = float(candle["high"])
+    l = float(candle["low"])
+    c = float(candle["close"])
+
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+    body_ratio = body / rng
+
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    if body_ratio < CFG.min_body_ratio_confirm:
+        return False
+
+    if direction == "BUY":
+        # confirmation candle should not have a large upper indecision wick
+        if (upper / rng) > CFG.max_opposite_wick_ratio_confirm:
+            return False
+        return c > o
+
+    if direction == "SELL":
+        # confirmation candle should not have a large lower indecision wick
+        if (lower / rng) > CFG.max_opposite_wick_ratio_confirm:
+            return False
+        return c < o
+
+    return False
+
+def reversal_confirmation_passed(df_5m: pd.DataFrame, direction: str) -> bool:
+    """
+    Stricter than before:
+    BUY:
+      - last close > previous high
+      - last close > EMA20
+      - bullish confirmation candle quality
+    SELL:
+      - last close < previous low
+      - last close < EMA20
+      - bearish confirmation candle quality
+    """
+    if len(df_5m) < 3:
+        return False
+
+    last = df_5m.iloc[-1]
+    prev = df_5m.iloc[-2]
+    ema = float(df_5m["ema20"].iloc[-1])
+
+    if direction == "BUY":
+        return (
+            float(last["close"]) > float(prev["high"])
+            and float(last["close"]) > ema
+            and candle_quality_ok(last, "BUY")
+        )
+
+    return (
+        float(last["close"]) < float(prev["low"])
+        and float(last["close"]) < ema
+        and candle_quality_ok(last, "SELL")
+    )
+
+def breakout_confirmation_passed(df_5m: pd.DataFrame, direction: str, level_hit: float) -> bool:
+    """
+    Stricter breakout confirmation:
+    BUY:
+      - close > EMA20
+      - close > level_hit
+      - bullish confirmation candle quality
+      - momentum shift present
+    SELL:
+      - close < EMA20
+      - close < level_hit
+      - bearish confirmation candle quality
+      - momentum shift present
+    """
+    if len(df_5m) < 3:
+        return False
+
+    last = df_5m.iloc[-1]
+    ema = float(df_5m["ema20"].iloc[-1])
+
+    if direction == "BUY":
+        return (
+            float(last["close"]) > ema
+            and float(last["close"]) > level_hit
+            and candle_quality_ok(last, "BUY")
+            and momentum_shift(df_5m, "BUY")
+        )
+
+    return (
+        float(last["close"]) < ema
+        and float(last["close"]) < level_hit
+        and candle_quality_ok(last, "SELL")
+        and momentum_shift(df_5m, "SELL")
+    )
 
 
 # =========================
@@ -659,7 +848,7 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: list, level_hit: float, dire
 # =========================
 
 def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
-    if len(df_5m) < 80 or len(df_15m) < 120 or len(df_1h) < 120 or len(df_4h) < 30:
+    if len(df_5m) < 60 or len(df_15m) < 100 or len(df_1h) < 100 or len(df_4h) < 30:
         return None
 
     df_5m = compute_indicators_5m(df_5m)
@@ -671,14 +860,9 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
     session = session_label_from_ts(current_ts)
     level_now = float(df_5m["close"].iloc[-1])
 
-    market_label, adx_val = compute_market_state(df_1h, df_4h)
-    if market_label != "Range":
-        return None
-
+    market_label, _, market_adx = compute_market_state(df_1h, df_4h, "Range")
     liq_state, _ = liquidity_state(df_5m)
-    if liq_state == "Low":
-        return None
-
+    bias = structure_bias(df_1h, df_4h)
     key_levels = extract_key_levels(df_15m, df_1h)
     exp_move_val = expected_move_1h(df_1h)
 
@@ -687,23 +871,41 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
 
     level_hit, wick_info = choose_best_level(df_5m, level_now, key_levels)
 
-    # In range, direction is chosen from rejection side of the wick cluster near level
-    if wick_info.get("lower_cluster"):
+    if bias == "Bullish":
         direction = "BUY"
-    elif wick_info.get("upper_cluster"):
+    elif bias == "Bearish":
         direction = "SELL"
+    else:
+        direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
+
+    score, confidence, reasons, trigger, br, rj, ms, st, wick_ok = weighted_signal_score(
+        df_5m, level_hit, direction, wick_info, market_label
+    )
+
+    if score <= 0 or trigger is None:
+        return None
+
+    # Context enforcement
+    if market_label == "Trending":
+        # continuation / breakout style only
+        if not br:
+            return None
+
+        if not breakout_confirmation_passed(df_5m, direction, level_hit):
+            return None
+
+    elif market_label == "Range":
+        # reversal style only
+        if trigger != "Wick Rejection near Level" and not rj:
+            return None
+
+        if not reversal_confirmation_passed(df_5m, direction):
+            return None
+
     else:
         return None
 
-    score, conf, reasons, trigger, wick_ok = weighted_reversal_score(df_5m, level_hit, direction, wick_info)
-
-    if trigger is None or not wick_ok:
-        return None
-
-    if not reversal_confirmation_passed(df_5m, direction):
-        return None
-
-    trade_type = classify_trade_strength(score, conf)
+    trade_type = classify_trade_strength(score, confidence)
 
     if CFG.require_strong_only and trade_type != "Strong":
         return None
@@ -713,6 +915,8 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
         levels=key_levels,
         level_hit=level_hit,
         direction=direction,
+        trigger=trigger,
+        trade_type=trade_type,
         exp_move_val=exp_move_val,
     )
 
@@ -724,7 +928,9 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
         "time": current_ts,
         "session": session,
         "market_label": market_label,
-        "adx": adx_val,
+        "market_adx": market_adx,
+        "liq_state": liq_state,
+        "bias": bias,
         "direction": direction,
         "level_now": level_now,
         "level": float(level_hit),
@@ -735,7 +941,7 @@ def generate_signal_from_data(df_4h, df_1h, df_15m, df_5m):
         "t3": None if plan.get("t3") is None else float(plan["t3"]),
         "rr": None if plan.get("rr") is None else float(plan["rr"]),
         "score": int(score),
-        "confidence": int(conf),
+        "confidence": int(confidence),
         "trade_type": trade_type,
         "trigger": trigger,
         "reasons": reasons,
@@ -778,7 +984,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                 else:
                     continue
 
-        # conservative: stop first
+        # conservative: stop first if same-candle ambiguity
         if direction == "BUY":
             if l <= stop:
                 return {
@@ -803,7 +1009,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "triggered": True,
                     "t1_hit": t1_hit,
                     "t2_hit": t2_hit,
-                    "t3_hit": True,
+                    "t3_hit": t3_hit,
                     "exit_bar": idx,
                     "exit_price": t3,
                     "r_result": 3.0,
@@ -814,7 +1020,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "status": "T2",
                     "triggered": True,
                     "t1_hit": t1_hit,
-                    "t2_hit": True,
+                    "t2_hit": t2_hit,
                     "t3_hit": t3_hit,
                     "exit_bar": idx,
                     "exit_price": t2,
@@ -845,7 +1051,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "triggered": True,
                     "t1_hit": t1_hit,
                     "t2_hit": t2_hit,
-                    "t3_hit": True,
+                    "t3_hit": t3_hit,
                     "exit_bar": idx,
                     "exit_price": t3,
                     "r_result": 3.0,
@@ -856,7 +1062,7 @@ def simulate_trade_outcome(trade: dict, future_5m: pd.DataFrame, max_bars: int =
                     "status": "T2",
                     "triggered": True,
                     "t1_hit": t1_hit,
-                    "t2_hit": True,
+                    "t2_hit": t2_hit,
                     "t3_hit": t3_hit,
                     "exit_bar": idx,
                     "exit_price": t2,
@@ -964,6 +1170,7 @@ def run_backtest():
             "bars_in_trade": outcome["exit_bar"],
         })
 
+        # one trade at a time
         i += max(1, outcome["exit_bar"])
 
     res = pd.DataFrame(results)
@@ -1008,7 +1215,7 @@ def run_backtest():
     print("Net R result:", net_r)
 
     print("\nBy market label:")
-    for ml in ["Range"]:
+    for ml in ["Trending", "Range", "Weak"]:
         sub = res[res["market_label"] == ml]
         if len(sub) == 0:
             continue
