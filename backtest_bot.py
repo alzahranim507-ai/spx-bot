@@ -1372,7 +1372,10 @@ def main():
             print("[ERROR]", repr(e))
         time.sleep(CFG.loop_sleep_seconds)
 
+def run_backtest():
+    print("starting backtest...")
+
 
 if __name__ == "__main__":
-    print("backtest file ready")
+    run_backtest()
     
