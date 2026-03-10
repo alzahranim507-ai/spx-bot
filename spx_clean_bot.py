@@ -10,24 +10,25 @@ Data source:
 - No ES points adjustment
 
 Core idea:
-- Keep the original Hunter WICK style logic
-- Structure / levels / indicators all come from FOREXCOM:SPX500
+- Hunter WICK style logic
+- Structure / levels / indicators come from FOREXCOM:SPX500
 - Bias(1H/4H) -> wick behavior near important key level
 - ATR fallback targets if levels are insufficient
 - T3 optional for stronger setups
 - Trade classification: Weak / Standard / Strong
 - Safer flip logic (block first, flip only with extra confirmation)
-- Better level selection (importance-weighted, not nearest only)
-- Better entry logic (less late on strong rejection setups)
-- Full safe formatting
+- Better level selection (importance-weighted)
+- Better entry logic
 - Session filter for weaker off-hours signals
 - Improved active trade management
+- Better TV fetch resilience
+- Better wick trade filtering (do NOT kill all wick trades)
 
 Env vars:
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
-- TV_USERNAME   (optional)
-- TV_PASSWORD   (optional)
+- TV_USERNAME   (optional but recommended)
+- TV_PASSWORD   (optional but recommended)
 """
 
 import os
@@ -40,7 +41,6 @@ import pandas as pd
 import requests
 
 from tvDatafeed import TvDatafeed, Interval
-
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.volatility import AverageTrueRange
@@ -82,11 +82,11 @@ class Config:
     # Level detection / clustering
     level_touch_tolerance_frac: float = 0.0013
     level_cluster_tolerance_frac: float = 0.0010
-    max_key_levels: int = 6
+    max_key_levels: int = 7
 
     # Scoring
     score_threshold: int = 3
-    min_rr_to_t1: float = 1.35
+    min_rr_to_t1: float = 1.30
     signal_cooldown_minutes: int = 14
 
     # Market state
@@ -95,7 +95,7 @@ class Config:
     adx_trending_on: float = 25.0
     adx_range_on: float = 20.0
 
-    # Liquidity (if volume available from TradingView feed)
+    # Liquidity
     liquidity_lookback_5m: int = 60
     liquidity_thresholds: tuple = (0.60, 1.25, 2.00)
 
@@ -112,6 +112,11 @@ class Config:
     wick_cluster_min_hits: int = 3
     wick_near_level_tolerance_frac: float = 0.0010
     wick_min_abs_pts: float = 1.2
+
+    # Level quality
+    level_zone_near_pts: float = 18.0
+    level_min_touch_count: int = 2
+    level_strong_touch_count: int = 3
 
     # Trade strength
     strong_score_threshold: int = 5
@@ -153,9 +158,26 @@ class Config:
     no_signal_after_reset_minutes: int = 8
 
     # Bars to fetch
-    bars_5m: int = 1500
-    bars_15m: int = 1200
-    bars_1h: int = 1200
+    bars_5m: int = 900
+    bars_15m: int = 600
+    bars_1h: int = 400
+
+    # TradingView resilience
+    tv_retry_attempts: int = 3
+    tv_retry_sleep_base: float = 2.0
+    tv_fallback_bars: tuple = (800, 600, 500, 400, 300, 200)
+
+    # Error reporting
+    error_notify_cooldown_minutes: int = 15
+
+    # Optional safety filters
+    block_all_weak_trades: bool = False
+    block_counter_trend_in_trending_market: bool = True
+    require_momentum_confirmation: bool = True
+
+    # Wick trade filter
+    wick_trade_filter_enabled: bool = True
+    allow_counter_trend_wick_if_strong: bool = True
 
 
 CFG = Config()
@@ -171,6 +193,7 @@ def make_tv_client() -> TvDatafeed:
     return TvDatafeed()
 
 TV = make_tv_client()
+LAST_GOOD_DATA = {}
 
 
 # =========================
@@ -252,7 +275,11 @@ def send_telegram(text: str):
         return
 
     url = f"https://api.telegram.org/bot{CFG.telegram_bot_token}/sendMessage"
-    payload = {"chat_id": CFG.telegram_chat_id, "text": text, "disable_web_page_preview": True}
+    payload = {
+        "chat_id": CFG.telegram_chat_id,
+        "text": text,
+        "disable_web_page_preview": True
+    }
 
     for attempt in range(3):
         try:
@@ -269,20 +296,8 @@ def send_telegram(text: str):
 # TradingView fetching
 # =========================
 
-def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) -> pd.DataFrame:
-    df = TV.get_hist(
-        symbol=symbol,
-        exchange=exchange,
-        interval=interval,
-        n_bars=n_bars,
-    )
-
-    if df is None or df.empty:
-        raise RuntimeError(f"TradingView empty data: {exchange}:{symbol} interval={interval} n_bars={n_bars}")
-
+def _normalize_tv_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
-    # Standardize column names
     out.columns = [str(c).lower() for c in out.columns]
 
     for c in ["open", "high", "low", "close"]:
@@ -294,16 +309,81 @@ def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) ->
 
     out = out.sort_index()
 
-    # Make index tz-aware UTC if needed
     if getattr(out.index, "tz", None) is None:
         out.index = out.index.tz_localize("UTC")
 
-    # numeric sanitize
     for c in ["open", "high", "low", "close", "volume"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
     out = out.dropna(subset=["open", "high", "low", "close"])
+    if out.empty:
+        raise RuntimeError("Normalized TradingView dataframe is empty")
+
     return out
+
+def reinit_tv_client():
+    global TV
+    TV = make_tv_client()
+    print("[INFO] Reinitialized TradingView client")
+
+def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) -> pd.DataFrame:
+    global TV, LAST_GOOD_DATA
+
+    cache_key = f"{exchange}:{symbol}:{interval}"
+
+    bar_options = [n_bars]
+    for x in CFG.tv_fallback_bars:
+        if x not in bar_options:
+            bar_options.append(x)
+
+    last_err = None
+
+    for attempt in range(CFG.tv_retry_attempts):
+        for bars in bar_options:
+            try:
+                df = TV.get_hist(
+                    symbol=symbol,
+                    exchange=exchange,
+                    interval=interval,
+                    n_bars=bars,
+                )
+
+                if df is None or df.empty:
+                    last_err = RuntimeError(
+                        f"TradingView empty data: {exchange}:{symbol} interval={interval} n_bars={bars}"
+                    )
+                    continue
+
+                out = _normalize_tv_df(df)
+
+                min_needed = 120 if interval == Interval.in_1_hour else 150
+                if len(out) < min_needed:
+                    last_err = RuntimeError(
+                        f"TradingView too few bars: {exchange}:{symbol} interval={interval} got={len(out)}"
+                    )
+                    continue
+
+                LAST_GOOD_DATA[cache_key] = out.copy()
+                return out
+
+            except Exception as e:
+                last_err = e
+
+        try:
+            reinit_tv_client()
+        except Exception as reinit_err:
+            last_err = reinit_err
+
+        time.sleep(CFG.tv_retry_sleep_base * (attempt + 1))
+
+    cached = LAST_GOOD_DATA.get(cache_key)
+    if cached is not None and not cached.empty:
+        print(f"[WARN] Using cached data for {cache_key} بسبب فشل الجلب: {repr(last_err)}")
+        return cached.copy()
+
+    raise RuntimeError(
+        f"TradingView fetch failed repeatedly: {exchange}:{symbol} interval={interval} | last_error={repr(last_err)}"
+    )
 
 def fetch_timeframes():
     symbol = CFG.tv_symbol
@@ -329,8 +409,8 @@ def find_pivots(series: pd.Series, left: int, right: int):
     n = len(arr)
     for i in range(left, n - right):
         v = arr[i]
-        wl = arr[i - left : i]
-        wr = arr[i + 1 : i + 1 + right]
+        wl = arr[i - left: i]
+        wr = arr[i + 1: i + 1 + right]
         if np.all(v > wl) and np.all(v >= wr):
             piv_hi.append(i)
         if np.all(v < wl) and np.all(v <= wr):
@@ -341,7 +421,7 @@ def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
     def bias_from(df):
         hi_idx, lo_idx = find_pivots(df["high"], CFG.pivot_left, CFG.pivot_right)
         highs = [float(df["high"].iloc[i]) for i in hi_idx][-2:]
-        lows  = [float(df["low"].iloc[i])  for i in lo_idx][-2:]
+        lows = [float(df["low"].iloc[i]) for i in lo_idx][-2:]
         if len(highs) < 2 or len(lows) < 2:
             return "Weak"
         h1, h2 = highs[-2], highs[-1]
@@ -384,8 +464,8 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list:
     price = float(df_15m["close"].iloc[-1])
 
     hi_idx, lo_idx = find_pivots(df_1h["high"], CFG.pivot_left, CFG.pivot_right)
-    swing_highs = [float(df_1h["high"].iloc[i]) for i in hi_idx][-12:] if hi_idx else []
-    swing_lows  = [float(df_1h["low"].iloc[i])  for i in lo_idx][-12:] if lo_idx else []
+    swing_highs = [float(df_1h["high"].iloc[i]) for i in hi_idx][-14:] if hi_idx else []
+    swing_lows = [float(df_1h["low"].iloc[i]) for i in lo_idx][-14:] if lo_idx else []
 
     recent = df_15m.tail(220)
     range_hi = float(recent["high"].max())
@@ -395,7 +475,7 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list:
     candidates = [float(x) for x in candidates if np.isfinite(x)]
 
     merged = cluster_levels(candidates, CFG.level_cluster_tolerance_frac, price)
-    merged = sorted(merged, key=lambda x: abs(x - price))[: max(CFG.max_key_levels * 3, 18)]
+    merged = sorted(merged, key=lambda x: abs(x - price))[: max(CFG.max_key_levels * 4, 20)]
     merged = sorted(cluster_levels(merged, CFG.level_cluster_tolerance_frac, price))
 
     if len(merged) > CFG.max_key_levels:
@@ -452,6 +532,26 @@ def momentum_shift(df_5m: pd.DataFrame, direction: str) -> bool:
         return (c < ema) or (hist_prev > 0 and hist < 0)
     return False
 
+def strong_buy_confirmation(df_5m: pd.DataFrame) -> bool:
+    if len(df_5m) < 5:
+        return False
+    c = float(df_5m["close"].iloc[-1])
+    ema = float(df_5m["ema20"].iloc[-1])
+    macd_hist = float(df_5m["macd_hist"].iloc[-1])
+    k = float(df_5m["stochrsi_k"].iloc[-1])
+    d = float(df_5m["stochrsi_d"].iloc[-1])
+    return (c > ema) and (macd_hist > 0) and (k >= d)
+
+def strong_sell_confirmation(df_5m: pd.DataFrame) -> bool:
+    if len(df_5m) < 5:
+        return False
+    c = float(df_5m["close"].iloc[-1])
+    ema = float(df_5m["ema20"].iloc[-1])
+    macd_hist = float(df_5m["macd_hist"].iloc[-1])
+    k = float(df_5m["stochrsi_k"].iloc[-1])
+    d = float(df_5m["stochrsi_d"].iloc[-1])
+    return (c < ema) and (macd_hist < 0) and (k <= d)
+
 def rejection_lite(df_5m: pd.DataFrame, direction: str) -> bool:
     c = df_5m.iloc[-1]
     o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
@@ -465,22 +565,27 @@ def rejection_lite(df_5m: pd.DataFrame, direction: str) -> bool:
     return False
 
 def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
-    price = float(df_5m["close"].iloc[-1])
-    window = df_5m.tail(8)
+    window = df_5m.tail(10)
+    if len(window) < 4:
+        return False
+
+    last_close = float(window["close"].iloc[-1])
+    prev_close = float(window["close"].iloc[-2])
+    last_low = float(window["low"].iloc[-1])
+    last_high = float(window["high"].iloc[-1])
+
     if direction == "BUY":
-        broke = (window["close"] > level).any()
-        retest = (
-            near_level(price, level, CFG.level_touch_tolerance_frac)
-            or near_level(float(window["low"].min()), level, CFG.level_touch_tolerance_frac)
-        )
-        return bool(broke and retest and price >= level)
+        broke = (window["close"] > level).sum() >= 2
+        retest = abs(last_low - level) <= 2.0 or abs(prev_close - level) <= 2.0
+        hold = last_close > level
+        return bool(broke and retest and hold)
+
     if direction == "SELL":
-        broke = (window["close"] < level).any()
-        retest = (
-            near_level(price, level, CFG.level_touch_tolerance_frac)
-            or near_level(float(window["high"].max()), level, CFG.level_touch_tolerance_frac)
-        )
-        return bool(broke and retest and price <= level)
+        broke = (window["close"] < level).sum() >= 2
+        retest = abs(last_high - level) <= 2.0 or abs(prev_close - level) <= 2.0
+        hold = last_close < level
+        return bool(broke and retest and hold)
+
     return False
 
 
@@ -600,28 +705,37 @@ def eta_to_t1_minutes(df_5m: pd.DataFrame, price_now: float, t1: float, directio
 
 
 # =========================
-# Wick Cluster
+# Wick Cluster / Level Quality
 # =========================
 
 def wick_cluster_near_level(df_5m: pd.DataFrame, level: float) -> dict:
     w = df_5m.tail(min(CFG.wick_cluster_lookback_5m, len(df_5m))).copy()
     if w.empty:
-        return {"upper_cluster": False, "lower_cluster": False, "upper_hits": 0, "lower_hits": 0, "bucket": level_bucket_x(level)}
+        return {
+            "upper_cluster": False,
+            "lower_cluster": False,
+            "upper_hits": 0,
+            "lower_hits": 0,
+            "bucket": level_bucket_x(level),
+        }
 
     upper_hits = 0
     lower_hits = 0
 
     for _, r in w.iterrows():
-        o = float(r["open"]); h = float(r["high"]); l = float(r["low"]); c = float(r["close"])
+        o = float(r["open"])
+        h = float(r["high"])
+        l = float(r["low"])
+        c = float(r["close"])
         rng = max(h - l, 1e-9)
 
         upper = h - max(o, c)
         lower = min(o, c) - l
 
         near = (
-            (abs(h - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac) or
-            (abs(l - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac) or
-            (abs(c - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac)
+            (abs(h - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac)
+            or (abs(l - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac)
+            or (abs(c - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac)
         )
 
         if not near:
@@ -632,53 +746,70 @@ def wick_cluster_near_level(df_5m: pd.DataFrame, level: float) -> dict:
         if lower >= CFG.wick_min_abs_pts and (lower / rng) >= CFG.wick_ratio_strong:
             lower_hits += 1
 
-    upper_cluster = upper_hits >= CFG.wick_cluster_min_hits
-    lower_cluster = lower_hits >= CFG.wick_cluster_min_hits
-
     return {
-        "upper_cluster": bool(upper_cluster),
-        "lower_cluster": bool(lower_cluster),
+        "upper_cluster": upper_hits >= CFG.wick_cluster_min_hits,
+        "lower_cluster": lower_hits >= CFG.wick_cluster_min_hits,
         "upper_hits": int(upper_hits),
         "lower_hits": int(lower_hits),
         "bucket": level_bucket_x(level),
     }
 
-
-# =========================
-# Level importance
-# =========================
-
-def score_level_importance(df_5m: pd.DataFrame, level_now: float, level: float) -> float:
-    wick_info = wick_cluster_near_level(df_5m, level)
-    distance_pts = abs(level_now - level)
-
-    score = 0.0
-    score += max(0.0, 20.0 - distance_pts) * 0.15
-    score += float(wick_info["upper_hits"] + wick_info["lower_hits"]) * 1.4
-
-    if near_level(level_now, level, CFG.level_touch_tolerance_frac):
-        score += 2.0
-
-    recent = df_5m.tail(30)
+def count_level_touches(df_5m: pd.DataFrame, level: float, lookback: int = 40, abs_tol: float = 2.0) -> int:
+    recent = df_5m.tail(min(lookback, len(df_5m)))
     touches = 0
     for _, r in recent.iterrows():
-        h = float(r["high"]); l = float(r["low"]); c = float(r["close"])
-        if abs(h - level) <= 2.0 or abs(l - level) <= 2.0 or abs(c - level) <= 2.0:
+        h = float(r["high"])
+        l = float(r["low"])
+        c = float(r["close"])
+        if abs(h - level) <= abs_tol or abs(l - level) <= abs_tol or abs(c - level) <= abs_tol:
             touches += 1
-    score += touches * 0.4
+    return touches
 
-    return float(score)
+def level_quality_info(df_5m: pd.DataFrame, level_now: float, level: float) -> dict:
+    wick_info = wick_cluster_near_level(df_5m, level)
+    touches = count_level_touches(df_5m, level)
+    distance_pts = abs(level_now - level)
+
+    quality_score = 0.0
+    quality_score += max(0.0, 22.0 - distance_pts) * 0.14
+    quality_score += float(wick_info["upper_hits"] + wick_info["lower_hits"]) * 1.5
+    quality_score += float(touches) * 0.45
+
+    if near_level(level_now, level, CFG.level_touch_tolerance_frac):
+        quality_score += 2.0
+
+    strong = (
+        touches >= CFG.level_strong_touch_count
+        or wick_info["upper_hits"] >= 2
+        or wick_info["lower_hits"] >= 2
+        or wick_info["upper_cluster"]
+        or wick_info["lower_cluster"]
+    )
+
+    tradable = (
+        touches >= CFG.level_min_touch_count
+        or wick_info["upper_hits"] >= 1
+        or wick_info["lower_hits"] >= 1
+    )
+
+    return {
+        "touches": touches,
+        "distance_pts": distance_pts,
+        "quality_score": float(quality_score),
+        "strong": bool(strong),
+        "tradable": bool(tradable),
+        "wick_info": wick_info,
+    }
 
 def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: list) -> tuple[float, dict]:
     ranked = []
     for lvl in key_levels:
-        wick_info = wick_cluster_near_level(df_5m, float(lvl))
-        imp = score_level_importance(df_5m, level_now, float(lvl))
-        ranked.append((imp, float(lvl), wick_info))
+        info = level_quality_info(df_5m, level_now, float(lvl))
+        ranked.append((info["quality_score"], float(lvl), info))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
 
-    near_candidates = [x for x in ranked if abs(x[1] - level_now) <= 18.0]
+    near_candidates = [x for x in ranked if abs(x[1] - level_now) <= CFG.level_zone_near_pts]
     chosen = near_candidates[0] if near_candidates else ranked[0]
     return chosen[1], chosen[2]
 
@@ -732,12 +863,16 @@ def pick_targets(levels: list, entry: float, direction: str):
         return None, None
     if direction == "BUY":
         above = sorted([lvl for lvl in levels if lvl > entry])
-        return (above[0] if len(above) >= 1 else None,
-                above[1] if len(above) >= 2 else None)
+        return (
+            above[0] if len(above) >= 1 else None,
+            above[1] if len(above) >= 2 else None
+        )
     if direction == "SELL":
         below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
-        return (below[0] if len(below) >= 1 else None,
-                below[1] if len(below) >= 2 else None)
+        return (
+            below[0] if len(below) >= 1 else None,
+            below[1] if len(below) >= 2 else None
+        )
     return None, None
 
 def compute_trade_plan(
@@ -785,7 +920,6 @@ def compute_trade_plan(
             stop = float(level_hit + (price * 0.0013) + buffer)
 
     t1, t2 = pick_targets(levels, entry, direction)
-
     atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val, trade_type)
 
     if t1 is None:
@@ -793,7 +927,25 @@ def compute_trade_plan(
     if t2 is None:
         t2 = atr_t2
 
-    t3 = atr_t3 if trade_type == "Strong" else None
+    t3 = None
+    if trade_type == "Strong" and atr_t3 is not None:
+        if direction == "BUY":
+            if t2 is None or atr_t3 > t2:
+                t3 = atr_t3
+        else:
+            if t2 is None or atr_t3 < t2:
+                t3 = atr_t3
+
+    # Final safety ordering
+    targets = [t for t in [t1, t2, t3] if t is not None and np.isfinite(t)]
+    if direction == "BUY":
+        targets = sorted(set(targets))
+    else:
+        targets = sorted(set(targets), reverse=True)
+
+    t1 = targets[0] if len(targets) > 0 else None
+    t2 = targets[1] if len(targets) > 1 else None
+    t3 = targets[2] if len(targets) > 2 else None
 
     rr = None
     if t1 is not None:
@@ -838,7 +990,7 @@ def confidence_percent(score: int, direction: str, bias: str, session: str, mark
     return int(max(5, min(95, base + adj)))
 
 def probability_t1_t2(conf: int, rr: float | None, dist_t1: float | None, dist_t2: float | None,
-                     exp_move_1h_val: float | None, liq_state: str, market_label: str) -> tuple[int, int]:
+                      exp_move_1h_val: float | None, liq_state: str, market_label: str) -> tuple[int, int]:
     t1 = float(conf)
 
     if rr is not None and np.isfinite(rr):
@@ -934,7 +1086,7 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
     trade_line = "-"
     if active_trade is not None:
         trade_line = (
-            f"{active_trade.get('direction','?')} | "
+            f"{active_trade.get('direction', '?')} | "
             f"Entry {safe_f1(active_trade.get('entry'))} | "
             f"Stop {safe_f1(active_trade.get('stop'))} | "
             f"T1 {safe_f1(active_trade.get('t1'))} | "
@@ -973,6 +1125,8 @@ class BotState:
         self.market_dir = "Neutral"
         self.market_adx = None
 
+        self.last_error_notify_utc = None
+
     def can_signal(self, key: str) -> bool:
         if self.no_signal_until_utc is not None and datetime.utcnow() < self.no_signal_until_utc:
             return False
@@ -983,6 +1137,16 @@ class BotState:
 
     def mark_signal(self, key: str):
         self.last_signal_ts[key] = datetime.utcnow()
+
+    def should_notify_error(self) -> bool:
+        nowu = datetime.utcnow()
+        if self.last_error_notify_utc is None:
+            self.last_error_notify_utc = nowu
+            return True
+        if (nowu - self.last_error_notify_utc) >= timedelta(minutes=CFG.error_notify_cooldown_minutes):
+            self.last_error_notify_utc = nowu
+            return True
+        return False
 
 STATE = BotState()
 
@@ -1030,9 +1194,13 @@ def maybe_daily_reset():
 
 def maybe_update_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
     nowu = datetime.utcnow()
-    should = STATE.market_state_last_calc_utc is None or (nowu - STATE.market_state_last_calc_utc) >= timedelta(minutes=CFG.market_state_update_minutes)
+    should = STATE.market_state_last_calc_utc is None or (
+        nowu - STATE.market_state_last_calc_utc
+    ) >= timedelta(minutes=CFG.market_state_update_minutes)
+
     if not should:
         return
+
     label, direction, adx_val = compute_market_state(df_1h, df_4h, STATE.market_label)
     STATE.market_label = label
     STATE.market_dir = direction
@@ -1041,7 +1209,7 @@ def maybe_update_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
 
 
 # =========================
-# Scoring
+# Scoring / Wick filtering
 # =========================
 
 def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict) -> tuple[int, list[str], str]:
@@ -1051,9 +1219,9 @@ def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info
 
     wick_reason = None
     if wick_info.get("upper_cluster") and direction == "SELL":
-        wick_reason = f"Upper-wick rejection cluster near {wick_info.get('bucket','N/A')}"
+        wick_reason = f"Upper-wick rejection cluster near {wick_info.get('bucket', 'N/A')}"
     if wick_info.get("lower_cluster") and direction == "BUY":
-        wick_reason = f"Lower-wick cluster near support {wick_info.get('bucket','N/A')}"
+        wick_reason = f"Lower-wick cluster near support {wick_info.get('bucket', 'N/A')}"
 
     if wick_reason:
         score += 3
@@ -1085,6 +1253,69 @@ def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info
     if trigger is None:
         return 0, ["No trigger"], "None"
     return score, reasons, trigger
+
+def wick_trade_is_valid(direction: str, trigger: str, level_info: dict, market_label: str, market_dir: str,
+                        df_5m: pd.DataFrame, score: int) -> bool:
+    """
+    Smart wick filter:
+    - keeps good wick trades
+    - rejects weak/noisy wick trades
+    """
+    if not CFG.wick_trade_filter_enabled:
+        return True
+
+    wick_info = level_info["wick_info"]
+    touches = level_info["touches"]
+    strong_level = level_info["strong"]
+
+    # Only enforce special rules if wick is part of the setup
+    is_wick_trade = (trigger == "Wick Rejection near Level") or wick_info.get("upper_cluster") or wick_info.get("lower_cluster")
+    if not is_wick_trade:
+        return True
+
+    # basic level quality
+    if not level_info["tradable"]:
+        return False
+
+    # side-specific wick evidence
+    if direction == "SELL":
+        if wick_info["upper_hits"] < 1 and not wick_info["upper_cluster"]:
+            return False
+    if direction == "BUY":
+        if wick_info["lower_hits"] < 1 and not wick_info["lower_cluster"]:
+            return False
+
+    # weak wick trade needs more context
+    if score <= 2 and not strong_level:
+        return False
+
+    # counter-trend wick trades must be stronger
+    if market_label == "Trending":
+        if market_dir == "Bullish" and direction == "SELL":
+            if not CFG.allow_counter_trend_wick_if_strong:
+                return False
+            if score < 5:
+                return False
+            if wick_info["upper_hits"] < 2 and not wick_info["upper_cluster"]:
+                return False
+            if touches < CFG.level_strong_touch_count:
+                return False
+            if not strong_sell_confirmation(df_5m):
+                return False
+
+        if market_dir == "Bearish" and direction == "BUY":
+            if not CFG.allow_counter_trend_wick_if_strong:
+                return False
+            if score < 5:
+                return False
+            if wick_info["lower_hits"] < 2 and not wick_info["lower_cluster"]:
+                return False
+            if touches < CFG.level_strong_touch_count:
+                return False
+            if not strong_buy_confirmation(df_5m):
+                return False
+
+    return True
 
 
 # =========================
@@ -1242,8 +1473,10 @@ def evaluate_once():
     if not key_levels:
         return
 
-    level_hit, wick_info = choose_best_level(df_5m, level_now, key_levels)
+    level_hit, level_info = choose_best_level(df_5m, level_now, key_levels)
+    wick_info = level_info["wick_info"]
 
+    # base direction
     if bias == "Bullish":
         direction = "BUY"
     elif bias == "Bearish":
@@ -1251,6 +1484,7 @@ def evaluate_once():
     else:
         direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
 
+    # safer flip logic
     sell_confirm = momentum_shift(df_5m, "SELL") or stoch_cross(df_5m, "SELL") or break_retest(df_5m, level_hit, "SELL")
     buy_confirm = momentum_shift(df_5m, "BUY") or stoch_cross(df_5m, "BUY") or break_retest(df_5m, level_hit, "BUY")
 
@@ -1278,10 +1512,78 @@ def evaluate_once():
     conf = confidence_percent(score, direction, bias, session, STATE.market_label, liq_state)
     trade_type = classify_trade_strength(score, conf)
 
+    # optional: block all weak trades
+    if CFG.block_all_weak_trades and trade_type == "Weak":
+        return
+
+    # off-hours filter
     if session in ("After-Hours", "Pre-Market"):
         if score < CFG.offhours_min_score:
             return
         if CFG.offhours_block_weak and trade_type == "Weak":
+            return
+
+    # trend protection
+    if CFG.block_counter_trend_in_trending_market and STATE.market_label == "Trending":
+        if STATE.market_dir == "Bullish" and direction == "SELL":
+            # do not kill strong reversal wick blindly
+            if not (CFG.allow_counter_trend_wick_if_strong and wick_trade_is_valid(
+                direction=direction,
+                trigger=trigger,
+                level_info=level_info,
+                market_label=STATE.market_label,
+                market_dir=STATE.market_dir,
+                df_5m=df_5m,
+                score=score,
+            )):
+                return
+
+        if STATE.market_dir == "Bearish" and direction == "BUY":
+            if not (CFG.allow_counter_trend_wick_if_strong and wick_trade_is_valid(
+                direction=direction,
+                trigger=trigger,
+                level_info=level_info,
+                market_label=STATE.market_label,
+                market_dir=STATE.market_dir,
+                df_5m=df_5m,
+                score=score,
+            )):
+                return
+
+    # wick-specific smart filter
+    if not wick_trade_is_valid(
+        direction=direction,
+        trigger=trigger,
+        level_info=level_info,
+        market_label=STATE.market_label,
+        market_dir=STATE.market_dir,
+        df_5m=df_5m,
+        score=score,
+    ):
+        return
+
+    # general momentum confirmation
+    if CFG.require_momentum_confirmation:
+        if direction == "BUY" and not strong_buy_confirmation(df_5m):
+            # allow very strong wick reversal if quality is high
+            if not (
+                trigger == "Wick Rejection near Level"
+                and level_info["strong"]
+                and wick_info["lower_hits"] >= 2
+            ):
+                return
+
+        if direction == "SELL" and not strong_sell_confirmation(df_5m):
+            if not (
+                trigger == "Wick Rejection near Level"
+                and level_info["strong"]
+                and wick_info["upper_hits"] >= 2
+            ):
+                return
+
+    # weak non-wick setups need better level quality
+    if trade_type == "Weak" and trigger != "Wick Rejection near Level":
+        if not level_info["strong"]:
             return
 
     plan = compute_trade_plan(
@@ -1298,7 +1600,7 @@ def evaluate_once():
     if rr is not None and np.isfinite(float(rr)) and float(rr) < CFG.min_rr_to_t1:
         return
 
-    key = f"{direction}:{round(level_hit,1)}:{trigger}:{trade_type}"
+    key = f"{direction}:{round(level_hit, 1)}:{trigger}:{trade_type}"
     if not STATE.can_signal(key):
         return
 
@@ -1359,8 +1661,9 @@ def main():
         f"- Trade Types: Weak / Standard / Strong\n"
         f"- ATR fallback targets: ON\n"
         f"- T3: {'ON' if CFG.enable_t3 else 'OFF'}\n"
-        f"- Safer flip logic: ON\n"
         f"- Session filter: ON\n"
+        f"- Smart wick filter: {'ON' if CFG.wick_trade_filter_enabled else 'OFF'}\n"
+        f"- Counter-trend protection: {'ON' if CFG.block_counter_trend_in_trending_market else 'OFF'}\n"
         f"- Stop: HardStop({CFG.hard_stop_buffer_pts:.1f} pts) + 5m close confirm"
     )
 
@@ -1368,8 +1671,17 @@ def main():
         try:
             evaluate_once()
         except Exception as e:
-            send_telegram(f"❌ {CFG.user_title}: خطأ - {repr(e)}")
             print("[ERROR]", repr(e))
+            try:
+                reinit_tv_client()
+            except Exception as reinit_err:
+                print("[WARN] TV client reinit failed:", repr(reinit_err))
+
+            if STATE.should_notify_error():
+                send_telegram(f"❌ {CFG.user_title}: خطأ بيانات TradingView - {repr(e)}")
+
+            time.sleep(15)
+
         time.sleep(CFG.loop_sleep_seconds)
 
 
