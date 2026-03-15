@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-SPX500 Trading Bot (Hunter WICK PRO Dynamic - FOREXCOM/TradingView)
+SPX500 Trading Bot (Hunter WICK PRO Dynamic+ - FOREXCOM/TradingView)
 For: دكتور محمد
 
-Dynamic version:
+Features:
 - TradingView via tvdatafeed
-- Symbol: FOREXCOM:SPX500
-- Dynamic target expansion after T2
-- Stop gets raised as targets are hit
+- Range-quality filter
+- Smart T2
+- Dynamic target extension
+- Reversal watch
+- Daily and weekly stats
 """
 
 import os
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone, date
 
 import numpy as np
 import pandas as pd
@@ -161,6 +163,40 @@ class Config:
     wick_trade_filter_enabled: bool = True
     allow_counter_trend_wick_if_strong: bool = True
 
+    # NEW: range behavior filter
+    range_quality_filter_enabled: bool = True
+    range_filter_only_when_adx_below: float = 21.0
+    range_min_space_pts: float = 14.0
+    range_min_space_expected_move_ratio: float = 0.55
+    range_max_nearby_levels_within_pts: float = 10.0
+    range_max_nearby_levels_count: int = 2
+
+    # NEW: adaptive stop in range
+    range_stop_extra_atr_mult: float = 0.18
+    range_stop_extra_min_pts: float = 0.8
+    range_stop_extra_max_pts: float = 3.0
+
+    # NEW: target map / probabilities
+    target_probability_min_to_show: int = 45
+    target_probability_min_to_extend: int = 50
+    max_initial_targets: int = 5
+    extension_rr_min_points: float = 4.0
+
+    # NEW: smart T2
+    smart_t2_enabled: bool = True
+    smart_t2_atr_mult: float = 0.95
+    smart_t2_expected_move_mult: float = 0.75
+    smart_t2_max_distance_ratio_to_t1: float = 2.2
+
+    # NEW: stats
+    stats_daily_enabled: bool = True
+    stats_weekly_enabled: bool = True
+    stats_daily_send_hour: int = 23
+    stats_daily_send_minute: int = 59
+    stats_weekly_send_weekday: int = 4   # Friday = 4 in Python weekday()
+    stats_weekly_send_hour: int = 23
+    stats_weekly_send_minute: int = 59
+
 
 CFG = Config()
 
@@ -239,6 +275,12 @@ def safe_f2(x, default="N/A"):
     except Exception:
         return default
 
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
 def level_bucket_x(level: float) -> str:
     try:
         b = int(float(level) // 10) * 10
@@ -272,6 +314,148 @@ def send_telegram(text: str):
         except Exception as e:
             print("[WARN] Telegram exception:", repr(e))
         time.sleep(1.3 * (attempt + 1))
+
+
+# =========================
+# Stats models
+# =========================
+
+@dataclass
+class ClosedTradeRecord:
+    closed_at_riyadh: datetime
+    direction: str
+    entry: float
+    stop: float
+    initial_stop: float
+    trade_type: str
+    result_label: str
+    max_target_hit: int
+    r_result: float
+    market_label: str
+    session: str
+
+@dataclass
+class StatsState:
+    closed_trades: list = field(default_factory=list)
+    last_daily_stats_sent_date: date | None = None
+    last_weekly_stats_sent_week_key: str | None = None
+
+    def add_trade(self, rec: ClosedTradeRecord):
+        self.closed_trades.append(rec)
+
+    def get_day_records(self, target_date: date):
+        return [x for x in self.closed_trades if x.closed_at_riyadh.date() == target_date]
+
+    def get_week_records_mon_to_fri(self, target_date: date):
+        weekday = target_date.weekday()  # Mon=0
+        monday = target_date - timedelta(days=weekday)
+        friday = monday + timedelta(days=4)
+        return [
+            x for x in self.closed_trades
+            if monday <= x.closed_at_riyadh.date() <= friday
+        ]
+
+
+# =========================
+# Stats helpers
+# =========================
+
+def summarize_records(records: list[ClosedTradeRecord]) -> dict:
+    total = len(records)
+    wins = sum(1 for r in records if r.r_result > 0)
+    losses = sum(1 for r in records if r.r_result < 0)
+    breakeven = sum(1 for r in records if abs(r.r_result) < 1e-9)
+    net_r = float(sum(r.r_result for r in records))
+
+    t1_only = sum(1 for r in records if r.max_target_hit == 1)
+    t2_hit = sum(1 for r in records if r.max_target_hit == 2)
+    t3_hit = sum(1 for r in records if r.max_target_hit == 3)
+    t4_plus = sum(1 for r in records if r.max_target_hit >= 4)
+
+    range_count = sum(1 for r in records if r.market_label == "Range")
+    trending_count = sum(1 for r in records if r.market_label == "Trending")
+
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
+
+    best_trade = max(records, key=lambda r: r.r_result, default=None)
+    worst_trade = min(records, key=lambda r: r.r_result, default=None)
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "net_r": net_r,
+        "winrate": winrate,
+        "t1_only": t1_only,
+        "t2_hit": t2_hit,
+        "t3_hit": t3_hit,
+        "t4_plus": t4_plus,
+        "range_count": range_count,
+        "trending_count": trending_count,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+    }
+
+def daily_stats_message(summary: dict, target_date: date) -> str:
+    best_txt = "N/A"
+    worst_txt = "N/A"
+
+    if summary["best_trade"] is not None:
+        bt = summary["best_trade"]
+        best_txt = f"{bt.direction} | {bt.result_label} | {bt.r_result:+.2f}R"
+    if summary["worst_trade"] is not None:
+        wt = summary["worst_trade"]
+        worst_txt = f"{wt.direction} | {wt.result_label} | {wt.r_result:+.2f}R"
+
+    return (
+        f"📊 {CFG.user_title} — Daily Stats\n"
+        f"📅 Date: {target_date.isoformat()} (Riyadh)\n\n"
+        f"Total Trades: {summary['total']}\n"
+        f"Wins: {summary['wins']}\n"
+        f"Losses: {summary['losses']}\n"
+        f"Breakeven: {summary['breakeven']}\n"
+        f"Win Rate: {summary['winrate']:.1f}%\n"
+        f"Net Result: {summary['net_r']:+.2f}R\n\n"
+        f"T1 only: {summary['t1_only']}\n"
+        f"T2 hit: {summary['t2_hit']}\n"
+        f"T3 hit: {summary['t3_hit']}\n"
+        f"T4+: {summary['t4_plus']}\n\n"
+        f"Range Trades: {summary['range_count']}\n"
+        f"Trending Trades: {summary['trending_count']}\n\n"
+        f"Best Trade: {best_txt}\n"
+        f"Worst Trade: {worst_txt}"
+    )
+
+def weekly_stats_message(summary: dict, monday: date, friday: date) -> str:
+    best_txt = "N/A"
+    worst_txt = "N/A"
+
+    if summary["best_trade"] is not None:
+        bt = summary["best_trade"]
+        best_txt = f"{bt.direction} | {bt.result_label} | {bt.r_result:+.2f}R"
+    if summary["worst_trade"] is not None:
+        wt = summary["worst_trade"]
+        worst_txt = f"{wt.direction} | {wt.result_label} | {wt.r_result:+.2f}R"
+
+    return (
+        f"📈 {CFG.user_title} — Weekly Stats\n"
+        f"🗓 Period: {monday.isoformat()} → {friday.isoformat()} (Mon-Fri Riyadh)\n\n"
+        f"Total Trades: {summary['total']}\n"
+        f"Wins: {summary['wins']}\n"
+        f"Losses: {summary['losses']}\n"
+        f"Breakeven: {summary['breakeven']}\n"
+        f"Win Rate: {summary['winrate']:.1f}%\n"
+        f"Net Result: {summary['net_r']:+.2f}R\n\n"
+        f"T1 only: {summary['t1_only']}\n"
+        f"T2 hit: {summary['t2_hit']}\n"
+        f"T3 hit: {summary['t3_hit']}\n"
+        f"T4+: {summary['t4_plus']}\n\n"
+        f"Range Trades: {summary['range_count']}\n"
+        f"Trending Trades: {summary['trending_count']}\n\n"
+        f"Best Trade: {best_txt}\n"
+        f"Worst Trade: {worst_txt}"
+    )
 
 
 # =========================
@@ -469,7 +653,196 @@ def fmt_levels(levels: list) -> str:
 def near_level(price: float, level: float, tol_frac: float) -> bool:
     return abs(price - level) / max(price, 1e-9) <= tol_frac
 
+def nearest_opposite_level_distance(levels: list, level_hit: float, direction: str) -> float | None:
+    if not levels:
+        return None
+    if direction == "BUY":
+        above = sorted([x for x in levels if x > level_hit])
+        if not above:
+            return None
+        return float(above[0] - level_hit)
+    below = sorted([x for x in levels if x < level_hit], reverse=True)
+    if not below:
+        return None
+    return float(level_hit - below[0])
 
+def nearby_levels_count(levels: list, level_hit: float, within_pts: float) -> int:
+    count = 0
+    for lvl in levels:
+        if abs(float(lvl) - float(level_hit)) <= within_pts:
+            count += 1
+    return count
+
+def range_level_is_clean(
+    levels: list,
+    level_hit: float,
+    direction: str,
+    level_info: dict,
+    market_label: str,
+    market_adx: float | None,
+    exp_move_val: float | None,
+) -> tuple[bool, str]:
+    if not CFG.range_quality_filter_enabled:
+        return True, "range filter off"
+
+    if market_label != "Range":
+        return True, "not range"
+
+    if market_adx is not None and market_adx > CFG.range_filter_only_when_adx_below:
+        return True, "range adx too strong"
+
+    wick_info = level_info["wick_info"]
+    has_clean_wick = (
+        (direction == "BUY" and (wick_info.get("lower_hits", 0) >= 1 or wick_info.get("lower_cluster")))
+        or
+        (direction == "SELL" and (wick_info.get("upper_hits", 0) >= 1 or wick_info.get("upper_cluster")))
+    )
+
+    if not has_clean_wick and not level_info.get("strong", False):
+        return False, "range level rejected: weak wick/level"
+
+    space_pts = nearest_opposite_level_distance(levels, level_hit, direction)
+    if space_pts is None:
+        return False, "range level rejected: no opposite space"
+
+    min_space_pts = CFG.range_min_space_pts
+    if exp_move_val is not None and np.isfinite(exp_move_val):
+        min_space_pts = max(min_space_pts, float(exp_move_val) * CFG.range_min_space_expected_move_ratio)
+
+    if space_pts < min_space_pts:
+        return False, f"range level rejected: too little space ({space_pts:.1f} pts)"
+
+    nearby = nearby_levels_count(levels, level_hit, CFG.range_max_nearby_levels_within_pts)
+    if nearby > CFG.range_max_nearby_levels_count:
+        return False, f"range level rejected: congestion ({nearby} nearby lvls)"
+
+    return True, "range level accepted"
+
+
+# =========================
+# Target map helpers
+# =========================
+
+def target_probability_estimate(
+    direction: str,
+    target_price: float,
+    current_price: float,
+    exp_move_val: float | None,
+    market_label: str,
+    market_dir: str,
+    liq_state: str,
+    df_5m: pd.DataFrame,
+) -> int:
+    if target_price is None or not np.isfinite(target_price):
+        return 0
+
+    dist = abs(target_price - current_price)
+    score = 58.0
+
+    if exp_move_val is not None and np.isfinite(exp_move_val) and exp_move_val > 0:
+        ratio = dist / exp_move_val
+        if ratio <= 0.5:
+            score += 18
+        elif ratio <= 0.85:
+            score += 10
+        elif ratio <= 1.1:
+            score += 3
+        elif ratio <= 1.35:
+            score -= 8
+        else:
+            score -= 18
+
+    if market_label == "Trending":
+        score += 6
+    elif market_label == "Range":
+        score -= 4
+
+    if (market_dir == "Bullish" and direction == "BUY") or (market_dir == "Bearish" and direction == "SELL"):
+        score += 6
+    elif market_dir in ("Bullish", "Bearish"):
+        score -= 8
+
+    if liq_state == "Low":
+        score -= 6
+    elif liq_state == "High":
+        score += 2
+    elif liq_state == "Extreme":
+        score += 3
+
+    try:
+        c = float(df_5m["close"].iloc[-1])
+        ema = float(df_5m["ema20"].iloc[-1])
+        macd_hist = float(df_5m["macd_hist"].iloc[-1])
+        if direction == "BUY":
+            if c > ema:
+                score += 4
+            if macd_hist > 0:
+                score += 4
+        else:
+            if c < ema:
+                score += 4
+            if macd_hist < 0:
+                score += 4
+    except Exception:
+        pass
+
+    return int(max(5, min(95, round(score))))
+
+def classify_target_zone(target_idx: int, prob: int) -> str:
+    if target_idx == 1:
+        return "First reaction zone"
+    if target_idx == 2:
+        return "Continuation zone"
+    if target_idx == 3:
+        return "Weakening watch" if prob < 60 else "Continuation extension"
+    if target_idx >= 4:
+        return "Exhaustion / reversal watch" if prob < 55 else "Runner extension"
+    return "Target zone"
+
+def build_initial_target_map(
+    direction: str,
+    entry: float,
+    targets: list[float],
+    current_price: float,
+    exp_move_val: float | None,
+    market_label: str,
+    market_dir: str,
+    liq_state: str,
+    df_5m: pd.DataFrame,
+) -> list[dict]:
+    out = []
+    for i, tgt in enumerate(targets[:CFG.max_initial_targets], start=1):
+        if tgt is None or not np.isfinite(tgt):
+            continue
+        prob = target_probability_estimate(
+            direction=direction,
+            target_price=float(tgt),
+            current_price=current_price,
+            exp_move_val=exp_move_val,
+            market_label=market_label,
+            market_dir=market_dir,
+            liq_state=liq_state,
+            df_5m=df_5m,
+        )
+        out.append({
+            "name": f"T{i}",
+            "price": float(tgt),
+            "prob": int(prob),
+            "zone": classify_target_zone(i, prob),
+        })
+    return out
+
+def filter_target_map_for_message(target_map: list[dict]) -> list[dict]:
+    if not target_map:
+        return []
+    kept = []
+    for i, t in enumerate(target_map, start=1):
+        if i <= 2:
+            kept.append(t)
+            continue
+        if t["prob"] >= CFG.target_probability_min_to_show:
+            kept.append(t)
+    return kept
 # =========================
 # Indicators
 # =========================
@@ -845,6 +1218,53 @@ def pick_targets(levels: list, entry: float, direction: str):
         )
     return None, None
 
+def compute_range_adaptive_extra_stop(
+    market_label: str,
+    exp_move_val: float | None,
+) -> float:
+    if market_label != "Range":
+        return 0.0
+
+    extra = CFG.range_stop_extra_min_pts
+    if exp_move_val is not None and np.isfinite(exp_move_val):
+        extra = max(extra, min(CFG.range_stop_extra_max_pts, float(exp_move_val) * CFG.range_stop_extra_atr_mult))
+
+    return float(max(CFG.range_stop_extra_min_pts, min(CFG.range_stop_extra_max_pts, extra)))
+
+def compute_smart_t2(
+    entry: float,
+    direction: str,
+    t1: float | None,
+    raw_t2: float | None,
+    exp_move_val: float | None,
+) -> float | None:
+    if not CFG.smart_t2_enabled or t1 is None or not np.isfinite(t1):
+        return raw_t2
+
+    if exp_move_val is None or not np.isfinite(exp_move_val) or exp_move_val <= 0:
+        return raw_t2
+
+    if direction == "BUY":
+        candidate_a = entry + (float(exp_move_val) * CFG.smart_t2_atr_mult)
+        candidate_b = entry + (float(exp_move_val) * CFG.smart_t2_expected_move_mult)
+        smart_candidate = max(candidate_a, candidate_b, t1 + max(2.0, (t1 - entry) * 0.35))
+        chosen = smart_candidate if raw_t2 is None else min(raw_t2, smart_candidate)
+        if (chosen - entry) / max((t1 - entry), 1e-9) > CFG.smart_t2_max_distance_ratio_to_t1:
+            chosen = entry + ((t1 - entry) * CFG.smart_t2_max_distance_ratio_to_t1)
+        if chosen <= t1:
+            chosen = t1 + max(2.0, float(exp_move_val) * 0.18)
+        return float(chosen)
+
+    candidate_a = entry - (float(exp_move_val) * CFG.smart_t2_atr_mult)
+    candidate_b = entry - (float(exp_move_val) * CFG.smart_t2_expected_move_mult)
+    smart_candidate = min(candidate_a, candidate_b, t1 - max(2.0, (entry - t1) * 0.35))
+    chosen = smart_candidate if raw_t2 is None else max(raw_t2, smart_candidate)
+    if (entry - chosen) / max((entry - t1), 1e-9) > CFG.smart_t2_max_distance_ratio_to_t1:
+        chosen = entry - ((entry - t1) * CFG.smart_t2_max_distance_ratio_to_t1)
+    if chosen >= t1:
+        chosen = t1 - max(2.0, float(exp_move_val) * 0.18)
+    return float(chosen)
+
 def compute_trade_plan(
     df_5m: pd.DataFrame,
     levels: list,
@@ -853,12 +1273,16 @@ def compute_trade_plan(
     trigger: str,
     trade_type: str,
     exp_move_val: float | None,
+    market_label: str,
+    market_dir: str,
+    liq_state: str,
 ):
     last = df_5m.iloc[-1]
     price = float(last["close"])
     last_high = float(last["high"])
     last_low = float(last["low"])
     buffer = max(price * 0.0002, 0.5)
+    range_extra_stop = compute_range_adaptive_extra_stop(market_label, exp_move_val)
 
     if trigger == "Wick Rejection near Level":
         if direction == "BUY":
@@ -866,36 +1290,35 @@ def compute_trade_plan(
                 entry = float(max(price, level_hit + buffer * 0.4))
             else:
                 entry = float(max(price, (last_high + level_hit) / 2.0))
-            stop = float(min(last_low, level_hit) - buffer)
+            stop = float(min(last_low, level_hit) - buffer - range_extra_stop)
         else:
             if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
                 entry = float(min(price, level_hit - buffer * 0.4))
             else:
                 entry = float(min(price, (last_low + level_hit) / 2.0))
-            stop = float(max(last_high, level_hit) + buffer)
+            stop = float(max(last_high, level_hit) + buffer + range_extra_stop)
 
     elif trigger == "Rejection":
         if direction == "BUY":
             entry = float(max(price, last_high - buffer * 0.4))
-            stop = float(min(last_low, level_hit) - buffer)
+            stop = float(min(last_low, level_hit) - buffer - range_extra_stop)
         else:
             entry = float(min(price, last_low + buffer * 0.4))
-            stop = float(max(last_high, level_hit) + buffer)
+            stop = float(max(last_high, level_hit) + buffer + range_extra_stop)
     else:
         if direction == "BUY":
             entry = float(max(price, level_hit + buffer))
-            stop = float(level_hit - (price * 0.0013) - buffer)
+            stop = float(level_hit - (price * 0.0013) - buffer - range_extra_stop)
         else:
             entry = float(min(price, level_hit - buffer))
-            stop = float(level_hit + (price * 0.0013) + buffer)
+            stop = float(level_hit + (price * 0.0013) + buffer + range_extra_stop)
 
-    t1, t2 = pick_targets(levels, entry, direction)
+    raw_t1, raw_t2 = pick_targets(levels, entry, direction)
     atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val, trade_type)
 
-    if t1 is None:
-        t1 = atr_t1
-    if t2 is None:
-        t2 = atr_t2
+    t1 = raw_t1 if raw_t1 is not None else atr_t1
+    t2 = raw_t2 if raw_t2 is not None else atr_t2
+    t2 = compute_smart_t2(entry=entry, direction=direction, t1=t1, raw_t2=t2, exp_move_val=exp_move_val)
 
     t3 = None
     if trade_type == "Strong" and atr_t3 is not None:
@@ -908,13 +1331,19 @@ def compute_trade_plan(
 
     targets = [t for t in [t1, t2, t3] if t is not None and np.isfinite(t)]
     if direction == "BUY":
-        targets = sorted(set(targets))
+        targets = sorted(set(float(x) for x in targets))
     else:
-        targets = sorted(set(targets), reverse=True)
+        targets = sorted(set(float(x) for x in targets), reverse=True)
 
     t1 = targets[0] if len(targets) > 0 else None
     t2 = targets[1] if len(targets) > 1 else None
     t3 = targets[2] if len(targets) > 2 else None
+
+    if t1 is not None and t2 is not None:
+        if direction == "BUY" and t2 <= t1:
+            t2 = t1 + max(2.0, (exp_move_val or 8.0) * 0.2)
+        if direction == "SELL" and t2 >= t1:
+            t2 = t1 - max(2.0, (exp_move_val or 8.0) * 0.2)
 
     rr = None
     if t1 is not None:
@@ -922,16 +1351,36 @@ def compute_trade_plan(
         reward = abs(t1 - entry)
         rr = (reward / risk) if risk > 0 else None
 
+    initial_targets = [x for x in [t1, t2, t3] if x is not None and np.isfinite(x)]
+    target_map = build_initial_target_map(
+        direction=direction,
+        entry=entry,
+        targets=initial_targets,
+        current_price=price,
+        exp_move_val=exp_move_val,
+        market_label=market_label,
+        market_dir=market_dir,
+        liq_state=liq_state,
+        df_5m=df_5m,
+    )
+    message_target_map = filter_target_map_for_message(target_map)
+
+    t4 = None
+    if len(message_target_map) >= 4:
+        t4 = float(message_target_map[3]["price"])
+
     return {
-        "entry": entry,
-        "stop": stop,
-        "initial_stop": stop,
-        "t1": t1,
-        "t2": t2,
-        "t3": t3,
-        "t4": None,
+        "entry": float(entry),
+        "stop": float(stop),
+        "initial_stop": float(stop),
+        "t1": None if t1 is None else float(t1),
+        "t2": None if t2 is None else float(t2),
+        "t3": None if t3 is None else float(t3),
+        "t4": None if t4 is None else float(t4),
         "rr": rr,
         "trade_type": trade_type,
+        "target_map": message_target_map,
+        "all_target_candidates": target_map,
     }
 
 
@@ -999,6 +1448,17 @@ def probability_t1_t2(conf: int, rr: float | None, dist_t1: float | None, dist_t
 # Messages
 # =========================
 
+def format_target_map_for_message(target_map: list[dict]) -> str:
+    if not target_map:
+        return "N/A"
+
+    lines = []
+    for t in target_map:
+        lines.append(
+            f"{t['name']}: {safe_f1(t['price'])} | {safe_int(t['prob'])}% | {t['zone']}"
+        )
+    return "\n".join(lines)
+
 def signal_message(
     session: str,
     symbol: str,
@@ -1023,6 +1483,7 @@ def signal_message(
     exp_txt = f"±{float(exp_move):.0f} pts" if exp_move is not None and np.isfinite(float(exp_move)) else "N/A"
     eta_txt = "N/A" if eta_band is None else f"{eta_band[0]}–{eta_band[1]} min"
     trade_type = plan.get("trade_type", "N/A")
+    target_map_txt = format_target_map_for_message(plan.get("target_map", []))
 
     return (
         f"🚨 {CFG.user_title} — فرصة دخول (Hunter Smart)\n\n"
@@ -1046,6 +1507,8 @@ def signal_message(
         f"📊 Probability\n"
         f"T1 Hit: {p_t1}%\n"
         f"T2 Hit: {p_t2}%\n\n"
+        f"🗺 Target Map\n"
+        f"{target_map_txt}\n\n"
         f"📈 Expected Move (1H): {exp_txt}\n"
         f"⏱ ETA to T1: {eta_txt}\n\n"
         f"🧠 Reason: {', '.join(reasons)}"
@@ -1055,6 +1518,7 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
                           levels: list, price: float, active_trade: dict | None) -> str:
     status = "None" if active_trade is None else active_trade.get("status", "Unknown")
     trade_line = "-"
+    target_map_line = "N/A"
     if active_trade is not None:
         trade_line = (
             f"{active_trade.get('direction', '?')} | "
@@ -1065,6 +1529,7 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
             f"T3 {safe_f1(active_trade.get('t3'))} | "
             f"T4 {safe_f1(active_trade.get('t4'))}"
         )
+        target_map_line = format_target_map_for_message(active_trade.get("target_map", []))
 
     return (
         f"👋 {CFG.user_title}\n"
@@ -1076,7 +1541,8 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
         f"💵 Price: {safe_f1(price)}\n"
         f"🧱 Key Levels: {fmt_levels(levels)}\n"
         f"📌 Active Trade: {status}\n"
-        f"🧾 Trade: {trade_line}"
+        f"🧾 Trade: {trade_line}\n"
+        f"🗺 Targets:\n{target_map_line}"
     )
 
 
@@ -1099,6 +1565,7 @@ class BotState:
         self.market_adx = None
 
         self.last_error_notify_utc = None
+        self.stats = StatsState()
 
     def can_signal(self, key: str) -> bool:
         if self.no_signal_until_utc is not None and datetime.utcnow() < self.no_signal_until_utc:
@@ -1147,7 +1614,7 @@ def maybe_daily_reset():
         send_telegram(
             f"🛎️ {CFG.user_title} — Daily Reset (Riyadh)\n"
             f"السبب: منتصف الليل بتوقيت السعودية.\n"
-            f"ملاحظة: تم إنهاء تتبع الصفقة لتفادي تعليق البوت وبداية يوم جديد."
+            f"ملاحظة: الصفقة الحالية مستمرة ولن يتم حذفها، فقط بدأ يوم جديد."
         )
     else:
         send_telegram(
@@ -1156,7 +1623,6 @@ def maybe_daily_reset():
             f"لا توجد صفقة فعّالة — تم بدء يوم جديد."
         )
 
-    STATE.active_trade = None
     STATE.last_reset_date_riyadh = today
     STATE.no_signal_until_utc = datetime.utcnow() + timedelta(minutes=CFG.no_signal_after_reset_minutes)
 
@@ -1276,10 +1742,8 @@ def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info
     if trigger is None:
         return 0, ["No trigger"], "None"
     return score, reasons, trigger
-
-
 # =========================
-# Dynamic expansion after T2/T3
+# Dynamic expansion / target behavior
 # =========================
 
 def next_levels_beyond(levels: list, price_ref: float, direction: str) -> list:
@@ -1291,6 +1755,53 @@ def dynamic_extension_allowed(df_5m: pd.DataFrame, direction: str) -> bool:
     if direction == "BUY":
         return strong_buy_confirmation(df_5m)
     return strong_sell_confirmation(df_5m)
+
+def target_behavior_check(
+    df_5m: pd.DataFrame,
+    direction: str,
+    market_label: str,
+    exp_move_val: float | None,
+    current_price: float,
+    candidate_target: float | None,
+) -> tuple[bool, str]:
+    if candidate_target is None or not np.isfinite(candidate_target):
+        return False, "invalid candidate target"
+
+    if len(df_5m) < 10:
+        return False, "not enough 5m data"
+
+    c = float(df_5m["close"].iloc[-1])
+    ema = float(df_5m["ema20"].iloc[-1])
+    macd_hist = float(df_5m["macd_hist"].iloc[-1])
+    macd_prev = float(df_5m["macd_hist"].iloc[-2])
+
+    last = df_5m.iloc[-1]
+    o, h, l, cl = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    rng = max(h - l, 1e-9)
+    upper = h - max(o, cl)
+    lower = min(o, cl) - l
+
+    dist = abs(candidate_target - current_price)
+
+    if exp_move_val is not None and np.isfinite(exp_move_val):
+        if dist > float(exp_move_val) * 1.35:
+            return False, "target too far vs expected move"
+
+    if direction == "BUY":
+        if c < ema and macd_hist < macd_prev:
+            return False, "buy extension weakening"
+        if upper / rng >= 0.42 and cl < o:
+            return False, "buy rejection candle"
+    else:
+        if c > ema and macd_hist > macd_prev:
+            return False, "sell extension weakening"
+        if lower / rng >= 0.42 and cl > o:
+            return False, "sell rejection candle"
+
+    if market_label == "Range" and dist < CFG.extension_rr_min_points:
+        return False, "range extension too small"
+
+    return True, "extension valid"
 
 def dynamic_target_from_market_or_atr(levels: list, current_price: float, direction: str, exp_move_val: float | None,
                                       used_targets: list[float], stage: str) -> float | None:
@@ -1305,8 +1816,10 @@ def dynamic_target_from_market_or_atr(levels: list, current_price: float, direct
 
     if stage == "T3":
         dist = exp_move_val * CFG.dynamic_t3_atr_mult
-    else:
+    elif stage == "T4":
         dist = exp_move_val * CFG.dynamic_t4_atr_mult
+    else:
+        dist = exp_move_val * (CFG.dynamic_t4_atr_mult + 0.18)
 
     if direction == "BUY":
         candidate = current_price + dist
@@ -1318,64 +1831,253 @@ def dynamic_target_from_market_or_atr(levels: list, current_price: float, direct
 
     return None
 
-def maybe_expand_targets(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame, last_price: float):
+def probability_for_extension_target(
+    df_5m: pd.DataFrame,
+    direction: str,
+    candidate_target: float,
+    current_price: float,
+    exp_move_val: float | None,
+    market_label: str,
+    market_dir: str,
+    liq_state: str,
+) -> int:
+    return target_probability_estimate(
+        direction=direction,
+        target_price=float(candidate_target),
+        current_price=float(current_price),
+        exp_move_val=exp_move_val,
+        market_label=market_label,
+        market_dir=market_dir,
+        liq_state=liq_state,
+        df_5m=df_5m,
+    )
+
+def maybe_extend_next_target(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame, last_price: float):
     tr = STATE.active_trade
     if tr is None or tr.get("status") != "live":
         return
 
     direction = tr["direction"]
-    used_targets = [x for x in [tr.get("t1"), tr.get("t2"), tr.get("t3"), tr.get("t4")] if x is not None]
+    used_targets = [x for x in tr.get("all_target_prices", []) if x is not None]
+    exp_move_val = expected_move_1h(df_1h)
+    levels = extract_key_levels(df_15m, df_1h)
 
     if not dynamic_extension_allowed(df_5m, direction):
         return
 
-    exp_move_val = expected_move_1h(df_1h)
-    levels = extract_key_levels(df_15m, df_1h)
+    next_idx = int(tr.get("next_target_idx_to_define", 4))
+    if next_idx < 3:
+        next_idx = 3
 
-    # after T2 -> add T3 if missing
-    if tr.get("t2_hit") and not tr.get("t3_defined") and CFG.enable_t3:
-        new_t3 = dynamic_target_from_market_or_atr(
-            levels=levels,
-            current_price=last_price,
-            direction=direction,
-            exp_move_val=exp_move_val,
-            used_targets=used_targets,
-            stage="T3",
-        )
-        if new_t3 is not None:
-            tr["t3"] = float(new_t3)
-            tr["t3_defined"] = True
-            if CFG.move_stop_to_t1_on_t2 and tr.get("t1") is not None:
-                tr["stop"] = float(tr["t1"])
-            send_telegram(
-                f"🧠 {CFG.user_title} — Dynamic Target Expansion\n"
-                f"After T2, momentum still strong ✅\n"
-                f"New T3: {safe_f1(tr['t3'])}\n"
-                f"Raised Stop: {safe_f1(tr['stop'])}"
-            )
+    stage_name = f"T{next_idx}"
+    candidate = dynamic_target_from_market_or_atr(
+        levels=levels,
+        current_price=last_price,
+        direction=direction,
+        exp_move_val=exp_move_val,
+        used_targets=used_targets,
+        stage=stage_name,
+    )
+    if candidate is None:
+        return
 
-    # after T3 -> add T4 if missing
-    if tr.get("t3_hit") and not tr.get("t4_defined") and CFG.enable_dynamic_t4:
-        used_targets = [x for x in [tr.get("t1"), tr.get("t2"), tr.get("t3"), tr.get("t4")] if x is not None]
-        new_t4 = dynamic_target_from_market_or_atr(
-            levels=levels,
-            current_price=last_price,
-            direction=direction,
-            exp_move_val=exp_move_val,
-            used_targets=used_targets,
-            stage="T4",
-        )
-        if new_t4 is not None:
-            tr["t4"] = float(new_t4)
-            tr["t4_defined"] = True
-            if CFG.move_stop_to_t2_on_t3 and tr.get("t2") is not None:
-                tr["stop"] = float(tr["t2"])
-            send_telegram(
-                f"🚀 {CFG.user_title} — Dynamic Runner Extended\n"
-                f"After T3, trend still alive ✅\n"
-                f"New T4: {safe_f1(tr['t4'])}\n"
-                f"Raised Stop: {safe_f1(tr['stop'])}"
-            )
+    ok, reason = target_behavior_check(
+        df_5m=df_5m,
+        direction=direction,
+        market_label=STATE.market_label,
+        exp_move_val=exp_move_val,
+        current_price=last_price,
+        candidate_target=candidate,
+    )
+    if not ok:
+        return
+
+    prob = probability_for_extension_target(
+        df_5m=df_5m,
+        direction=direction,
+        candidate_target=float(candidate),
+        current_price=float(last_price),
+        exp_move_val=exp_move_val,
+        market_label=STATE.market_label,
+        market_dir=STATE.market_dir,
+        liq_state=liquidity_state(df_5m)[0],
+    )
+    if prob < CFG.target_probability_min_to_extend:
+        return
+
+    zone = classify_target_zone(next_idx, prob)
+
+    tr["dynamic_targets"][stage_name] = {
+        "price": float(candidate),
+        "prob": int(prob),
+        "zone": zone,
+        "defined": True,
+        "hit": False,
+    }
+    tr["all_target_prices"].append(float(candidate))
+    tr["target_map"].append({
+        "name": stage_name,
+        "price": float(candidate),
+        "prob": int(prob),
+        "zone": zone,
+    })
+    tr["next_target_idx_to_define"] = next_idx + 1
+
+    prev_hit_idx = int(tr.get("last_target_hit_idx", 2))
+    prev_target_name = f"T{prev_hit_idx}"
+    prev_target = tr["dynamic_targets"].get(prev_target_name, {})
+    prev_target_price = prev_target.get("price")
+    if prev_target_price is not None:
+        tr["stop"] = float(prev_target_price)
+
+    send_telegram(
+        f"🧠 {CFG.user_title} — Dynamic Target Extension\n"
+        f"New {stage_name}: {safe_f1(candidate)}\n"
+        f"Probability: {prob}%\n"
+        f"Zone: {zone}\n"
+        f"Raised Stop: {safe_f1(tr['stop'])}"
+    )
+
+def detect_weakening_or_reversal_watch(df_5m: pd.DataFrame, direction: str) -> tuple[bool, str]:
+    if len(df_5m) < 8:
+        return False, "not enough data"
+
+    last = df_5m.iloc[-1]
+    prev = df_5m.iloc[-2]
+
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    po, ph, pl, pc = float(prev["open"]), float(prev["high"]), float(prev["low"]), float(prev["close"])
+    rng = max(h - l, 1e-9)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    ema = float(df_5m["ema20"].iloc[-1])
+    macd_hist = float(df_5m["macd_hist"].iloc[-1])
+    macd_prev = float(df_5m["macd_hist"].iloc[-2])
+
+    if direction == "BUY":
+        if upper / rng >= 0.45 and c < o:
+            return True, "upper rejection after target"
+        if c < ema and macd_hist < macd_prev:
+            return True, "buy momentum weakening"
+        if c < pc and h <= ph:
+            return True, "buy follow-through weakening"
+    else:
+        if lower / rng >= 0.45 and c > o:
+            return True, "lower rejection after target"
+        if c > ema and macd_hist > macd_prev:
+            return True, "sell momentum weakening"
+        if c > pc and l >= pl:
+            return True, "sell follow-through weakening"
+
+    return False, "no weakness"
+
+
+# =========================
+# Trade result recording
+# =========================
+
+def record_closed_trade(result_label: str, max_target_hit: int, r_result: float):
+    tr = STATE.active_trade
+    if tr is None:
+        return
+
+    rec = ClosedTradeRecord(
+        closed_at_riyadh=now_riyadh(),
+        direction=str(tr.get("direction", "?")),
+        entry=float(tr.get("entry", np.nan)),
+        stop=float(tr.get("stop", np.nan)),
+        initial_stop=float(tr.get("initial_stop", np.nan)),
+        trade_type=str(tr.get("trade_type", "N/A")),
+        result_label=str(result_label),
+        max_target_hit=int(max_target_hit),
+        r_result=float(r_result),
+        market_label=str(tr.get("market_label_at_entry", "Unknown")),
+        session=str(tr.get("session_at_entry", "Unknown")),
+    )
+    STATE.stats.add_trade(rec)
+
+def compute_r_result_for_stop_exit(last_price: float) -> tuple[float, str]:
+    tr = STATE.active_trade
+    if tr is None:
+        return 0.0, "unknown"
+
+    entry = float(tr["entry"])
+    initial_stop = float(tr["initial_stop"])
+    direction = tr["direction"]
+    risk = abs(entry - initial_stop)
+    if risk <= 0:
+        return 0.0, "invalid risk"
+
+    pnl = (last_price - entry) if direction == "BUY" else (entry - last_price)
+    r_result = pnl / risk
+
+    if abs(r_result) < 0.08:
+        return 0.0, "breakeven"
+    if r_result > 0:
+        return float(r_result), "stop in profit"
+    return float(r_result), "stop loss"
+
+def current_max_target_hit(tr: dict) -> int:
+    if tr is None:
+        return 0
+
+    max_hit = 0
+    dynamic_targets = tr.get("dynamic_targets", {})
+    for name, info in dynamic_targets.items():
+        if info.get("hit"):
+            try:
+                idx = int(name.replace("T", ""))
+                max_hit = max(max_hit, idx)
+            except Exception:
+                pass
+    return max_hit
+
+
+# =========================
+# Stats sending
+# =========================
+
+def maybe_send_daily_stats():
+    if not CFG.stats_daily_enabled:
+        return
+
+    t = now_riyadh()
+    target_date = t.date()
+
+    should_window = (t.hour == CFG.stats_daily_send_hour and t.minute >= CFG.stats_daily_send_minute)
+    if not should_window:
+        return
+
+    if STATE.stats.last_daily_stats_sent_date == target_date:
+        return
+
+    records = STATE.stats.get_day_records(target_date)
+    summary = summarize_records(records)
+    send_telegram(daily_stats_message(summary, target_date))
+    STATE.stats.last_daily_stats_sent_date = target_date
+
+def maybe_send_weekly_stats():
+    if not CFG.stats_weekly_enabled:
+        return
+
+    t = now_riyadh()
+    if t.weekday() != CFG.stats_weekly_send_weekday:
+        return
+    if not (t.hour == CFG.stats_weekly_send_hour and t.minute >= CFG.stats_weekly_send_minute):
+        return
+
+    monday = t.date() - timedelta(days=t.weekday())
+    friday = monday + timedelta(days=4)
+    week_key = f"{monday.isoformat()}_{friday.isoformat()}"
+
+    if STATE.stats.last_weekly_stats_sent_week_key == week_key:
+        return
+
+    records = STATE.stats.get_week_records_mon_to_fri(t.date())
+    summary = summarize_records(records)
+    send_telegram(weekly_stats_message(summary, monday, friday))
+    STATE.stats.last_weekly_stats_sent_week_key = week_key
 
 
 # =========================
@@ -1390,10 +2092,6 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
     direction = tr["direction"]
     entry = float(tr["entry"])
     stop = float(tr["stop"])
-    t1 = tr.get("t1")
-    t2 = tr.get("t2")
-    t3 = tr.get("t3")
-    t4 = tr.get("t4")
 
     if tr["status"] == "pending":
         triggered = (last_price >= entry) if direction == "BUY" else (last_price <= entry)
@@ -1405,7 +2103,7 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
                 f"Direction: {direction}\n"
                 f"Entry Triggered @ {safe_f1(last_price)}\n"
                 f"Stop: {safe_f1(stop)}\n"
-                f"T1: {safe_f1(t1)} | T2: {safe_f1(t2)} | T3: {safe_f1(t3)} | T4: {safe_f1(t4)}"
+                f"Targets:\n{format_target_map_for_message(tr.get('target_map', []))}"
             )
         return
 
@@ -1417,12 +2115,16 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
         if CFG.hard_stop_enabled:
             beyond = (stop - last_price) >= CFG.hard_stop_buffer_pts if direction == "BUY" else (last_price - stop) >= CFG.hard_stop_buffer_pts
             if beyond:
+                r_result, label = compute_r_result_for_stop_exit(last_price)
+                max_hit = current_max_target_hit(tr)
                 send_telegram(
                     f"❌ {CFG.user_title} — وقف الخسارة (Hard Stop)\n"
                     f"Stop Hit ✅ | Direction: {direction}\n"
                     f"Stop: {safe_f1(stop)} | Price: {safe_f1(last_price)}\n"
+                    f"Result: {r_result:+.2f}R\n"
                     f"ملاحظة: تم الإغلاق الفوري لتجنب انزلاق كبير."
                 )
+                record_closed_trade(label, max_hit, r_result)
                 STATE.active_trade = None
                 return
 
@@ -1441,12 +2143,16 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
                     last_close = float(df_5m["close"].iloc[-1])
                     confirmed = (last_close <= stop) if direction == "BUY" else (last_close >= stop)
                     if confirmed:
+                        r_result, label = compute_r_result_for_stop_exit(last_price)
+                        max_hit = current_max_target_hit(tr)
                         send_telegram(
                             f"❌ {CFG.user_title} — وقف الخسارة تأكد\n"
                             f"Stop Hit ✅ | Direction: {direction}\n"
                             f"Stop: {safe_f1(stop)} | Price: {safe_f1(last_price)}\n"
+                            f"Result: {r_result:+.2f}R\n"
                             f"تأكيد: إغلاق 5m ضد الصفقة."
                         )
+                        record_closed_trade(label, max_hit, r_result)
                         STATE.active_trade = None
                         return
                     else:
@@ -1458,62 +2164,107 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
         tr["stop_pending"] = False
         tr.pop("stop_pending_since_utc", None)
 
-    if t1 is not None and not tr.get("t1_hit"):
-        hit_t1 = (last_price >= float(t1)) if direction == "BUY" else (last_price <= float(t1))
-        if hit_t1:
-            tr["t1_hit"] = True
-            if CFG.move_stop_to_be_on_t1:
-                tr["stop"] = float(entry)
+    # Check target hits dynamically
+    dynamic_targets = tr.get("dynamic_targets", {})
+    sorted_targets = sorted(
+        dynamic_targets.items(),
+        key=lambda kv: int(kv[0].replace("T", "")),
+        reverse=False
+    )
+
+    for name, info in sorted_targets:
+        if info.get("hit"):
+            continue
+
+        tgt_price = float(info["price"])
+        idx = int(name.replace("T", ""))
+
+        hit = (last_price >= tgt_price) if direction == "BUY" else (last_price <= tgt_price)
+        if not hit:
+            continue
+
+        info["hit"] = True
+        tr["last_target_hit_idx"] = idx
+
+        # Raise stop to previous target/entry
+        if idx == 1 and CFG.move_stop_to_be_on_t1:
+            tr["stop"] = float(entry)
+        elif idx == 2 and CFG.move_stop_to_t1_on_t2:
+            prev = dynamic_targets.get("T1", {})
+            if prev.get("price") is not None:
+                tr["stop"] = float(prev["price"])
+        elif idx >= 3 and CFG.move_stop_to_t2_on_t3:
+            prev_name = f"T{idx-1}"
+            prev = dynamic_targets.get(prev_name, {})
+            if prev.get("price") is not None:
+                tr["stop"] = float(prev["price"])
+
+        if idx == 1:
             send_telegram(
-                f"🎯 {CFG.user_title} — Target 1 Hit\n"
-                f"T1: {safe_f1(t1)}\n"
+                f"🎯 {CFG.user_title} — {name} Hit\n"
+                f"{name}: {safe_f1(tgt_price)}\n"
+                f"Probability was: {safe_int(info.get('prob'))}%\n"
                 f"Raised Stop: {safe_f1(tr['stop'])}"
             )
+        else:
+            weak, weak_reason = detect_weakening_or_reversal_watch(df_5m, direction)
+            zone_note = info.get("zone", "Target zone")
+            msg = (
+                f"🏆 {CFG.user_title} — {name} Hit\n"
+                f"{name}: {safe_f1(tgt_price)}\n"
+                f"Probability was: {safe_int(info.get('prob'))}%\n"
+                f"Zone: {zone_note}\n"
+                f"Raised Stop: {safe_f1(tr['stop'])}"
+            )
+            if weak:
+                msg += f"\n⚠️ Weakening Watch: {weak_reason}"
+            send_telegram(msg)
 
-    if t2 is not None and not tr.get("t2_hit"):
-        hit_t2 = (last_price >= float(t2)) if direction == "BUY" else (last_price <= float(t2))
-        if hit_t2:
-            tr["t2_hit"] = True
-            if CFG.move_stop_to_t1_on_t2 and tr.get("t1") is not None:
-                tr["stop"] = float(tr["t1"])
+        # Extend next target only after hitting the latest currently defined target
+        highest_defined_idx = max(int(k.replace("T", "")) for k in dynamic_targets.keys())
+        if idx >= highest_defined_idx:
+            maybe_extend_next_target(df_5m, df_15m, df_1h, last_price)
+
+       # If there is weakness after higher target, notify reversal watch
+    # وإذا كانت الصفقة وصلت هدف متقدم ثم ظهر ضعف واضح، نعتبرها منتهية إحصائيًا إذا ما عاد فيه أهداف أقوى
+    max_hit_idx = current_max_target_hit(tr)
+    if max_hit_idx >= 2:
+        weak, weak_reason = detect_weakening_or_reversal_watch(df_5m, direction)
+        if weak and not tr.get("reversal_watch_sent"):
+            tr["reversal_watch_sent"] = True
             send_telegram(
-                f"🏆 {CFG.user_title} — Target 2 Hit\n"
-                f"T2: {safe_f1(t2)}\n"
-                f"Raised Stop: {safe_f1(tr['stop'])}\n"
-                f"جاري فحص إمكانية إضافة T3..."
+                f"🔄 {CFG.user_title} — Reversal Watch Zone\n"
+                f"Last Hit Target: T{max_hit_idx}\n"
+                f"Reason: {weak_reason}\n"
+                f"ملاحظة: ليست صفقة عكسية مباشرة — فقط مراقبة لضعف الحركة."
             )
 
-    maybe_expand_targets(df_5m, df_15m, df_1h, last_price)
+            # إذا ما فيه هدف جديد متوقع والصفقة أصلاً وصلت هدف متقدم،
+            # سجلها كصفقة منتهية إحصائيًا عند آخر سعر حالي
+            highest_defined_idx = 0
+            if tr.get("dynamic_targets"):
+                highest_defined_idx = max(int(k.replace('T', '')) for k in tr["dynamic_targets"].keys())
 
-    t3 = tr.get("t3")
-    if t3 is not None and not tr.get("t3_hit"):
-        hit_t3 = (last_price >= float(t3)) if direction == "BUY" else (last_price <= float(t3))
-        if hit_t3:
-            tr["t3_hit"] = True
-            if CFG.move_stop_to_t2_on_t3 and tr.get("t2") is not None:
-                tr["stop"] = float(tr["t2"])
-            send_telegram(
-                f"🚀 {CFG.user_title} — Target 3 Hit\n"
-                f"T3: {safe_f1(t3)}\n"
-                f"Raised Stop: {safe_f1(tr['stop'])}\n"
-                f"جاري فحص إمكانية إضافة T4..."
-            )
+            if max_hit_idx >= highest_defined_idx:
+                risk = abs(float(tr["entry"]) - float(tr["initial_stop"]))
+                if risk > 0:
+                    pnl = (last_price - float(tr["entry"])) if direction == "BUY" else (float(tr["entry"]) - last_price)
+                    r_result = pnl / risk
+                else:
+                    r_result = 0.0
 
-    maybe_expand_targets(df_5m, df_15m, df_1h, last_price)
-
-    t4 = tr.get("t4")
-    if t4 is not None and not tr.get("t4_hit"):
-        hit_t4 = (last_price >= float(t4)) if direction == "BUY" else (last_price <= float(t4))
-        if hit_t4:
-            tr["t4_hit"] = True
-            send_telegram(
-                f"🔥 {CFG.user_title} — Target 4 Hit\n"
-                f"T4: {safe_f1(t4)}\n"
-                f"اقتراح: إغلاق كامل / Final runner exit"
-            )
-            STATE.active_trade = None
-            return
-
+                record_closed_trade(
+                    result_label=f"closed on weakness after T{max_hit_idx}",
+                    max_target_hit=max_hit_idx,
+                    r_result=float(r_result),
+                )
+                send_telegram(
+                    f"✅ {CFG.user_title} — Trade Registered Closed\n"
+                    f"Reason: weakness after T{max_hit_idx}\n"
+                    f"Result: {r_result:+.2f}R"
+                )
+                STATE.active_trade = None
+                return
 
 # =========================
 # Main evaluation
@@ -1546,6 +2297,9 @@ def evaluate_once():
                 session, symbol, bias, market_state_str, key_levels, level_now, STATE.active_trade
             ))
             STATE.last_hour_sent = current_hour
+
+    maybe_send_daily_stats()
+    maybe_send_weekly_stats()
 
     if STATE.no_signal_until_utc is not None and datetime.utcnow() < STATE.no_signal_until_utc:
         return
@@ -1638,6 +2392,19 @@ def evaluate_once():
     ):
         return
 
+    # NEW: professional range filter
+    range_ok, range_reason = range_level_is_clean(
+        levels=key_levels,
+        level_hit=level_hit,
+        direction=direction,
+        level_info=level_info,
+        market_label=STATE.market_label,
+        market_adx=STATE.market_adx,
+        exp_move_val=exp_move_val,
+    )
+    if not range_ok:
+        return
+
     if CFG.require_momentum_confirmation:
         if direction == "BUY" and not strong_buy_confirmation(df_5m):
             if not (
@@ -1667,6 +2434,9 @@ def evaluate_once():
         trigger=trigger,
         trade_type=trade_type,
         exp_move_val=exp_move_val,
+        market_label=STATE.market_label,
+        market_dir=STATE.market_dir,
+        liq_state=liq_state,
     )
 
     rr = plan.get("rr")
@@ -1705,10 +2475,27 @@ def evaluate_once():
         p_t2=p2,
         exp_move=exp_move_val,
         eta_band=eta,
-        reasons=reasons,
+        reasons=reasons + ([range_reason] if range_reason not in ("not range", "range filter off", "range adx too strong", "range level accepted") else []),
     )
     send_telegram(msg)
     STATE.mark_signal(key)
+
+    # dynamic targets storage from target map
+    dynamic_targets = {}
+    for t in plan.get("target_map", []):
+        dynamic_targets[t["name"]] = {
+            "price": float(t["price"]),
+            "prob": int(t["prob"]),
+            "zone": str(t["zone"]),
+            "defined": True,
+            "hit": False,
+        }
+
+    all_target_prices = [float(t["price"]) for t in plan.get("target_map", [])]
+
+    initial_highest_target_idx = 0
+    if plan.get("target_map"):
+        initial_highest_target_idx = max(int(t["name"].replace("T", "")) for t in plan["target_map"])
 
     STATE.active_trade = {
         "direction": direction,
@@ -1719,32 +2506,41 @@ def evaluate_once():
         "t1": None if plan.get("t1") is None else float(plan["t1"]),
         "t2": None if plan.get("t2") is None else float(plan["t2"]),
         "t3": None if plan.get("t3") is None else float(plan["t3"]),
-        "t4": None if plan.get("t4") is None else None,
+        "t4": None if plan.get("t4") is None else float(plan["t4"]),
         "status": "pending",
         "created_utc": datetime.utcnow(),
         "trade_type": trade_type,
-        "t1_hit": False,
-        "t2_hit": False,
-        "t3_hit": False,
-        "t4_hit": False,
-        "t3_defined": plan.get("t3") is not None,
-        "t4_defined": False,
+        "market_label_at_entry": STATE.market_label,
+        "session_at_entry": session,
+        "target_map": plan.get("target_map", []),
+        "all_target_candidates": plan.get("all_target_candidates", []),
+        "dynamic_targets": dynamic_targets,
+        "all_target_prices": all_target_prices,
+        "next_target_idx_to_define": max(3, initial_highest_target_idx + 1),
+        "last_target_hit_idx": 0,
+        "reversal_watch_sent": False,
     }
 
 
+# =========================
+# Main
+# =========================
+
 def main():
     send_telegram(
-        f"✅ {CFG.user_title} — Bot started\n"
-        f"Rules:\n"
-        f"- Source: TradingView ({CFG.tv_exchange}:{CFG.tv_symbol})\n"
-        f"- Direction: Bias(1H/4H) ➜ Wick-Cluster near Key Level\n"
-        f"- Strongest Reason: Wick Rejection near Level\n"
-        f"- Dynamic T3/T4 expansion: ON\n"
-        f"- Stop raising after targets: ON\n"
-        f"- Session filter: ON\n"
-        f"- Counter-trend protection: {'ON' if CFG.block_counter_trend_in_trending_market else 'OFF'}\n"
-        f"- Stop: HardStop({CFG.hard_stop_buffer_pts:.1f} pts) + 5m close confirm"
-    )
+    f"✅ {CFG.user_title} — Bot started\n"
+    f"Rules:\n"
+    f"- Source: TradingView ({CFG.tv_exchange}:{CFG.tv_symbol})\n"
+    f"- Direction: Bias(1H/4H) ➜ Wick-Cluster near Key Level\n"
+    f"- Strongest Reason: Wick Rejection near Level\n"
+    f"- Dynamic target map: ON\n"
+    f"- Open-ended target extension: ON\n"
+    f"- Range quality filter: ON\n"
+    f"- Daily / Weekly stats: ON\n"
+    f"- Counter-trend protection: {'ON' if CFG.block_counter_trend_in_trending_market else 'OFF'}\n"
+    f"- Stop: HardStop({CFG.hard_stop_buffer_pts:.1f} pts) + 5m close confirm\n"
+    f"- Midnight reset: keeps active trade tracking"
+)
 
     while True:
         try:
