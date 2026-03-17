@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-SPX500 Trading Bot (Hunter Smart - Range/Trend Filtered)
+SPX500 Trading Bot (Hunter Smart - 3-State Regime + Hybrid)
 For: دكتور محمد
 
-Part 1/4
+PART 1/4
 - Imports
 - Config
 - TradingView / Telegram / Helpers
+- Fetching
 - Indicators
-- Market state
-- Range filters
-- Fake breakout filters
-- Bot state
+- Structure / Levels
+- Market regime classification:
+    Trend / Clean Range / Messy
 """
 
 import os
 import time
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -34,13 +35,13 @@ except ImportError:
     ZoneInfo = None
 
 
-# =========================
+# =========================================================
 # Config
-# =========================
+# =========================================================
 
 @dataclass
 class Config:
-    # TradingView source
+    # TradingView
     tv_symbol: str = "SPX500"
     tv_exchange: str = "FOREXCOM"
     tv_username: str = os.getenv("TV_USERNAME", "")
@@ -56,57 +57,113 @@ class Config:
     tz_ny: str = "America/New_York"
 
     # Loop
-    loop_sleep_seconds: int = 25
+    loop_sleep_seconds: int = 20
+
+    # Fetch bars
+    bars_5m: int = 1200
+    bars_15m: int = 900
+    bars_1h: int = 500
+
+    # TradingView resilience
+    tv_retry_attempts: int = 3
+    tv_retry_sleep_base: float = 2.0
+    tv_fallback_bars: tuple = (1000, 800, 700, 600, 500, 400, 300)
+
+    # Error reporting
+    error_notify_cooldown_minutes: int = 15
 
     # Structure / pivots
     pivot_left: int = 3
     pivot_right: int = 3
 
-    # Level detection / clustering
-    level_touch_tolerance_frac: float = 0.0013
+    # Level detection
     level_cluster_tolerance_frac: float = 0.0010
     max_key_levels: int = 8
+    level_zone_near_pts: float = 18.0
+    level_touch_tolerance_frac: float = 0.0013
+    level_min_touch_count: int = 2
+    level_strong_touch_count: int = 3
 
-    # Scoring
-    score_threshold: int = 3
-    min_rr_to_t1: float = 1.30
+    # Signal cooldown
     signal_cooldown_minutes: int = 14
 
-    # Market state
+    # Hourly update
+    hourly_update: bool = True
+
+    # Daily reset
+    daily_reset_enabled: bool = True
+    daily_reset_hour: int = 0
+    daily_reset_minute: int = 0
+    daily_reset_window_minutes: int = 5
+    no_signal_after_reset_minutes: int = 8
+
+    # Indicator windows
     adx_window: int = 14
-    market_state_update_minutes: int = 15
-    adx_trending_on: float = 25.0
-    adx_range_on: float = 20.0
+    expected_move_atr_window: int = 14
+    atr15_window: int = 14
 
     # Liquidity
     liquidity_lookback_5m: int = 60
     liquidity_thresholds: tuple = (0.60, 1.25, 2.00)
 
-    # Expected move
-    expected_move_atr_window: int = 14
+    # Range / Regime
+    enable_regime_filters: bool = True
+    range_lookback_15m: int = 96
+    range_min_width_pts: float = 16.0
 
-    # ETA
-    eta_velocity_lookback_5m: int = 24
-    eta_min_velocity_pts_per_min: float = 0.15
+    # ADX hysteresis
+    adx_trending_on: float = 25.0
+    adx_range_on: float = 20.0
 
-    # Wick cluster
-    wick_cluster_lookback_5m: int = 10
-    wick_ratio_strong: float = 0.45
-    wick_cluster_min_hits: int = 3
-    wick_near_level_tolerance_frac: float = 0.0010
-    wick_min_abs_pts: float = 1.2
+    # Clean range quality
+    range_touch_tolerance_atr_mult: float = 0.25
+    range_min_touches_each_side: int = 2
+    range_max_sweeps_total: int = 6
+    range_max_width_atr: float = 6.0
+    range_max_slope_atr: float = 0.55
 
-    # Level quality
-    level_zone_near_pts: float = 18.0
-    level_min_touch_count: int = 2
-    level_strong_touch_count: int = 3
+    # Mid-zone
+    enable_mid_range_skip: bool = True
+    mid_no_trade_pct: float = 0.18
+    mid_atr_floor_mult: float = 0.40
 
-    # Trade strength
+    # Edge zones for clean range
+    enable_edge_only_range: bool = True
+    edge_zone_pct: float = 0.32
+    edge_atr_floor_mult: float = 0.55
+
+    # Fake breakout / trap filter
+    enable_fake_break_filter: bool = True
+    fake_break_buffer_atr_mult: float = 0.10
+    fake_break_wick_body_ratio: float = 1.50
+    fake_break_cooldown_bars_5m: int = 3
+
+    # Closed-bar confirmation
+    require_closed_bar_confirmation: bool = True
+
+    # Trend protection
+    enable_trend_protection: bool = True
+
+    # Anti chase
+    max_chase_distance_pts_clean_range: float = 16.0
+    max_chase_distance_pts_trend: float = 12.0
+    max_chase_distance_pts_messy: float = 8.0
+
+    # Score / RR
+    score_threshold: int = 3
     strong_score_threshold: int = 5
     strong_conf_threshold: int = 62
     standard_conf_threshold: int = 50
+    min_rr_to_t1: float = 1.20
 
-    # Dynamic targets
+    # Off-hours control
+    offhours_min_score: int = 4
+    offhours_block_weak: bool = True
+
+    # Momentum confirmation
+    require_momentum_confirmation: bool = True
+
+    # Targets
     enable_t3: bool = True
     enable_dynamic_t4: bool = True
     atr_fallback_t1_mult_weak: float = 0.28
@@ -117,12 +174,6 @@ class Config:
     dynamic_t3_atr_mult: float = 1.15
     dynamic_t4_atr_mult: float = 1.45
 
-    # Entry logic
-    aggressive_entry_for_strong_wick: bool = True
-
-    # Trade tracking
-    hourly_update: bool = True
-
     # Stop logic
     hard_stop_enabled: bool = True
     hard_stop_buffer_pts: float = 1.0
@@ -132,88 +183,34 @@ class Config:
     move_stop_to_t1_on_t2: bool = True
     move_stop_to_t2_on_t3: bool = True
 
-    # Session filter
-    offhours_min_score: int = 4
-    offhours_block_weak: bool = True
+    # Entry tuning
+    aggressive_entry_for_strong_wick: bool = True
 
-    # Daily reset
-    daily_reset_enabled: bool = True
-    daily_reset_hour: int = 0
-    daily_reset_minute: int = 0
-    daily_reset_window_minutes: int = 5
-    no_signal_after_reset_minutes: int = 8
+    # Hybrid
+    enable_hybrid_entries: bool = True
+    enable_early_entries_in_clean_range: bool = True
+    enable_early_entries_in_messy: bool = False
 
-    # Bars to fetch
-    bars_5m: int = 900
-    bars_15m: int = 600
-    bars_1h: int = 400
+    # Early entry detection
+    early_two_candle_reversal: bool = True
+    early_need_rejection_or_2bar: bool = True
 
-    # TradingView resilience
-    tv_retry_attempts: int = 3
-    tv_retry_sleep_base: float = 2.0
-    tv_fallback_bars: tuple = (800, 600, 500, 400, 300, 200)
+    # Position sizing hint (for Telegram text only)
+    strong_risk_scale: float = 1.00
+    early_risk_scale: float = 0.50
 
-    # Error reporting
-    error_notify_cooldown_minutes: int = 15
+    # Messy mode
+    messy_allows_only_strong_break_retest: bool = True
 
-    # Optional safety filters
-    block_all_weak_trades: bool = False
-    require_momentum_confirmation: bool = True
-
-    # =========================
-    # NEW FILTERS
-    # =========================
-
-    # Regime filters
-    enable_regime_filters: bool = True
-
-    # Range window on 15m
-    range_lookback_15m: int = 96
-    range_min_width_pts: float = 18.0
-
-    # Mid-range skip
-    enable_mid_range_skip: bool = True
-    mid_no_trade_pct: float = 0.40
-    mid_atr_floor_mult: float = 0.50
-
-    # Edge-only entries in range
-    enable_edge_only_range: bool = True
-    edge_zone_pct: float = 0.20
-    edge_atr_floor_mult: float = 0.50
-
-    # Fake breakout / trap filter
-    enable_fake_break_filter: bool = True
-    fake_break_buffer_atr_mult: float = 0.10
-    fake_break_wick_body_ratio: float = 1.5
-    fake_break_cooldown_bars_5m: int = 3
-
-    # Closed bar confirmation
-    require_closed_bar_confirmation: bool = True
-
-    # Trend protection
-    enable_trend_protection: bool = True
-
-    # Range edge requirements
-    range_sell_needs_upper_edge: bool = True
-    range_buy_needs_lower_edge: bool = True
-
-    # Chase prevention
-    max_chase_distance_pts_range: float = 8.0
-    max_chase_distance_pts_trend: float = 12.0
-
-    # Counter-trend rules
-    allow_counter_trend_wick_if_strong: bool = False
-
-    # 15m candle-close requirement for range reversal trades
-    require_15m_close_back_inside_range: bool = True
-
+    # Market state refresh
+    market_state_update_minutes: int = 10
 
 CFG = Config()
 
 
-# =========================
+# =========================================================
 # TradingView client
-# =========================
+# =========================================================
 
 def make_tv_client() -> TvDatafeed:
     if CFG.tv_username and CFG.tv_password:
@@ -224,9 +221,9 @@ TV = make_tv_client()
 LAST_GOOD_DATA = {}
 
 
-# =========================
+# =========================================================
 # TZ helpers
-# =========================
+# =========================================================
 
 def tzinfo(name: str):
     if ZoneInfo is None:
@@ -252,6 +249,7 @@ def session_label() -> str:
     pre_start = 4 * 60
     rth_start = 9 * 60 + 30
     rth_end = 16 * 60
+
     if pre_start <= hm < rth_start:
         return "Pre-Market"
     if rth_start <= hm < rth_end:
@@ -259,9 +257,9 @@ def session_label() -> str:
     return "After-Hours"
 
 
-# =========================
-# Safe formatting
-# =========================
+# =========================================================
+# Safe helpers
+# =========================================================
 
 def safe_f1(x, default="N/A"):
     try:
@@ -285,6 +283,9 @@ def safe_f2(x, default="N/A"):
     except Exception:
         return default
 
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
 def level_bucket_x(level: float) -> str:
     try:
         b = int(float(level) // 10) * 10
@@ -292,13 +293,10 @@ def level_bucket_x(level: float) -> str:
     except Exception:
         return "N/A"
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
-
-# =========================
+# =========================================================
 # Telegram
-# =========================
+# =========================================================
 
 def send_telegram(text: str):
     if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
@@ -320,12 +318,12 @@ def send_telegram(text: str):
             print("[WARN] Telegram send failed:", r.text)
         except Exception as e:
             print("[WARN] Telegram exception:", repr(e))
-        time.sleep(1.3 * (attempt + 1))
+        time.sleep(1.2 * (attempt + 1))
 
 
-# =========================
+# =========================================================
 # TradingView fetching
-# =========================
+# =========================================================
 
 def _normalize_tv_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -386,7 +384,6 @@ def _tv_get_hist(symbol: str, exchange: str, interval: Interval, n_bars: int) ->
 
                 out = _normalize_tv_df(df)
                 min_needed = 120 if interval == Interval.in_1_hour else 150
-
                 if len(out) < min_needed:
                     last_err = RuntimeError(
                         f"TradingView too few bars: {exchange}:{symbol} interval={interval} got={len(out)}"
@@ -429,9 +426,9 @@ def fetch_timeframes():
     return f"{exchange}:{symbol}", df_4h, df_1h, df_15m, df_5m
 
 
-# =========================
+# =========================================================
 # Structure / Levels
-# =========================
+# =========================================================
 
 def find_pivots(series: pd.Series, left: int, right: int):
     arr = series.values
@@ -439,8 +436,8 @@ def find_pivots(series: pd.Series, left: int, right: int):
     n = len(arr)
     for i in range(left, n - right):
         v = arr[i]
-        wl = arr[i - left: i]
-        wr = arr[i + 1: i + 1 + right]
+        wl = arr[i - left:i]
+        wr = arr[i + 1:i + 1 + right]
         if np.all(v > wl) and np.all(v >= wr):
             piv_hi.append(i)
         if np.all(v < wl) and np.all(v <= wr):
@@ -452,10 +449,13 @@ def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
         hi_idx, lo_idx = find_pivots(df["high"], CFG.pivot_left, CFG.pivot_right)
         highs = [float(df["high"].iloc[i]) for i in hi_idx][-2:]
         lows = [float(df["low"].iloc[i]) for i in lo_idx][-2:]
+
         if len(highs) < 2 or len(lows) < 2:
             return "Weak"
+
         h1, h2 = highs[-2], highs[-1]
         l1, l2 = lows[-2], lows[-1]
+
         if h2 > h1 and l2 > l1:
             return "Bullish"
         if h2 < h1 and l2 < l1:
@@ -510,6 +510,7 @@ def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> list:
             CFG.level_cluster_tolerance_frac,
             price
         ))
+
     return merged
 
 def fmt_levels(levels: list) -> str:
@@ -519,28 +520,123 @@ def near_level(price: float, level: float, tol_frac: float) -> bool:
     return abs(price - level) / max(price, 1e-9) <= tol_frac
 
 
-# =========================
+# =========================================================
 # Indicators
-# =========================
+# =========================================================
 
 def compute_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     out = df_5m.copy()
     out["rsi"] = RSIIndicator(close=out["close"], window=14).rsi()
+
     st = StochRSIIndicator(close=out["close"], window=14, smooth1=3, smooth2=3)
     out["stochrsi_k"] = st.stochrsi_k()
     out["stochrsi_d"] = st.stochrsi_d()
+
     out["ema20"] = EMAIndicator(close=out["close"], window=20).ema_indicator()
+
     macd = MACD(close=out["close"], window_slow=26, window_fast=12, window_sign=9)
     out["macd_hist"] = macd.macd_diff()
+
     return out
+
+def latest_atr_15m(df_15m: pd.DataFrame, window: int = None) -> float | None:
+    if window is None:
+        window = CFG.atr15_window
+
+    if len(df_15m) < window + 3:
+        return None
+
+    atr = AverageTrueRange(
+        high=df_15m["high"],
+        low=df_15m["low"],
+        close=df_15m["close"],
+        window=window
+    ).average_true_range()
+
+    val = float(atr.iloc[-1])
+    if not np.isfinite(val) or val <= 0:
+        return None
+
+    return val
+
+def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
+    if len(df_1h) < (CFG.expected_move_atr_window + 5):
+        return None
+
+    atr = AverageTrueRange(
+        high=df_1h["high"],
+        low=df_1h["low"],
+        close=df_1h["close"],
+        window=CFG.expected_move_atr_window,
+    ).average_true_range()
+
+    val = float(atr.iloc[-1])
+    if not np.isfinite(val) or val <= 0:
+        return None
+
+    return val
+
+
+# =========================================================
+# Price action helpers
+# =========================================================
+
+def candle_parts(row: pd.Series) -> tuple[float, float, float, float, float, float, float]:
+    o = float(row["open"])
+    h = float(row["high"])
+    l = float(row["low"])
+    c = float(row["close"])
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    rng = max(h - l, 1e-9)
+    return o, h, l, c, body, upper, lower
+
+def rejection_lite(df_5m: pd.DataFrame, direction: str) -> bool:
+    c = df_5m.iloc[-1]
+    _, h, l, _, _, upper, lower = candle_parts(c)
+    rng = max(h - l, 1e-9)
+
+    if direction == "BUY":
+        return (lower / rng) >= 0.25
+    if direction == "SELL":
+        return (upper / rng) >= 0.25
+    return False
+
+def strong_rejection(df_5m: pd.DataFrame, direction: str) -> bool:
+    c = df_5m.iloc[-1]
+    _, h, l, _, body, upper, lower = candle_parts(c)
+    rng = max(h - l, 1e-9)
+
+    if direction == "BUY":
+        return (lower / rng) >= 0.38 and lower > max(body, 0.8)
+    if direction == "SELL":
+        return (upper / rng) >= 0.38 and upper > max(body, 0.8)
+    return False
+
+def two_bar_reversal(df_5m: pd.DataFrame, direction: str) -> bool:
+    if len(df_5m) < 3:
+        return False
+
+    c1 = df_5m.iloc[-1]
+    c2 = df_5m.iloc[-2]
+
+    if direction == "BUY":
+        return float(c1["close"]) > float(c1["open"]) and float(c2["close"]) > float(c2["open"])
+    if direction == "SELL":
+        return float(c1["close"]) < float(c1["open"]) and float(c2["close"]) < float(c2["open"])
+    return False
 
 def stoch_cross(df_5m: pd.DataFrame, direction: str) -> bool:
     k = df_5m["stochrsi_k"].tail(3).values
     d = df_5m["stochrsi_d"].tail(3).values
+
     if len(k) < 3 or np.isnan(k).any() or np.isnan(d).any():
         return False
+
     prev = k[-2] - d[-2]
     curr = k[-1] - d[-1]
+
     if direction == "BUY":
         return prev < 0 and curr > 0 and np.nanmin(k) < 0.25
     if direction == "SELL":
@@ -550,10 +646,12 @@ def stoch_cross(df_5m: pd.DataFrame, direction: str) -> bool:
 def momentum_shift(df_5m: pd.DataFrame, direction: str) -> bool:
     if len(df_5m) < 30:
         return False
+
     c = float(df_5m["close"].iloc[-1])
     ema = float(df_5m["ema20"].iloc[-1])
     hist = float(df_5m["macd_hist"].iloc[-1])
     hist_prev = float(df_5m["macd_hist"].iloc[-2])
+
     if direction == "BUY":
         return (c > ema) or (hist_prev < 0 and hist > 0)
     if direction == "SELL":
@@ -563,34 +661,26 @@ def momentum_shift(df_5m: pd.DataFrame, direction: str) -> bool:
 def strong_buy_confirmation(df_5m: pd.DataFrame) -> bool:
     if len(df_5m) < 5:
         return False
+
     c = float(df_5m["close"].iloc[-1])
     ema = float(df_5m["ema20"].iloc[-1])
     macd_hist = float(df_5m["macd_hist"].iloc[-1])
     k = float(df_5m["stochrsi_k"].iloc[-1])
     d = float(df_5m["stochrsi_d"].iloc[-1])
+
     return (c > ema) and (macd_hist > 0) and (k >= d)
 
 def strong_sell_confirmation(df_5m: pd.DataFrame) -> bool:
     if len(df_5m) < 5:
         return False
+
     c = float(df_5m["close"].iloc[-1])
     ema = float(df_5m["ema20"].iloc[-1])
     macd_hist = float(df_5m["macd_hist"].iloc[-1])
     k = float(df_5m["stochrsi_k"].iloc[-1])
     d = float(df_5m["stochrsi_d"].iloc[-1])
-    return (c < ema) and (macd_hist < 0) and (k <= d)
 
-def rejection_lite(df_5m: pd.DataFrame, direction: str) -> bool:
-    c = df_5m.iloc[-1]
-    o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
-    rng = max(h - l, 1e-9)
-    upper = h - max(o, cl)
-    lower = min(o, cl) - l
-    if direction == "BUY":
-        return (lower / rng >= 0.25)
-    if direction == "SELL":
-        return (upper / rng >= 0.25)
-    return False
+    return (c < ema) and (macd_hist < 0) and (k <= d)
 
 def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
     window = df_5m.tail(10)
@@ -617,9 +707,9 @@ def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
     return False
 
 
-# =========================
-# Liquidity / Market state
-# =========================
+# =========================================================
+# Liquidity
+# =========================================================
 
 def liquidity_state(df_5m: pd.DataFrame) -> tuple[str, float | None]:
     if "volume" not in df_5m.columns:
@@ -641,6 +731,7 @@ def liquidity_state(df_5m: pd.DataFrame) -> tuple[str, float | None]:
 
     ratio = cur / avg
     t_low, t_high, t_ext = CFG.liquidity_thresholds
+
     if ratio < t_low:
         return "Low", ratio
     if ratio < t_high:
@@ -649,103 +740,10 @@ def liquidity_state(df_5m: pd.DataFrame) -> tuple[str, float | None]:
         return "High", ratio
     return "Extreme", ratio
 
-def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, prev_label: str):
-    if len(df_1h) < (CFG.adx_window + 5):
-        return "Weak", "Neutral", None
 
-    adx = ADXIndicator(
-        high=df_1h["high"], low=df_1h["low"], close=df_1h["close"], window=CFG.adx_window
-    ).adx()
-    adx_val = float(adx.iloc[-1]) if adx is not None and len(adx) else None
-
-    bias = structure_bias(df_1h, df_4h)
-    direction = "Neutral"
-    if bias == "Bullish":
-        direction = "Bullish"
-    elif bias == "Bearish":
-        direction = "Bearish"
-
-    if adx_val is None or np.isnan(adx_val):
-        return "Weak", direction, None
-
-    if adx_val >= CFG.adx_trending_on:
-        label = "Trending"
-    elif adx_val <= CFG.adx_range_on:
-        label = "Range"
-    else:
-        if prev_label == "Trending" and adx_val > CFG.adx_range_on:
-            label = "Trending"
-        elif prev_label == "Range" and adx_val < CFG.adx_trending_on:
-            label = "Range"
-        else:
-            label = "Weak"
-
-    return label, direction, adx_val
-
-def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
-    if len(df_1h) < (CFG.expected_move_atr_window + 5):
-        return None
-    atr = AverageTrueRange(
-        high=df_1h["high"], low=df_1h["low"], close=df_1h["close"],
-        window=CFG.expected_move_atr_window,
-    ).average_true_range()
-    val = float(atr.iloc[-1])
-    if not np.isfinite(val) or val <= 0:
-        return None
-    return val
-
-def eta_to_t1_minutes(df_5m: pd.DataFrame, price_now: float, t1: float, direction: str, liq_state: str) -> tuple[int, int] | None:
-    if t1 is None or not np.isfinite(t1):
-        return None
-    look = min(CFG.eta_velocity_lookback_5m, len(df_5m))
-    if look < 8:
-        return None
-    closes = df_5m["close"].tail(look).astype(float)
-    diffs = closes.diff().abs().dropna()
-    if diffs.empty:
-        return None
-    avg_abs_move_per_5m = float(diffs.mean())
-    vel = max(avg_abs_move_per_5m / 5.0, CFG.eta_min_velocity_pts_per_min)
-
-    dist = abs((t1 - price_now) if direction == "BUY" else (price_now - t1))
-    if dist < 0.1:
-        return (1, 5)
-
-    base = dist / vel
-
-    mult = 1.0
-    if liq_state == "Low":
-        mult = 1.35
-    elif liq_state == "Normal":
-        mult = 1.05
-    elif liq_state == "High":
-        mult = 0.90
-    elif liq_state == "Extreme":
-        mult = 0.80
-
-    eta = base * mult
-    lo = int(max(5, round(eta * 0.75)))
-    hi = int(max(lo + 5, round(eta * 1.25)))
-    return lo, hi
-
-
-# =========================
-# Range / Regime helpers
-# =========================
-
-def latest_atr_15m(df_15m: pd.DataFrame, window: int = 14) -> float | None:
-    if len(df_15m) < window + 3:
-        return None
-    atr = AverageTrueRange(
-        high=df_15m["high"],
-        low=df_15m["low"],
-        close=df_15m["close"],
-        window=window
-    ).average_true_range()
-    val = float(atr.iloc[-1])
-    if not np.isfinite(val) or val <= 0:
-        return None
-    return val
+# =========================================================
+# Range / Regime classification
+# =========================================================
 
 def compute_range_info(df_15m: pd.DataFrame) -> dict:
     look = min(CFG.range_lookback_15m, len(df_15m))
@@ -760,10 +758,38 @@ def compute_range_info(df_15m: pd.DataFrame) -> dict:
     if atr15 is None:
         atr15 = max(r_width * 0.08, 1.0)
 
+    width_atr = r_width / max(atr15, 1e-9)
+
     mid_dist = max(r_width * (CFG.mid_no_trade_pct / 2.0), atr15 * CFG.mid_atr_floor_mult)
     edge_dist = max(r_width * CFG.edge_zone_pct, atr15 * CFG.edge_atr_floor_mult)
 
+    touch_tol = atr15 * CFG.range_touch_tolerance_atr_mult
+    highs = recent["high"].astype(float).values
+    lows = recent["low"].astype(float).values
+    closes = recent["close"].astype(float).values
+
+    touches_high = int(np.sum(np.abs(highs - r_high) <= touch_tol))
+    touches_low = int(np.sum(np.abs(lows - r_low) <= touch_tol))
+
+    buf = atr15 * CFG.fake_break_buffer_atr_mult
+    sweep_up = int(np.sum((highs > (r_high + buf)) & (closes < r_high)))
+    sweep_dn = int(np.sum((lows < (r_low - buf)) & (closes > r_low)))
+    sweeps_total = sweep_up + sweep_dn
+
+    ema20 = recent["close"].ewm(span=20, adjust=False).mean()
+    slope_ref = 10 if len(ema20) > 10 else max(1, len(ema20) - 1)
+    slope_atr = abs(float(ema20.iloc[-1]) - float(ema20.iloc[-1 - slope_ref])) / max(atr15, 1e-9) if len(ema20) > slope_ref else 0.0
+
     valid = np.isfinite(r_high) and np.isfinite(r_low) and (r_width >= CFG.range_min_width_pts)
+
+    clean_range = (
+        valid
+        and width_atr <= CFG.range_max_width_atr
+        and touches_high >= CFG.range_min_touches_each_side
+        and touches_low >= CFG.range_min_touches_each_side
+        and sweeps_total <= CFG.range_max_sweeps_total
+        and slope_atr <= CFG.range_max_slope_atr
+    )
 
     return {
         "valid": bool(valid),
@@ -772,8 +798,17 @@ def compute_range_info(df_15m: pd.DataFrame) -> dict:
         "mid": float(r_mid),
         "width": float(r_width),
         "atr15": float(atr15),
+        "width_atr": float(width_atr),
         "mid_dist": float(mid_dist),
         "edge_dist": float(edge_dist),
+        "touch_tol": float(touch_tol),
+        "touches_high": int(touches_high),
+        "touches_low": int(touches_low),
+        "sweep_up": int(sweep_up),
+        "sweep_dn": int(sweep_dn),
+        "sweeps_total": int(sweeps_total),
+        "slope_atr": float(slope_atr),
+        "clean_range": bool(clean_range),
     }
 
 def price_in_mid_range(price: float, range_info: dict) -> bool:
@@ -802,6 +837,27 @@ def range_position_label(price: float, range_info: dict) -> str:
         return "Mid"
     return "Inner"
 
+def compute_adx_and_market_direction(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+    if len(df_1h) < (CFG.adx_window + 5):
+        return None, "Neutral", "Weak"
+
+    adx_ind = ADXIndicator(
+        high=df_1h["high"],
+        low=df_1h["low"],
+        close=df_1h["close"],
+        window=CFG.adx_window
+    )
+    adx_val = float(adx_ind.adx().iloc[-1])
+
+    bias = structure_bias(df_1h, df_4h)
+    direction = "Neutral"
+    if bias == "Bullish":
+        direction = "Bullish"
+    elif bias == "Bearish":
+        direction = "Bearish"
+
+    return adx_val, direction, bias
+
 def trend_direction_from_bias_and_state(bias: str, market_dir: str) -> str:
     if market_dir in ("Bullish", "Bearish"):
         return market_dir
@@ -809,40 +865,61 @@ def trend_direction_from_bias_and_state(bias: str, market_dir: str) -> str:
         return bias
     return "Neutral"
 
+def classify_market_regime(df_1h: pd.DataFrame, df_4h: pd.DataFrame, df_15m: pd.DataFrame, prev_label: str):
+    adx_val, market_dir, bias = compute_adx_and_market_direction(df_1h, df_4h)
+    range_info = compute_range_info(df_15m)
 
-# =========================
+    if adx_val is None or not np.isfinite(adx_val):
+        return {
+            "label": "Weak",
+            "dir": market_dir,
+            "bias": bias,
+            "adx": None,
+            "range_info": range_info,
+        }
+
+    # Trend hysteresis
+    if adx_val >= CFG.adx_trending_on:
+        label = "Trending"
+    elif adx_val <= CFG.adx_range_on:
+        label = "Clean Range" if range_info.get("clean_range", False) else "Messy"
+    else:
+        if prev_label == "Trending":
+            label = "Trending"
+        else:
+            label = "Clean Range" if range_info.get("clean_range", False) else "Messy"
+
+    return {
+        "label": label,
+        "dir": market_dir,
+        "bias": bias,
+        "adx": float(adx_val),
+        "range_info": range_info,
+    }
+
+
+# =========================================================
 # Fake breakout / trap detection
-# =========================
-
-def candle_parts(row: pd.Series) -> tuple[float, float, float, float, float, float, float]:
-    o = float(row["open"])
-    h = float(row["high"])
-    l = float(row["low"])
-    c = float(row["close"])
-    body = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-    rng = max(h - l, 1e-9)
-    return o, h, l, c, body, upper, lower
+# =========================================================
 
 def detect_fake_breaks(df_15m: pd.DataFrame, range_info: dict, market_label: str) -> dict:
     out = {
-        "bull_trap": False,   # broke above high then closed back below
-        "bear_trap": False,   # broke below low then closed back above
+        "bull_trap": False,
+        "bear_trap": False,
         "reason": None,
     }
 
     if not CFG.enable_fake_break_filter:
         return out
+    if market_label != "Clean Range":
+        return out
     if not range_info.get("valid", False):
         return out
     if len(df_15m) < 3:
         return out
-    if market_label != "Range":
-        return out
 
     last = df_15m.iloc[-1]
-    o, h, l, c, body, upper, lower = candle_parts(last)
+    _, h, l, c, body, upper, lower = candle_parts(last)
 
     wick_body_ratio_up = upper / max(body, 0.1)
     wick_body_ratio_dn = lower / max(body, 0.1)
@@ -870,12 +947,12 @@ def detect_fake_breaks(df_15m: pd.DataFrame, range_info: dict, market_label: str
     return out
 
 
-# =========================
+# =========================================================
 # Wick / Level quality
-# =========================
+# =========================================================
 
 def wick_cluster_near_level(df_5m: pd.DataFrame, level: float) -> dict:
-    w = df_5m.tail(min(CFG.wick_cluster_lookback_5m, len(df_5m))).copy()
+    w = df_5m.tail(10).copy()
     if w.empty:
         return {
             "upper_cluster": False,
@@ -899,22 +976,22 @@ def wick_cluster_near_level(df_5m: pd.DataFrame, level: float) -> dict:
         lower = min(o, c) - l
 
         near = (
-            (abs(h - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac)
-            or (abs(l - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac)
-            or (abs(c - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac)
+            (abs(h - level) / max(level, 1e-9) <= CFG.level_touch_tolerance_frac)
+            or (abs(l - level) / max(level, 1e-9) <= CFG.level_touch_tolerance_frac)
+            or (abs(c - level) / max(level, 1e-9) <= CFG.level_touch_tolerance_frac)
         )
 
         if not near:
             continue
 
-        if upper >= CFG.wick_min_abs_pts and (upper / rng) >= CFG.wick_ratio_strong:
+        if upper >= 1.2 and (upper / rng) >= 0.45:
             upper_hits += 1
-        if lower >= CFG.wick_min_abs_pts and (lower / rng) >= CFG.wick_ratio_strong:
+        if lower >= 1.2 and (lower / rng) >= 0.45:
             lower_hits += 1
 
     return {
-        "upper_cluster": upper_hits >= CFG.wick_cluster_min_hits,
-        "lower_cluster": lower_hits >= CFG.wick_cluster_min_hits,
+        "upper_cluster": upper_hits >= 3,
+        "lower_cluster": lower_hits >= 3,
         "upper_hits": int(upper_hits),
         "lower_hits": int(lower_hits),
         "bucket": level_bucket_x(level),
@@ -979,9 +1056,9 @@ def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: list) -
     return chosen[1], chosen[2]
 
 
-# =========================
+# =========================================================
 # Bot State
-# =========================
+# =========================================================
 
 class BotState:
     def __init__(self):
@@ -995,11 +1072,12 @@ class BotState:
         self.market_state_last_calc_utc = None
         self.market_label = "Unknown"
         self.market_dir = "Neutral"
+        self.market_bias = "Weak"
         self.market_adx = None
+        self.range_info = {}
 
         self.last_error_notify_utc = None
 
-        # New cooldowns for traps
         self.block_long_until_bar_5m = 0
         self.block_short_until_bar_5m = 0
         self.bar_counter_5m = 0
@@ -1007,9 +1085,11 @@ class BotState:
     def can_signal(self, key: str) -> bool:
         if self.no_signal_until_utc is not None and datetime.utcnow() < self.no_signal_until_utc:
             return False
+
         last = self.last_signal_ts.get(key)
         if last is None:
             return True
+
         return (datetime.utcnow() - last) >= timedelta(minutes=CFG.signal_cooldown_minutes)
 
     def mark_signal(self, key: str):
@@ -1020,9 +1100,11 @@ class BotState:
         if self.last_error_notify_utc is None:
             self.last_error_notify_utc = nowu
             return True
+
         if (nowu - self.last_error_notify_utc) >= timedelta(minutes=CFG.error_notify_cooldown_minutes):
             self.last_error_notify_utc = nowu
             return True
+
         return False
 
     def long_blocked(self) -> bool:
@@ -1040,56 +1122,9 @@ class BotState:
 
 STATE = BotState()
 
-# =========================
-# Score setup
-# =========================
-
-def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict) -> tuple[int, list[str], str]:
-    score = 0
-    reasons: list[str] = []
-    trigger = None
-
-    wick_reason = None
-    if wick_info.get("upper_cluster") and direction == "SELL":
-        wick_reason = f"Upper-wick rejection cluster near {wick_info.get('bucket', 'N/A')}"
-    if wick_info.get("lower_cluster") and direction == "BUY":
-        wick_reason = f"Lower-wick cluster near support {wick_info.get('bucket', 'N/A')}"
-
-    if wick_reason:
-        score += 3
-        reasons.append("Wick Rejection near Level")
-        reasons.append(wick_reason)
-        trigger = "Wick Rejection near Level"
-
-    br = break_retest(df_5m, level_hit, direction)
-    rj = rejection_lite(df_5m, direction)
-    st = stoch_cross(df_5m, direction)
-    ms = momentum_shift(df_5m, direction)
-
-    if br:
-        score += 2
-        reasons.append("Break&Retest")
-        trigger = trigger or "Break&Retest"
-    if rj:
-        score += 2
-        reasons.append("Rejection")
-        trigger = trigger or "Rejection"
-    if st:
-        score += 1
-        reasons.append("Stoch RSI cross")
-    if ms:
-        score += 1
-        reasons.append("Momentum shift")
-
-    score = int(min(score, 6))
-    if trigger is None:
-        return 0, ["No trigger"], "None"
-    return score, reasons, trigger
-
-
-# =========================
-# Range / Trend direction logic
-# =========================
+# =========================================================
+# Direction / confirmations
+# =========================================================
 
 def buy_confirmations(df_5m: pd.DataFrame, level_hit: float) -> bool:
     return (
@@ -1107,159 +1142,169 @@ def sell_confirmations(df_5m: pd.DataFrame, level_hit: float) -> bool:
         or rejection_lite(df_5m, "SELL")
     )
 
-def choose_direction_safely(
+def strong_setup_ready(df_5m: pd.DataFrame, level_hit: float, direction: str, trap_info: dict) -> bool:
+    if direction == "BUY":
+        return (
+            trap_info.get("bear_trap", False)
+            or strong_rejection(df_5m, "BUY")
+            or break_retest(df_5m, level_hit, "BUY")
+            or strong_buy_confirmation(df_5m)
+        )
+
+    if direction == "SELL":
+        return (
+            trap_info.get("bull_trap", False)
+            or strong_rejection(df_5m, "SELL")
+            or break_retest(df_5m, level_hit, "SELL")
+            or strong_sell_confirmation(df_5m)
+        )
+
+    return False
+
+def early_setup_ready(df_5m: pd.DataFrame, direction: str) -> bool:
+    if direction == "BUY":
+        if CFG.early_need_rejection_or_2bar:
+            return rejection_lite(df_5m, "BUY") or two_bar_reversal(df_5m, "BUY")
+        return two_bar_reversal(df_5m, "BUY")
+
+    if direction == "SELL":
+        if CFG.early_need_rejection_or_2bar:
+            return rejection_lite(df_5m, "SELL") or two_bar_reversal(df_5m, "SELL")
+        return two_bar_reversal(df_5m, "SELL")
+
+    return False
+
+def choose_direction_by_regime(
     df_5m: pd.DataFrame,
-    df_15m: pd.DataFrame,
     level_hit: float,
     level_now: float,
     bias: str,
     range_info: dict,
-) -> tuple[str | None, list[str]]:
+    trap_info: dict,
+) -> tuple[str | None, str | None, list[str]]:
+    """
+    returns: direction, entry_mode, notes
+    entry_mode: Strong / Early / None
+    """
     notes: list[str] = []
 
     buy_ok = buy_confirmations(df_5m, level_hit)
     sell_ok = sell_confirmations(df_5m, level_hit)
 
-    # 1) TREND MODE
+    # =====================================================
+    # 1) TRENDING
+    # =====================================================
     if STATE.market_label == "Trending":
+        notes.append("Regime = Trending")
+
         if STATE.market_dir == "Bullish":
-            if buy_ok:
-                notes.append("Trend mode → Bullish → BUY only")
-                return "BUY", notes
-            notes.append("Trend mode bullish but no buy confirmation")
-            return None, notes
+            if strong_setup_ready(df_5m, level_hit, "BUY", trap_info) and buy_ok:
+                notes.append("Trend bullish → BUY only")
+                return "BUY", "Strong", notes
+            notes.append("Trend bullish but no strong BUY setup")
+            return None, None, notes
 
         if STATE.market_dir == "Bearish":
-            if sell_ok:
-                notes.append("Trend mode → Bearish → SELL only")
-                return "SELL", notes
-            notes.append("Trend mode bearish but no sell confirmation")
-            return None, notes
+            if strong_setup_ready(df_5m, level_hit, "SELL", trap_info) and sell_ok:
+                notes.append("Trend bearish → SELL only")
+                return "SELL", "Strong", notes
+            notes.append("Trend bearish but no strong SELL setup")
+            return None, None, notes
 
-    # 2) RANGE MODE
-    if STATE.market_label == "Range" and range_info.get("valid", False):
+        notes.append("Trend neutral direction → skip")
+        return None, None, notes
+
+    # =====================================================
+    # 2) CLEAN RANGE
+    # =====================================================
+    if STATE.market_label == "Clean Range" and range_info.get("valid", False):
         pos = range_position_label(level_now, range_info)
-        notes.append(f"Range mode → location={pos}")
+        notes.append(f"Regime = Clean Range | Pos = {pos}")
 
-        # Upper edge -> SELL zone only
+        # SELL side
         if price_near_range_high(level_now, range_info):
-            if sell_ok:
-                notes.append("Near upper edge with sell confirmation")
-                return "SELL", notes
-            notes.append("Near upper edge but no sell confirmation")
-            return None, notes
+            # Strong first
+            if strong_setup_ready(df_5m, level_hit, "SELL", trap_info) and sell_ok:
+                notes.append("Upper edge + strong sell setup")
+                return "SELL", "Strong", notes
 
-        # Lower edge -> BUY zone only
+            # Early second
+            if CFG.enable_hybrid_entries and CFG.enable_early_entries_in_clean_range:
+                if early_setup_ready(df_5m, "SELL"):
+                    notes.append("Upper edge + early sell weakness")
+                    return "SELL", "Early", notes
+
+            notes.append("Upper edge but no valid SELL setup")
+            return None, None, notes
+
+        # BUY side
         if price_near_range_low(level_now, range_info):
-            if buy_ok:
-                notes.append("Near lower edge with buy confirmation")
-                return "BUY", notes
-            notes.append("Near lower edge but no buy confirmation")
-            return None, notes
+            # Strong first
+            if strong_setup_ready(df_5m, level_hit, "BUY", trap_info) and buy_ok:
+                notes.append("Lower edge + strong buy setup")
+                return "BUY", "Strong", notes
 
-        # Mid / inner = skip
-        notes.append("Inside range away from edges → skip")
-        return None, notes
+            # Early second
+            if CFG.enable_hybrid_entries and CFG.enable_early_entries_in_clean_range:
+                if early_setup_ready(df_5m, "BUY"):
+                    notes.append("Lower edge + early buy strength")
+                    return "BUY", "Early", notes
 
-    # 3) WEAK / FALLBACK
+            notes.append("Lower edge but no valid BUY setup")
+            return None, None, notes
+
+        notes.append("Inside clean range away from edges → skip")
+        return None, None, notes
+
+    # =====================================================
+    # 3) MESSY
+    # =====================================================
+    if STATE.market_label == "Messy":
+        notes.append("Regime = Messy")
+
+        if CFG.messy_allows_only_strong_break_retest:
+            # In messy mode do NOT play classic range edges
+            # Only take strong momentum / break-retest aligned with bias
+            if bias == "Bullish":
+                if break_retest(df_5m, level_hit, "BUY") and strong_buy_confirmation(df_5m):
+                    notes.append("Messy → only strong BUY break-retest")
+                    return "BUY", "Strong", notes
+
+            if bias == "Bearish":
+                if break_retest(df_5m, level_hit, "SELL") and strong_sell_confirmation(df_5m):
+                    notes.append("Messy → only strong SELL break-retest")
+                    return "SELL", "Strong", notes
+
+            notes.append("Messy regime without strong break-retest")
+            return None, None, notes
+
+        # fallback if user disables strict messy behavior
+        if bias == "Bullish" and strong_buy_confirmation(df_5m):
+            notes.append("Messy fallback → strong BUY only")
+            return "BUY", "Strong", notes
+
+        if bias == "Bearish" and strong_sell_confirmation(df_5m):
+            notes.append("Messy fallback → strong SELL only")
+            return "SELL", "Strong", notes
+
+        return None, None, notes
+
+    # =====================================================
+    # 4) WEAK / FALLBACK
+    # =====================================================
+    notes.append("Regime = Weak fallback")
+
     if bias == "Bullish" and buy_ok:
-        notes.append("Weak state fallback → BUY by bias + confirmation")
-        return "BUY", notes
+        return "BUY", "Strong", notes
     if bias == "Bearish" and sell_ok:
-        notes.append("Weak state fallback → SELL by bias + confirmation")
-        return "SELL", notes
+        return "SELL", "Strong", notes
 
-    if buy_ok and not sell_ok:
-        notes.append("Weak state fallback → BUY by confirmations only")
-        return "BUY", notes
-    if sell_ok and not buy_ok:
-        notes.append("Weak state fallback → SELL by confirmations only")
-        return "SELL", notes
-
-    notes.append("No clear direction")
-    return None, notes
+    return None, None, notes
 
 
-# =========================
-# Filters / blocking
-# =========================
-
-def direction_allowed_by_trend(direction: str, trend_dir: str) -> bool:
-    if not CFG.enable_trend_protection:
-        return True
-    if STATE.market_label != "Trending":
-        return True
-    if trend_dir == "Bullish" and direction == "SELL":
-        return False
-    if trend_dir == "Bearish" and direction == "BUY":
-        return False
-    return True
-
-def direction_allowed_by_range_location(direction: str, level_now: float, range_info: dict) -> bool:
-    if not CFG.enable_edge_only_range:
-        return True
-    if STATE.market_label != "Range":
-        return True
-    if not range_info.get("valid", False):
-        return True
-
-    if CFG.enable_mid_range_skip and price_in_mid_range(level_now, range_info):
-        return False
-
-    if direction == "SELL" and CFG.range_sell_needs_upper_edge:
-        return price_near_range_high(level_now, range_info)
-
-    if direction == "BUY" and CFG.range_buy_needs_lower_edge:
-        return price_near_range_low(level_now, range_info)
-
-    return True
-
-def distance_from_best_edge(direction: str, level_now: float, range_info: dict) -> float | None:
-    if not range_info.get("valid", False):
-        return None
-    if direction == "SELL":
-        return abs(range_info["high"] - level_now)
-    if direction == "BUY":
-        return abs(level_now - range_info["low"])
-    return None
-
-def is_chasing_too_far(direction: str, level_now: float, range_info: dict) -> bool:
-    dist = distance_from_best_edge(direction, level_now, range_info)
-    if dist is None:
-        return False
-
-    if STATE.market_label == "Range":
-        return dist > CFG.max_chase_distance_pts_range
-
-    if STATE.market_label == "Trending":
-        return dist > CFG.max_chase_distance_pts_trend
-
-    return False
-
-def block_reason_for_direction(direction: str, level_now: float, range_info: dict, trend_dir: str, trap_info: dict) -> str | None:
-    if CFG.enable_regime_filters:
-        if not direction_allowed_by_trend(direction, trend_dir):
-            return f"Blocked by trend protection ({trend_dir})"
-
-        if not direction_allowed_by_range_location(direction, level_now, range_info):
-            pos = range_position_label(level_now, range_info)
-            return f"Blocked by range-location filter ({pos})"
-
-    if direction == "BUY" and STATE.long_blocked():
-        return "Blocked by recent bull-trap cooldown"
-
-    if direction == "SELL" and STATE.short_blocked():
-        return "Blocked by recent bear-trap cooldown"
-
-    if trap_info.get("bull_trap") and direction == "BUY":
-        return "Blocked by active bull trap"
-    if trap_info.get("bear_trap") and direction == "SELL":
-        return "Blocked by active bear trap"
-
-    if is_chasing_too_far(direction, level_now, range_info):
-        return "Blocked by anti-chase filter"
-
-    return None
+# =========================================================
+# Trap cooldown
+# =========================================================
 
 def update_trap_cooldown(trap_info: dict):
     if trap_info.get("bull_trap"):
@@ -1268,11 +1313,189 @@ def update_trap_cooldown(trap_info: dict):
         STATE.block_short(CFG.fake_break_cooldown_bars_5m)
 
 
-# =========================
-# Confidence / Probability
-# =========================
+# =========================================================
+# Blocking / filters
+# =========================================================
 
-def confidence_percent(score: int, direction: str, bias: str, session: str, market_label: str, liq_state: str) -> int:
+def direction_allowed_by_trend(direction: str, trend_dir: str) -> bool:
+    if not CFG.enable_trend_protection:
+        return True
+    if STATE.market_label != "Trending":
+        return True
+
+    if trend_dir == "Bullish" and direction == "SELL":
+        return False
+    if trend_dir == "Bearish" and direction == "BUY":
+        return False
+    return True
+
+def direction_allowed_by_range_location(direction: str, level_now: float, range_info: dict) -> bool:
+    if STATE.market_label != "Clean Range":
+        return True
+    if not CFG.enable_edge_only_range:
+        return True
+    if not range_info.get("valid", False):
+        return False
+
+    if CFG.enable_mid_range_skip and price_in_mid_range(level_now, range_info):
+        return False
+
+    if direction == "SELL":
+        return price_near_range_high(level_now, range_info)
+
+    if direction == "BUY":
+        return price_near_range_low(level_now, range_info)
+
+    return False
+
+def distance_from_best_location(direction: str, level_now: float, range_info: dict) -> float | None:
+    if not range_info.get("valid", False):
+        return None
+
+    if STATE.market_label == "Clean Range":
+        if direction == "SELL":
+            return abs(range_info["high"] - level_now)
+        if direction == "BUY":
+            return abs(level_now - range_info["low"])
+
+    if STATE.market_label == "Trending":
+        # for trend we keep it simple: distance from chosen level
+        return None
+
+    if STATE.market_label == "Messy":
+        return None
+
+    return None
+
+def is_chasing_too_far(direction: str, level_now: float, range_info: dict) -> bool:
+    dist = distance_from_best_location(direction, level_now, range_info)
+
+    if dist is None:
+        return False
+
+    if STATE.market_label == "Clean Range":
+        return dist > CFG.max_chase_distance_pts_clean_range
+
+    if STATE.market_label == "Trending":
+        return dist > CFG.max_chase_distance_pts_trend
+
+    if STATE.market_label == "Messy":
+        return dist > CFG.max_chase_distance_pts_messy
+
+    return False
+
+def block_reason_for_direction(
+    direction: str,
+    level_now: float,
+    range_info: dict,
+    trend_dir: str,
+    trap_info: dict,
+    entry_mode: str | None,
+) -> str | None:
+    # Trend protection
+    if not direction_allowed_by_trend(direction, trend_dir):
+        return f"Blocked by trend protection ({trend_dir})"
+
+    # Clean range location rules
+    if not direction_allowed_by_range_location(direction, level_now, range_info):
+        pos = range_position_label(level_now, range_info)
+        return f"Blocked by range-location filter ({pos})"
+
+    # Trap cooldown
+    if direction == "BUY" and STATE.long_blocked():
+        return "Blocked by recent bull-trap cooldown"
+    if direction == "SELL" and STATE.short_blocked():
+        return "Blocked by recent bear-trap cooldown"
+
+    # Active trap on same side
+    if trap_info.get("bull_trap") and direction == "BUY":
+        return "Blocked by active bull trap"
+    if trap_info.get("bear_trap") and direction == "SELL":
+        return "Blocked by active bear trap"
+
+    # Anti chase
+    if is_chasing_too_far(direction, level_now, range_info):
+        return "Blocked by anti-chase filter"
+
+    # Messy mode protection
+    if STATE.market_label == "Messy":
+        if entry_mode == "Early" and not CFG.enable_early_entries_in_messy:
+            return "Blocked: Early entries disabled in Messy"
+
+    return None
+
+
+# =========================================================
+# Score / confidence / probabilities
+# =========================================================
+
+def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: dict, entry_mode: str) -> tuple[int, list[str], str]:
+    score = 0
+    reasons: list[str] = []
+    trigger = None
+
+    wick_reason = None
+    if wick_info.get("upper_cluster") and direction == "SELL":
+        wick_reason = f"Upper-wick rejection cluster near {wick_info.get('bucket', 'N/A')}"
+    if wick_info.get("lower_cluster") and direction == "BUY":
+        wick_reason = f"Lower-wick cluster near support {wick_info.get('bucket', 'N/A')}"
+
+    if wick_reason:
+        score += 2 if entry_mode == "Early" else 3
+        reasons.append("Wick Rejection near Level")
+        reasons.append(wick_reason)
+        trigger = "Wick Rejection near Level"
+
+    br = break_retest(df_5m, level_hit, direction)
+    rj = rejection_lite(df_5m, direction)
+    sr = strong_rejection(df_5m, direction)
+    st = stoch_cross(df_5m, direction)
+    ms = momentum_shift(df_5m, direction)
+    tb = two_bar_reversal(df_5m, direction)
+
+    if br:
+        score += 2
+        reasons.append("Break&Retest")
+        trigger = trigger or "Break&Retest"
+
+    if sr:
+        score += 2
+        reasons.append("Strong Rejection")
+        trigger = trigger or "Strong Rejection"
+    elif rj:
+        score += 1 if entry_mode == "Early" else 2
+        reasons.append("Rejection")
+        trigger = trigger or "Rejection"
+
+    if tb and entry_mode == "Early":
+        score += 1
+        reasons.append("Two-bar reversal")
+
+    if st:
+        score += 1
+        reasons.append("Stoch RSI cross")
+
+    if ms:
+        score += 1
+        reasons.append("Momentum shift")
+
+    score = int(min(score, 6))
+    if trigger is None:
+        return 0, ["No trigger"], "None"
+
+    return score, reasons, trigger
+
+def classify_trade_strength(score: int, conf: int, entry_mode: str) -> str:
+    if entry_mode == "Early":
+        return "Early"
+
+    if score >= CFG.strong_score_threshold or conf >= CFG.strong_conf_threshold:
+        return "Strong"
+    if conf >= CFG.standard_conf_threshold or score >= 4:
+        return "Standard"
+    return "Weak"
+
+def confidence_percent(score: int, direction: str, bias: str, session: str, market_label: str, liq_state: str, entry_mode: str) -> int:
     base = int(round((score / 6) * 100))
     adj = 0
 
@@ -1291,13 +1514,18 @@ def confidence_percent(score: int, direction: str, bias: str, session: str, mark
 
     if market_label == "Trending":
         adj += 4
-    elif market_label == "Range":
-        adj -= 2
+    elif market_label == "Clean Range":
+        adj += 2
+    elif market_label == "Messy":
+        adj -= 7
+
+    if entry_mode == "Early":
+        adj -= 10
 
     return int(max(5, min(95, base + adj)))
 
 def probability_t1_t2(conf: int, rr: float | None, dist_t1: float | None, dist_t2: float | None,
-                      exp_move_1h_val: float | None, liq_state: str, market_label: str) -> tuple[int, int]:
+                      exp_move_1h_val: float | None, liq_state: str, market_label: str, entry_mode: str) -> tuple[int, int]:
     t1 = float(conf)
 
     if rr is not None and np.isfinite(rr):
@@ -1313,10 +1541,13 @@ def probability_t1_t2(conf: int, rr: float | None, dist_t1: float | None, dist_t
     elif liq_state in ("High", "Extreme"):
         t1 += 2
 
-    if market_label == "Range":
-        t1 -= 3
+    if market_label == "Messy":
+        t1 -= 8
     elif market_label == "Trending":
         t1 += 2
+
+    if entry_mode == "Early":
+        t1 -= 8
 
     if exp_move_1h_val is not None and dist_t1 is not None and np.isfinite(dist_t1):
         if dist_t1 > exp_move_1h_val * 1.20:
@@ -1332,13 +1563,58 @@ def probability_t1_t2(conf: int, rr: float | None, dist_t1: float | None, dist_t
     else:
         t2 = int(round(t1 * 0.65))
 
+    if entry_mode == "Early":
+        t2 = int(round(t2 * 0.82))
+
     t2 = max(5, min(t1, min(90, t2)))
     return int(t1), int(t2)
 
 
-# =========================
+# =========================================================
+# ETA helper
+# =========================================================
+
+def eta_to_t1_minutes(df_5m: pd.DataFrame, price_now: float, t1: float, direction: str, liq_state: str) -> tuple[int, int] | None:
+    if t1 is None or not np.isfinite(t1):
+        return None
+
+    look = min(24, len(df_5m))
+    if look < 8:
+        return None
+
+    closes = df_5m["close"].tail(look).astype(float)
+    diffs = closes.diff().abs().dropna()
+    if diffs.empty:
+        return None
+
+    avg_abs_move_per_5m = float(diffs.mean())
+    vel = max(avg_abs_move_per_5m / 5.0, 0.15)
+
+    dist = abs((t1 - price_now) if direction == "BUY" else (price_now - t1))
+    if dist < 0.1:
+        return (1, 5)
+
+    base = dist / vel
+
+    mult = 1.0
+    if liq_state == "Low":
+        mult = 1.35
+    elif liq_state == "Normal":
+        mult = 1.05
+    elif liq_state == "High":
+        mult = 0.90
+    elif liq_state == "Extreme":
+        mult = 0.80
+
+    eta = base * mult
+    lo = int(max(5, round(eta * 0.75)))
+    hi = int(max(lo + 5, round(eta * 1.25)))
+    return lo, hi
+
+
+# =========================================================
 # Messages
-# =========================
+# =========================================================
 
 def signal_message(
     session: str,
@@ -1364,11 +1640,19 @@ def signal_message(
     rr_txt = safe_f2(plan.get("rr"))
     exp_txt = f"±{float(exp_move):.0f} pts" if exp_move is not None and np.isfinite(float(exp_move)) else "N/A"
     eta_txt = "N/A" if eta_band is None else f"{eta_band[0]}–{eta_band[1]} min"
+
     trade_type = plan.get("trade_type", "N/A")
+    entry_mode = plan.get("entry_mode", "N/A")
+    risk_scale = plan.get("risk_scale", 1.0)
 
     range_pos = "N/A"
+    range_desc = "Range: N/A"
     if range_info is not None and range_info.get("valid", False):
         range_pos = range_position_label(level_now, range_info)
+        range_desc = (
+            f"{safe_f1(range_info['low'])} - {safe_f1(range_info['high'])} "
+            f"| Mid {safe_f1(range_info['mid'])}"
+        )
 
     return (
         f"🚨 {CFG.user_title} — فرصة دخول (Hunter Smart)\n\n"
@@ -1378,10 +1662,13 @@ def signal_message(
         f"📊 Market State: {market_state_str}\n"
         f"💧 Liquidity: {liq_state}\n"
         f"💰 Level Now: {safe_f1(level_now)}\n"
-        f"🧭 Range Position: {range_pos}\n\n"
+        f"🧭 Range Position: {range_pos}\n"
+        f"📦 Range Box: {range_desc}\n\n"
         f"📍 Direction: {direction}\n"
         f"🧱 Level: {safe_f1(level_hit)}\n"
-        f"🧬 Trade Type: {trade_type}\n\n"
+        f"🧬 Trade Type: {trade_type}\n"
+        f"⚙️ Entry Mode: {entry_mode}\n"
+        f"📏 Risk Scale: x{safe_f2(risk_scale)}\n\n"
         f"✅ Entry: {safe_f1(plan.get('entry'))}\n"
         f"🛑 Stop: {safe_f1(plan.get('stop'))}\n"
         f"🎯 Target 1: {t1_txt}\n"
@@ -1411,14 +1698,21 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
             f"T1 {safe_f1(active_trade.get('t1'))} | "
             f"T2 {safe_f1(active_trade.get('t2'))} | "
             f"T3 {safe_f1(active_trade.get('t3'))} | "
-            f"T4 {safe_f1(active_trade.get('t4'))}"
+            f"Mode {active_trade.get('entry_mode', 'N/A')}"
         )
 
     range_line = "Range: N/A"
+    quality_line = "Range Quality: N/A"
     if range_info is not None and range_info.get("valid", False):
         range_line = (
             f"Range: {safe_f1(range_info['low'])} - {safe_f1(range_info['high'])} "
             f"| Mid {safe_f1(range_info['mid'])}"
+        )
+        quality_line = (
+            f"Clean={range_info.get('clean_range', False)} | "
+            f"WidthATR={safe_f2(range_info.get('width_atr'))} | "
+            f"Touches(H/L)={range_info.get('touches_high')}/{range_info.get('touches_low')} | "
+            f"Sweeps={range_info.get('sweeps_total')}"
         )
 
     return (
@@ -1431,20 +1725,23 @@ def hourly_update_message(session: str, symbol: str, bias: str, market_state_str
         f"💵 Price: {safe_f1(price)}\n"
         f"🧱 Key Levels: {fmt_levels(levels)}\n"
         f"🧭 {range_line}\n"
+        f"🧪 {quality_line}\n"
         f"📌 Active Trade: {status}\n"
         f"🧾 Trade: {trade_line}"
     )
 
 
-# =========================
-# Reset / Market state cache
-# =========================
+# =========================================================
+# Reset / Market-state cache
+# =========================================================
 
 def maybe_daily_reset():
     if not CFG.daily_reset_enabled:
         return
+
     t = now_riyadh()
     today = t.date()
+
     if STATE.last_reset_date_riyadh == today:
         return
 
@@ -1472,7 +1769,7 @@ def maybe_daily_reset():
     STATE.last_reset_date_riyadh = today
     STATE.no_signal_until_utc = datetime.utcnow() + timedelta(minutes=CFG.no_signal_after_reset_minutes)
 
-def maybe_update_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
+def maybe_update_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, df_15m: pd.DataFrame):
     nowu = datetime.utcnow()
     should = STATE.market_state_last_calc_utc is None or (
         nowu - STATE.market_state_last_calc_utc
@@ -1481,22 +1778,17 @@ def maybe_update_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame):
     if not should:
         return
 
-    label, direction, adx_val = compute_market_state(df_1h, df_4h, STATE.market_label)
-    STATE.market_label = label
-    STATE.market_dir = direction
-    STATE.market_adx = adx_val
+    regime = classify_market_regime(df_1h, df_4h, df_15m, STATE.market_label)
+    STATE.market_label = regime["label"]
+    STATE.market_dir = regime["dir"]
+    STATE.market_bias = regime["bias"]
+    STATE.market_adx = regime["adx"]
+    STATE.range_info = regime["range_info"]
     STATE.market_state_last_calc_utc = nowu
 
-# =========================
-# Trade strength / targets
-# =========================
-
-def classify_trade_strength(score: int, conf: int) -> str:
-    if score >= CFG.strong_score_threshold or conf >= CFG.strong_conf_threshold:
-        return "Strong"
-    if conf >= CFG.standard_conf_threshold or score >= 4:
-        return "Standard"
-    return "Weak"
+# =========================================================
+# Targets / planning
+# =========================================================
 
 def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | None, trade_type: str):
     if exp_move_val is None or not np.isfinite(exp_move_val):
@@ -1506,7 +1798,7 @@ def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | Non
         d1 = exp_move_val * CFG.atr_fallback_t1_mult_weak
         d2 = exp_move_val * CFG.atr_fallback_t2_mult_weak
         d3 = None
-    elif trade_type == "Standard":
+    elif trade_type in ("Standard", "Early"):
         d1 = exp_move_val * CFG.atr_fallback_t1_mult_standard
         d2 = exp_move_val * CFG.atr_fallback_t2_mult_standard
         d3 = None
@@ -1529,24 +1821,37 @@ def atr_fallback_targets(entry: float, direction: str, exp_move_val: float | Non
 def pick_targets(levels: list, entry: float, direction: str):
     if not levels:
         return None, None
+
     if direction == "BUY":
         above = sorted([lvl for lvl in levels if lvl > entry])
         return (
             above[0] if len(above) >= 1 else None,
             above[1] if len(above) >= 2 else None
         )
+
     if direction == "SELL":
         below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
         return (
             below[0] if len(below) >= 1 else None,
             below[1] if len(below) >= 2 else None
         )
+
     return None, None
 
+def risk_scale_from_entry_mode(entry_mode: str) -> float:
+    if entry_mode == "Early":
+        return float(CFG.early_risk_scale)
+    return float(CFG.strong_risk_scale)
 
-# =========================
+def trade_type_from_entry_mode(entry_mode: str, classified_strength: str) -> str:
+    if entry_mode == "Early":
+        return "Early"
+    return classified_strength
+
+
+# =========================================================
 # Entry / Stop planner
-# =========================
+# =========================================================
 
 def compute_trade_plan(
     df_5m: pd.DataFrame,
@@ -1556,6 +1861,7 @@ def compute_trade_plan(
     direction: str,
     trigger: str,
     trade_type: str,
+    entry_mode: str,
     exp_move_val: float | None,
     range_info: dict | None = None,
 ):
@@ -1570,70 +1876,87 @@ def compute_trade_plan(
 
     buffer = max(price * 0.0002, 0.5)
 
-    # -------------------------
-    # RANGE MODE ENTRY / STOP
-    # -------------------------
-    if STATE.market_label == "Range" and range_info is not None and range_info.get("valid", False):
+    # =====================================================
+    # CLEAN RANGE MODE
+    # =====================================================
+    if STATE.market_label == "Clean Range" and range_info is not None and range_info.get("valid", False):
         if direction == "BUY":
-            # Prefer lower edge / support area
             anchor = min(level_hit, range_info["low"] + range_info["edge_dist"])
-            if trigger == "Wick Rejection near Level":
-                entry = float(max(price, anchor + max(0.4, atr15 * 0.08)))
-            elif trigger == "Break&Retest":
-                entry = float(max(price, anchor + max(0.8, atr15 * 0.12)))
-            else:
-                entry = float(max(price, anchor + max(0.5, atr15 * 0.10)))
 
-            stop = float(min(last_low, range_info["low"], level_hit) - max(buffer, atr15 * 0.22))
+            if entry_mode == "Early":
+                entry = float(max(price, anchor + max(0.3, atr15 * 0.06)))
+                stop = float(min(last_low, range_info["low"], level_hit) - max(buffer, atr15 * 0.18))
+            else:
+                if trigger == "Wick Rejection near Level":
+                    entry = float(max(price, anchor + max(0.4, atr15 * 0.08)))
+                elif trigger == "Break&Retest":
+                    entry = float(max(price, anchor + max(0.8, atr15 * 0.12)))
+                else:
+                    entry = float(max(price, anchor + max(0.5, atr15 * 0.10)))
+
+                stop = float(min(last_low, range_info["low"], level_hit) - max(buffer, atr15 * 0.22))
 
         else:  # SELL
-            # Prefer upper edge / resistance area
             anchor = max(level_hit, range_info["high"] - range_info["edge_dist"])
-            if trigger == "Wick Rejection near Level":
-                entry = float(min(price, anchor - max(0.4, atr15 * 0.08)))
-            elif trigger == "Break&Retest":
-                entry = float(min(price, anchor - max(0.8, atr15 * 0.12)))
+
+            if entry_mode == "Early":
+                entry = float(min(price, anchor - max(0.3, atr15 * 0.06)))
+                stop = float(max(last_high, range_info["high"], level_hit) + max(buffer, atr15 * 0.18))
             else:
-                entry = float(min(price, anchor - max(0.5, atr15 * 0.10)))
+                if trigger == "Wick Rejection near Level":
+                    entry = float(min(price, anchor - max(0.4, atr15 * 0.08)))
+                elif trigger == "Break&Retest":
+                    entry = float(min(price, anchor - max(0.8, atr15 * 0.12)))
+                else:
+                    entry = float(min(price, anchor - max(0.5, atr15 * 0.10)))
 
-            stop = float(max(last_high, range_info["high"], level_hit) + max(buffer, atr15 * 0.22))
+                stop = float(max(last_high, range_info["high"], level_hit) + max(buffer, atr15 * 0.22))
 
-    # -------------------------
-    # TREND / WEAK MODE ENTRY / STOP
-    # -------------------------
+    # =====================================================
+    # TREND / MESSY / FALLBACK
+    # =====================================================
     else:
-        if trigger == "Wick Rejection near Level":
+        if entry_mode == "Early":
+            # We keep Early lighter and tighter if ever allowed outside clean range
             if direction == "BUY":
-                if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
-                    entry = float(max(price, level_hit + buffer * 0.4))
-                else:
-                    entry = float(max(price, (last_high + level_hit) / 2.0))
-                stop = float(min(last_low, level_hit) - max(buffer, atr15 * 0.18))
+                entry = float(max(price, level_hit + max(buffer * 0.2, atr15 * 0.05)))
+                stop = float(min(last_low, level_hit) - max(buffer, atr15 * 0.16))
             else:
-                if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
-                    entry = float(min(price, level_hit - buffer * 0.4))
-                else:
-                    entry = float(min(price, (last_low + level_hit) / 2.0))
-                stop = float(max(last_high, level_hit) + max(buffer, atr15 * 0.18))
-
-        elif trigger == "Rejection":
-            if direction == "BUY":
-                entry = float(max(price, last_high - buffer * 0.4))
-                stop = float(min(last_low, level_hit) - max(buffer, atr15 * 0.18))
-            else:
-                entry = float(min(price, last_low + buffer * 0.4))
-                stop = float(max(last_high, level_hit) + max(buffer, atr15 * 0.18))
+                entry = float(min(price, level_hit - max(buffer * 0.2, atr15 * 0.05)))
+                stop = float(max(last_high, level_hit) + max(buffer, atr15 * 0.16))
         else:
-            if direction == "BUY":
-                entry = float(max(price, level_hit + max(buffer, atr15 * 0.08)))
-                stop = float(level_hit - max(price * 0.0011, atr15 * 0.22) - buffer)
-            else:
-                entry = float(min(price, level_hit - max(buffer, atr15 * 0.08)))
-                stop = float(level_hit + max(price * 0.0011, atr15 * 0.22) + buffer)
+            if trigger == "Wick Rejection near Level":
+                if direction == "BUY":
+                    if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
+                        entry = float(max(price, level_hit + buffer * 0.4))
+                    else:
+                        entry = float(max(price, (last_high + level_hit) / 2.0))
+                    stop = float(min(last_low, level_hit) - max(buffer, atr15 * 0.18))
+                else:
+                    if trade_type == "Strong" and CFG.aggressive_entry_for_strong_wick:
+                        entry = float(min(price, level_hit - buffer * 0.4))
+                    else:
+                        entry = float(min(price, (last_low + level_hit) / 2.0))
+                    stop = float(max(last_high, level_hit) + max(buffer, atr15 * 0.18))
 
-    # -------------------------
+            elif trigger == "Rejection" or trigger == "Strong Rejection":
+                if direction == "BUY":
+                    entry = float(max(price, last_high - buffer * 0.4))
+                    stop = float(min(last_low, level_hit) - max(buffer, atr15 * 0.18))
+                else:
+                    entry = float(min(price, last_low + buffer * 0.4))
+                    stop = float(max(last_high, level_hit) + max(buffer, atr15 * 0.18))
+            else:
+                if direction == "BUY":
+                    entry = float(max(price, level_hit + max(buffer, atr15 * 0.08)))
+                    stop = float(level_hit - max(price * 0.0011, atr15 * 0.22) - buffer)
+                else:
+                    entry = float(min(price, level_hit - max(buffer, atr15 * 0.08)))
+                    stop = float(level_hit + max(price * 0.0011, atr15 * 0.22) + buffer)
+
+    # =====================================================
     # Targets
-    # -------------------------
+    # =====================================================
     t1, t2 = pick_targets(levels, entry, direction)
     atr_t1, atr_t2, atr_t3 = atr_fallback_targets(entry, direction, exp_move_val, trade_type)
 
@@ -1650,6 +1973,10 @@ def compute_trade_plan(
         else:
             if t2 is None or atr_t3 < t2:
                 t3 = atr_t3
+
+    # Early entries: keep targets tighter by default
+    if entry_mode == "Early":
+        t3 = None
 
     targets = [t for t in [t1, t2, t3] if t is not None and np.isfinite(t)]
     if direction == "BUY":
@@ -1677,12 +2004,14 @@ def compute_trade_plan(
         "t4": None,
         "rr": rr,
         "trade_type": trade_type,
+        "entry_mode": entry_mode,
+        "risk_scale": risk_scale_from_entry_mode(entry_mode),
     }
 
 
-# =========================
-# Dynamic expansion after T2/T3
-# =========================
+# =========================================================
+# Dynamic T3 / T4 expansion
+# =========================================================
 
 def next_levels_beyond(levels: list, price_ref: float, direction: str) -> list:
     if direction == "BUY":
@@ -1705,10 +2034,7 @@ def dynamic_target_from_market_or_atr(levels: list, current_price: float, direct
     if exp_move_val is None or not np.isfinite(exp_move_val):
         return None
 
-    if stage == "T3":
-        dist = exp_move_val * CFG.dynamic_t3_atr_mult
-    else:
-        dist = exp_move_val * CFG.dynamic_t4_atr_mult
+    dist = exp_move_val * (CFG.dynamic_t3_atr_mult if stage == "T3" else CFG.dynamic_t4_atr_mult)
 
     if direction == "BUY":
         candidate = current_price + dist
@@ -1723,6 +2049,10 @@ def dynamic_target_from_market_or_atr(levels: list, current_price: float, direct
 def maybe_expand_targets(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame, last_price: float):
     tr = STATE.active_trade
     if tr is None or tr.get("status") != "live":
+        return
+
+    # Early entries do not get runners
+    if tr.get("entry_mode") == "Early":
         return
 
     direction = tr["direction"]
@@ -1780,9 +2110,9 @@ def maybe_expand_targets(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Da
             )
 
 
-# =========================
+# =========================================================
 # Active trade management
-# =========================
+# =========================================================
 
 def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.DataFrame, last_price: float):
     tr = STATE.active_trade
@@ -1797,9 +2127,9 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
     t3 = tr.get("t3")
     t4 = tr.get("t4")
 
-    # -------------------------
+    # =====================================================
     # Pending -> live
-    # -------------------------
+    # =====================================================
     if tr["status"] == "pending":
         triggered = (last_price >= entry) if direction == "BUY" else (last_price <= entry)
         if triggered:
@@ -1808,6 +2138,8 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
             send_telegram(
                 f"📍 {CFG.user_title} — الصفقة تفعلت\n"
                 f"Direction: {direction}\n"
+                f"Entry Mode: {tr.get('entry_mode', 'N/A')}\n"
+                f"Risk Scale: x{safe_f2(tr.get('risk_scale', 1.0))}\n"
                 f"Entry Triggered @ {safe_f1(last_price)}\n"
                 f"Stop: {safe_f1(stop)}\n"
                 f"T1: {safe_f1(t1)} | T2: {safe_f1(t2)} | T3: {safe_f1(t3)} | T4: {safe_f1(t4)}"
@@ -1817,10 +2149,11 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
     if tr["status"] != "live":
         return
 
-    # -------------------------
+    # =====================================================
     # Stop logic
-    # -------------------------
+    # =====================================================
     breached = (last_price <= stop) if direction == "BUY" else (last_price >= stop)
+
     if breached:
         if CFG.hard_stop_enabled:
             beyond = (
@@ -1832,6 +2165,7 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
                 send_telegram(
                     f"❌ {CFG.user_title} — وقف الخسارة (Hard Stop)\n"
                     f"Stop Hit ✅ | Direction: {direction}\n"
+                    f"Mode: {tr.get('entry_mode', 'N/A')}\n"
                     f"Stop: {safe_f1(stop)} | Price: {safe_f1(last_price)}\n"
                     f"ملاحظة: تم الإغلاق الفوري لتجنب انزلاق كبير."
                 )
@@ -1856,6 +2190,7 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
                         send_telegram(
                             f"❌ {CFG.user_title} — وقف الخسارة تأكد\n"
                             f"Stop Hit ✅ | Direction: {direction}\n"
+                            f"Mode: {tr.get('entry_mode', 'N/A')}\n"
                             f"Stop: {safe_f1(stop)} | Price: {safe_f1(last_price)}\n"
                             f"تأكيد: إغلاق 5m ضد الصفقة."
                         )
@@ -1870,42 +2205,67 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
         tr["stop_pending"] = False
         tr.pop("stop_pending_since_utc", None)
 
-    # -------------------------
+    # =====================================================
     # T1
-    # -------------------------
+    # =====================================================
     if t1 is not None and not tr.get("t1_hit"):
         hit_t1 = (last_price >= float(t1)) if direction == "BUY" else (last_price <= float(t1))
         if hit_t1:
             tr["t1_hit"] = True
+
+            # Early entries can be more conservative: move stop to BE immediately
             if CFG.move_stop_to_be_on_t1:
                 tr["stop"] = float(entry)
+
             send_telegram(
                 f"🎯 {CFG.user_title} — Target 1 Hit\n"
+                f"Mode: {tr.get('entry_mode', 'N/A')}\n"
                 f"T1: {safe_f1(t1)}\n"
                 f"Raised Stop: {safe_f1(tr['stop'])}"
             )
 
-    # -------------------------
+            # For Early entries with no T2/T3 ambition, allow optional simple exit tracking
+            if tr.get("entry_mode") == "Early" and tr.get("t2") is None:
+                send_telegram(
+                    f"✅ {CFG.user_title} — Early trade completed\n"
+                    f"T1 was the main target.\n"
+                    f"اقتراح: إغلاق أو تتبع يدوي."
+                )
+                STATE.active_trade = None
+                return
+
+    # =====================================================
     # T2
-    # -------------------------
+    # =====================================================
     if t2 is not None and not tr.get("t2_hit"):
         hit_t2 = (last_price >= float(t2)) if direction == "BUY" else (last_price <= float(t2))
         if hit_t2:
             tr["t2_hit"] = True
             if CFG.move_stop_to_t1_on_t2 and tr.get("t1") is not None:
                 tr["stop"] = float(tr["t1"])
+
             send_telegram(
                 f"🏆 {CFG.user_title} — Target 2 Hit\n"
+                f"Mode: {tr.get('entry_mode', 'N/A')}\n"
                 f"T2: {safe_f1(t2)}\n"
-                f"Raised Stop: {safe_f1(tr['stop'])}\n"
-                f"جاري فحص إمكانية إضافة T3..."
+                f"Raised Stop: {safe_f1(tr['stop'])}"
             )
+
+            # Early entries: usually enough here
+            if tr.get("entry_mode") == "Early":
+                send_telegram(
+                    f"✅ {CFG.user_title} — Early trade completed\n"
+                    f"T2 reached.\n"
+                    f"اقتراح: إغلاق كامل."
+                )
+                STATE.active_trade = None
+                return
 
     maybe_expand_targets(df_5m, df_15m, df_1h, last_price)
 
-    # -------------------------
+    # =====================================================
     # T3
-    # -------------------------
+    # =====================================================
     t3 = tr.get("t3")
     if t3 is not None and not tr.get("t3_hit"):
         hit_t3 = (last_price >= float(t3)) if direction == "BUY" else (last_price <= float(t3))
@@ -1913,18 +2273,19 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
             tr["t3_hit"] = True
             if CFG.move_stop_to_t2_on_t3 and tr.get("t2") is not None:
                 tr["stop"] = float(tr["t2"])
+
             send_telegram(
                 f"🚀 {CFG.user_title} — Target 3 Hit\n"
+                f"Mode: {tr.get('entry_mode', 'N/A')}\n"
                 f"T3: {safe_f1(t3)}\n"
-                f"Raised Stop: {safe_f1(tr['stop'])}\n"
-                f"جاري فحص إمكانية إضافة T4..."
+                f"Raised Stop: {safe_f1(tr['stop'])}"
             )
 
     maybe_expand_targets(df_5m, df_15m, df_1h, last_price)
 
-    # -------------------------
+    # =====================================================
     # T4
-    # -------------------------
+    # =====================================================
     t4 = tr.get("t4")
     if t4 is not None and not tr.get("t4_hit"):
         hit_t4 = (last_price >= float(t4)) if direction == "BUY" else (last_price <= float(t4))
@@ -1938,9 +2299,9 @@ def update_active_trade(df_5m: pd.DataFrame, df_15m: pd.DataFrame, df_1h: pd.Dat
             STATE.active_trade = None
             return
 
-# =========================
+# =========================================================
 # Main evaluation
-# =========================
+# =========================================================
 
 def evaluate_once():
     maybe_daily_reset()
@@ -1948,7 +2309,7 @@ def evaluate_once():
     session = session_label()
     symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
 
-    # advance 5m bar counter for trap cooldown logic
+    # advance 5m bar counter
     STATE.bar_counter_5m += 1
 
     # indicators
@@ -1956,20 +2317,20 @@ def evaluate_once():
     level_now = float(df_5m["close"].iloc[-1])
 
     # market state
-    maybe_update_market_state(df_1h, df_4h)
+    maybe_update_market_state(df_1h, df_4h, df_15m)
     adx_txt = "N/A" if STATE.market_adx is None else safe_f1(STATE.market_adx)
     market_state_str = f"{STATE.market_label} | {STATE.market_dir} | ADX(1H): {adx_txt}"
 
     # context
     liq_state, _ = liquidity_state(df_5m)
-    bias = structure_bias(df_1h, df_4h)
+    bias = STATE.market_bias if STATE.market_bias else structure_bias(df_1h, df_4h)
     trend_dir = trend_direction_from_bias_and_state(bias, STATE.market_dir)
 
     key_levels = extract_key_levels(df_15m, df_1h)
     exp_move_val = expected_move_1h(df_1h)
-    range_info = compute_range_info(df_15m)
+    range_info = STATE.range_info if STATE.range_info else compute_range_info(df_15m)
 
-    # fake breakout / trap detection
+    # fake breakout / traps
     trap_info = detect_fake_breaks(df_15m, range_info, STATE.market_label)
     update_trap_cooldown(trap_info)
 
@@ -1982,7 +2343,14 @@ def evaluate_once():
         current_hour = now_riyadh().replace(minute=0, second=0, microsecond=0)
         if STATE.last_hour_sent is None or current_hour > STATE.last_hour_sent:
             send_telegram(hourly_update_message(
-                session, symbol, bias, market_state_str, key_levels, level_now, STATE.active_trade, range_info
+                session=session,
+                symbol=symbol,
+                bias=bias,
+                market_state_str=market_state_str,
+                levels=key_levels,
+                price=level_now,
+                active_trade=STATE.active_trade,
+                range_info=range_info,
             ))
             STATE.last_hour_sent = current_hour
 
@@ -2001,66 +2369,89 @@ def evaluate_once():
     level_hit, level_info = choose_best_level(df_5m, level_now, key_levels)
     wick_info = level_info["wick_info"]
 
-    # choose direction safely
-    direction, direction_notes = choose_direction_safely(
+    # choose direction + entry mode
+    direction, entry_mode, direction_notes = choose_direction_by_regime(
         df_5m=df_5m,
-        df_15m=df_15m,
         level_hit=level_hit,
         level_now=level_now,
         bias=bias,
         range_info=range_info,
+        trap_info=trap_info,
     )
 
-    if direction is None:
+    if direction is None or entry_mode is None:
         return
 
-    # range/trend block checks
+    # block checks
     block_reason = block_reason_for_direction(
         direction=direction,
         level_now=level_now,
         range_info=range_info,
         trend_dir=trend_dir,
         trap_info=trap_info,
+        entry_mode=entry_mode,
     )
     if block_reason is not None:
         return
 
-    # extra 15m confirmation when in range reversal zones
-    if (
-        CFG.require_15m_close_back_inside_range
-        and STATE.market_label == "Range"
-        and range_info.get("valid", False)
-    ):
+    # closed-bar confirmation
+    if CFG.require_closed_bar_confirmation:
+        # We only evaluate once bar data is fetched closed from tvdatafeed,
+        # so this is practically already enforced, but we keep logic explicit.
+        pass
+
+    # extra 15m confirmation in clean range reversals
+    if STATE.market_label == "Clean Range" and range_info.get("valid", False):
         last15 = df_15m.iloc[-1]
         c15 = float(last15["close"])
         h15 = float(last15["high"])
         l15 = float(last15["low"])
 
         if direction == "SELL" and price_near_range_high(level_now, range_info):
-            # if price probed above and closed back below the upper boundary -> stronger sell
+            # reject SELL if candle is still closing clearly above range high
             if h15 > range_info["high"] and c15 > range_info["high"]:
                 return
 
         if direction == "BUY" and price_near_range_low(level_now, range_info):
-            # if price probed below and closed back above the lower boundary -> stronger buy
+            # reject BUY if candle is still closing clearly below range low
             if l15 < range_info["low"] and c15 < range_info["low"]:
                 return
 
+    # in messy mode, only allow strong entries
+    if STATE.market_label == "Messy" and entry_mode != "Strong":
+        return
+
     # score the setup
-    score, reasons, trigger = score_setup(df_5m, level_hit, direction, wick_info)
+    score, reasons, trigger = score_setup(
+        df_5m=df_5m,
+        level_hit=level_hit,
+        direction=direction,
+        wick_info=wick_info,
+        entry_mode=entry_mode,
+    )
     if score <= 0:
         return
 
-    # add direction notes
     for note in direction_notes:
         if note not in reasons:
             reasons.append(note)
 
     # confidence / trade type
-    conf = confidence_percent(score, direction, bias, session, STATE.market_label, liq_state)
-    trade_type = classify_trade_strength(score, conf)
+    conf = confidence_percent(
+        score=score,
+        direction=direction,
+        bias=bias,
+        session=session,
+        market_label=STATE.market_label,
+        liq_state=liq_state,
+        entry_mode=entry_mode,
+    )
 
-    if CFG.block_all_weak_trades and trade_type == "Weak":
+    classified_strength = classify_trade_strength(score, conf, entry_mode)
+    trade_type = trade_type_from_entry_mode(entry_mode, classified_strength)
+
+    # minimum score
+    if score < CFG.score_threshold and entry_mode != "Early":
         return
 
     # offhours stricter
@@ -2069,43 +2460,62 @@ def evaluate_once():
             return
         if CFG.offhours_block_weak and trade_type == "Weak":
             return
+        # optionally keep Early out of offhours if you want later
+        # currently allowed if all rules pass
 
     # momentum confirmation
     if CFG.require_momentum_confirmation:
         if direction == "BUY":
-            if not (
-                strong_buy_confirmation(df_5m)
-                or trigger == "Break&Retest"
-                or (STATE.market_label == "Range" and price_near_range_low(level_now, range_info))
-            ):
-                return
+            if entry_mode == "Strong":
+                if not (
+                    strong_buy_confirmation(df_5m)
+                    or trigger == "Break&Retest"
+                    or trigger == "Strong Rejection"
+                    or (STATE.market_label == "Clean Range" and price_near_range_low(level_now, range_info))
+                ):
+                    return
+            else:  # Early
+                if not (
+                    early_setup_ready(df_5m, "BUY")
+                    or (STATE.market_label == "Clean Range" and price_near_range_low(level_now, range_info))
+                ):
+                    return
 
         if direction == "SELL":
-            if not (
-                strong_sell_confirmation(df_5m)
-                or trigger == "Break&Retest"
-                or (STATE.market_label == "Range" and price_near_range_high(level_now, range_info))
-            ):
-                return
+            if entry_mode == "Strong":
+                if not (
+                    strong_sell_confirmation(df_5m)
+                    or trigger == "Break&Retest"
+                    or trigger == "Strong Rejection"
+                    or (STATE.market_label == "Clean Range" and price_near_range_high(level_now, range_info))
+                ):
+                    return
+            else:  # Early
+                if not (
+                    early_setup_ready(df_5m, "SELL")
+                    or (STATE.market_label == "Clean Range" and price_near_range_high(level_now, range_info))
+                ):
+                    return
 
-    # prevent weak random range trades
-    if STATE.market_label == "Range":
+    # clean range controls
+    if STATE.market_label == "Clean Range":
         if CFG.enable_mid_range_skip and price_in_mid_range(level_now, range_info):
             return
 
         if direction == "BUY" and not price_near_range_low(level_now, range_info):
             return
+
         if direction == "SELL" and not price_near_range_high(level_now, range_info):
             return
 
-    # prevent counter-trend trades when strong trend
+    # trend protection final check
     if CFG.enable_trend_protection and STATE.market_label == "Trending":
         if trend_dir == "Bullish" and direction == "SELL":
             return
         if trend_dir == "Bearish" and direction == "BUY":
             return
 
-    # trade plan
+    # compute trade plan
     plan = compute_trade_plan(
         df_5m=df_5m,
         df_15m=df_15m,
@@ -2114,6 +2524,7 @@ def evaluate_once():
         direction=direction,
         trigger=trigger,
         trade_type=trade_type,
+        entry_mode=entry_mode,
         exp_move_val=exp_move_val,
         range_info=range_info,
     )
@@ -2123,7 +2534,7 @@ def evaluate_once():
         return
 
     # cooldown key
-    key = f"{direction}:{round(level_hit, 1)}:{trigger}:{trade_type}:{STATE.market_label}"
+    key = f"{STATE.market_label}:{entry_mode}:{direction}:{round(level_hit,1)}:{trigger}:{trade_type}"
     if not STATE.can_signal(key):
         return
 
@@ -2135,7 +2546,16 @@ def evaluate_once():
     if plan.get("t2") is not None:
         dist_t2 = abs(float(plan["t2"]) - level_now)
 
-    p1, p2 = probability_t1_t2(conf, rr, dist_t1, dist_t2, exp_move_val, liq_state, STATE.market_label)
+    p1, p2 = probability_t1_t2(
+        conf=conf,
+        rr=rr,
+        dist_t1=dist_t1,
+        dist_t2=dist_t2,
+        exp_move_1h_val=exp_move_val,
+        liq_state=liq_state,
+        market_label=STATE.market_label,
+        entry_mode=entry_mode,
+    )
 
     eta = None
     if plan.get("t1") is not None:
@@ -2177,6 +2597,8 @@ def evaluate_once():
         "status": "pending",
         "created_utc": datetime.utcnow(),
         "trade_type": trade_type,
+        "entry_mode": entry_mode,
+        "risk_scale": float(plan.get("risk_scale", 1.0)),
         "market_label": STATE.market_label,
         "t1_hit": False,
         "t2_hit": False,
@@ -2187,22 +2609,26 @@ def evaluate_once():
     }
 
 
-# =========================
+# =========================================================
 # Main
-# =========================
+# =========================================================
 
 def main():
     send_telegram(
         f"✅ {CFG.user_title} — Bot started\n"
         f"Rules:\n"
         f"- Source: TradingView ({CFG.tv_exchange}:{CFG.tv_symbol})\n"
-        f"- Regime Filters: {'ON' if CFG.enable_regime_filters else 'OFF'}\n"
+        f"- 3-State Regime: ON\n"
+        f"- States: Trending / Clean Range / Messy\n"
         f"- Trend Protection: {'ON' if CFG.enable_trend_protection else 'OFF'}\n"
         f"- Mid-Range Skip: {'ON' if CFG.enable_mid_range_skip else 'OFF'}\n"
         f"- Edge-only Range Entries: {'ON' if CFG.enable_edge_only_range else 'OFF'}\n"
         f"- Fake Break Filter: {'ON' if CFG.enable_fake_break_filter else 'OFF'}\n"
+        f"- Hybrid Entries: {'ON' if CFG.enable_hybrid_entries else 'OFF'}\n"
+        f"- Early in Clean Range: {'ON' if CFG.enable_early_entries_in_clean_range else 'OFF'}\n"
+        f"- Early in Messy: {'ON' if CFG.enable_early_entries_in_messy else 'OFF'}\n"
         f"- Closed-bar Confirmation: {'ON' if CFG.require_closed_bar_confirmation else 'OFF'}\n"
-        f"- Dynamic T3/T4 expansion: {'ON' if CFG.enable_t3 or CFG.enable_dynamic_t4 else 'OFF'}\n"
+        f"- Dynamic T3/T4 expansion: {'ON' if (CFG.enable_t3 or CFG.enable_dynamic_t4) else 'OFF'}\n"
         f"- Stop raising after targets: ON\n"
         f"- Stop: HardStop({CFG.hard_stop_buffer_pts:.1f} pts) + 5m close confirm"
     )
@@ -2210,8 +2636,10 @@ def main():
     while True:
         try:
             evaluate_once()
+
         except Exception as e:
             print("[ERROR]", repr(e))
+
             try:
                 reinit_tv_client()
             except Exception as reinit_err:
