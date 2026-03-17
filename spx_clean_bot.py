@@ -601,6 +601,34 @@ def expected_move_1h(df_1h: pd.DataFrame) -> float | None:
     return val
 
 
+def liquidity_state(df_5m: pd.DataFrame):
+    if len(df_5m) < CFG.liquidity_lookback_5m + 5:
+        return "Normal", None
+
+    recent = df_5m.tail(CFG.liquidity_lookback_5m)
+
+    ranges = (recent["high"] - recent["low"]).astype(float)
+    avg_range = float(ranges.mean())
+
+    current_range = float(df_5m["high"].iloc[-1] - df_5m["low"].iloc[-1])
+
+    if avg_range <= 0:
+        return "Normal", None
+
+    ratio = current_range / avg_range
+
+    low, normal, high = CFG.liquidity_thresholds
+
+    if ratio < low:
+        return "Low", ratio
+    elif ratio < normal:
+        return "Normal", ratio
+    elif ratio < high:
+        return "High", ratio
+    else:
+        return "Extreme", ratio
+
+
 # =========================================================
 # Regime classification helpers
 # =========================================================
@@ -947,27 +975,32 @@ def strong_sell_confirmation(df_5m: pd.DataFrame) -> bool:
 
 
 def momentum_breakout(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
-    if len(df_5m) < 6:
+    if len(df_5m) < 8:
         return False
 
     closes = df_5m["close"].astype(float).tail(3).values
     ema = float(df_5m["ema20"].iloc[-1])
     macd_hist = float(df_5m["macd_hist"].iloc[-1])
 
+    prev_high = float(df_5m["high"].iloc[-6:-1].max())
+    prev_low = float(df_5m["low"].iloc[-6:-1].min())
+
     if direction == "BUY":
+        breakout_ref = max(float(level), prev_high)
         return (
-            closes[0] < closes[1] < closes[2] and
-            closes[2] > float(level) and
-            closes[2] > ema and
-            macd_hist > 0
+            closes[0] < closes[1] < closes[2]
+            and closes[2] > breakout_ref
+            and closes[2] > ema
+            and macd_hist > 0
         )
 
     if direction == "SELL":
+        breakout_ref = min(float(level), prev_low)
         return (
-            closes[0] > closes[1] > closes[2] and
-            closes[2] < float(level) and
-            closes[2] < ema and
-            macd_hist < 0
+            closes[0] > closes[1] > closes[2]
+            and closes[2] < breakout_ref
+            and closes[2] < ema
+            and macd_hist < 0
         )
 
     return False
