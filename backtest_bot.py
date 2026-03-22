@@ -1,235 +1,141 @@
 # -*- coding: utf-8 -*-
 """
-SPX Hybrid Smart Bot - Backtest
+SNIPER BOT v1 — Backtest
 For: دكتور محمد
+
+Logic:
+- Trade WITH trend only
+- Enter on pullback (EMA zone)
+- No reversal trading
+- Clean + selective entries
 """
 
-import numpy as np
+import yfinance as yf
 import pandas as pd
-from tvDatafeed import TvDatafeed, Interval
-from ta.trend import EMAIndicator, ADXIndicator
+import numpy as np
 
-# ================= LOAD DATA =================
+# =========================
+# CONFIG
+# =========================
 
-tv = TvDatafeed()
+SYMBOL = "ES=F"
+INTERVAL = "5m"
+LOOKBACK = "5d"
 
-def load_data():
-    df = tv.get_hist(
-        symbol="SPX500",
-        exchange="FOREXCOM",
-        interval=Interval.in_5_minute,
-        n_bars=3000
-    )
-    if df is None or df.empty:
-        raise RuntimeError("No data returned from TradingView")
+RR = 2.0
+RISK = 10  # points
 
-    df.columns = [c.lower() for c in df.columns]
-    df = df.dropna().copy()
-    return df
+# =========================
+# DATA
+# =========================
 
-# ================= INDICATORS =================
+df = yf.download(SYMBOL, interval=INTERVAL, period=LOOKBACK)
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ema20"] = EMAIndicator(df["close"], window=20).ema_indicator()
+df.dropna(inplace=True)
 
-    adx = ADXIndicator(
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        window=14
-    )
-    df["adx"] = adx.adx()
-    return df
+# =========================
+# INDICATORS
+# =========================
 
-# ================= MARKET MODE =================
+df["EMA20"] = df["Close"].ewm(span=20).mean()
+df["EMA50"] = df["Close"].ewm(span=50).mean()
 
-def detect_mode(row) -> str:
-    if row["adx"] > 25:
-        return "TREND"
-    elif row["adx"] < 20:
-        return "RANGE"
-    return "MIXED"
+# =========================
+# MARKET TREND
+# =========================
 
-# ================= PIVOTS =================
+def get_trend(row):
+    if row["EMA20"] > row["EMA50"]:
+        return "UP"
+    elif row["EMA20"] < row["EMA50"]:
+        return "DOWN"
+    else:
+        return "NONE"
 
-def find_pivots(df: pd.DataFrame):
-    highs = []
-    lows = []
+df["Trend"] = df.apply(get_trend, axis=1)
 
-    for i in range(3, len(df) - 3):
-        if (
-            df["high"].iloc[i] > df["high"].iloc[i - 3:i].max()
-            and df["high"].iloc[i] > df["high"].iloc[i + 1:i + 4].max()
-        ):
-            highs.append((i, float(df["high"].iloc[i])))
+# =========================
+# BACKTEST
+# =========================
 
-        if (
-            df["low"].iloc[i] < df["low"].iloc[i - 3:i].min()
-            and df["low"].iloc[i] < df["low"].iloc[i + 1:i + 4].min()
-        ):
-            lows.append((i, float(df["low"].iloc[i])))
+trades = []
 
-    return highs, lows
+for i in range(50, len(df) - 10):
 
-# ================= LEVELS =================
+    row = df.iloc[i]
 
-def build_levels(pivots, threshold=5.0):
-    levels = []
+    trend = row["Trend"]
+    price = row["Close"]
+    ema20 = row["EMA20"]
 
-    for _, lvl in pivots:
-        if not levels:
-            levels.append(float(lvl))
-        else:
-            if all(abs(float(lvl) - x) > threshold for x in levels):
-                levels.append(float(lvl))
+    # =========================
+    # ENTRY LOGIC
+    # =========================
 
-    return sorted(levels)
+    if trend == "UP":
 
-# ================= ENTRY =================
+        # pullback to EMA
+        if price < ema20:
 
-def check_entry(df: pd.DataFrame, i: int, levels: list):
-    price = float(df["close"].iloc[i])
-    prev = float(df["close"].iloc[i - 1])
-    mode = detect_mode(df.iloc[i])
+            entry = price
+            stop = entry - RISK
+            target = entry + (RISK * RR)
 
-    for lvl in levels:
-        # TREND BREAKOUT
-        if prev < lvl and price > lvl:
-            return "BUY", float(lvl), mode
+            future = df.iloc[i+1:i+10]
 
-        if prev > lvl and price < lvl:
-            return "SELL", float(lvl), mode
+            hit_target = future["High"].max() >= target
+            hit_stop = future["Low"].min() <= stop
 
-        # RANGE TOUCH
-        if mode == "RANGE":
-            if abs(price - lvl) < 4:
-                if price < lvl:
-                    return "BUY", float(lvl), mode
-                else:
-                    return "SELL", float(lvl), mode
+            if hit_target and not hit_stop:
+                result = +RR
+            elif hit_stop:
+                result = -1
+            else:
+                result = 0
 
-    return None, None, mode
+            trades.append(("BUY", entry, stop, target, result))
 
-# ================= TRADE SIMULATION =================
+    elif trend == "DOWN":
 
-def simulate_trades(df: pd.DataFrame, levels: list):
-    trades = []
+        if price > ema20:
 
-    i = 50  # نبدأ بعد توفر بيانات كفاية
-    while i < len(df) - 10:
-        direction, level, mode = check_entry(df, i, levels)
+            entry = price
+            stop = entry + RISK
+            target = entry - (RISK * RR)
 
-        if direction is None:
-            i += 1
-            continue
+            future = df.iloc[i+1:i+10]
 
-        entry = float(df["close"].iloc[i])
+            hit_target = future["Low"].min() <= target
+            hit_stop = future["High"].max() >= stop
 
-        # Stop
-        if direction == "BUY":
-            stop = float(level - 5)
-        else:
-            stop = float(level + 5)
+            if hit_target and not hit_stop:
+                result = +RR
+            elif hit_stop:
+                result = -1
+            else:
+                result = 0
 
-        risk = abs(entry - stop)
-        if risk <= 0:
-            i += 1
-            continue
+            trades.append(("SELL", entry, stop, target, result))
 
-        # Target = 2R
-        if direction == "BUY":
-            target = float(entry + (risk * 2))
-        else:
-            target = float(entry - (risk * 2))
 
-        result = None
+# =========================
+# RESULTS
+# =========================
 
-        # نمشي قدام 10 شمعات
-        for j in range(i + 1, min(i + 11, len(df))):
-            high = float(df["high"].iloc[j])
-            low = float(df["low"].iloc[j])
+wins = sum(1 for t in trades if t[4] > 0)
+losses = sum(1 for t in trades if t[4] < 0)
+total = len(trades)
+net = sum(t[4] for t in trades)
 
-            if direction == "BUY":
-                if low <= stop:
-                    result = -1.0
-                    break
-                if high >= target:
-                    result = 2.0
-                    break
+winrate = (wins / total * 100) if total > 0 else 0
 
-            else:  # SELL
-                if high >= stop:
-                    result = -1.0
-                    break
-                if low <= target:
-                    result = 2.0
-                    break
+print("\n===== SNIPER BACKTEST =====")
+print(f"Total Trades: {total}")
+print(f"Wins: {wins}")
+print(f"Losses: {losses}")
+print(f"Winrate: {winrate:.2f}%")
+print(f"Net R: {net:.2f}")
 
-        if result is not None:
-            trades.append({
-                "index": i,
-                "mode": mode,
-                "direction": direction,
-                "entry": entry,
-                "stop": stop,
-                "target": target,
-                "result_r": result
-            })
-            i += 10
-        else:
-            i += 1
-
-    return trades
-
-# ================= RESULTS =================
-
-def analyze_results(trades: list):
-    total = len(trades)
-    wins = len([t for t in trades if t["result_r"] > 0])
-    losses = len([t for t in trades if t["result_r"] < 0])
-    net_r = sum(t["result_r"] for t in trades)
-
-    trend_trades = len([t for t in trades if t["mode"] == "TREND"])
-    range_trades = len([t for t in trades if t["mode"] == "RANGE"])
-    mixed_trades = len([t for t in trades if t["mode"] == "MIXED"])
-
-    winrate = (wins / total * 100) if total > 0 else 0.0
-
-    return {
-        "Total Trades": total,
-        "Wins": wins,
-        "Losses": losses,
-        "Winrate": round(winrate, 2),
-        "Net R": round(net_r, 2),
-        "Trend Trades": trend_trades,
-        "Range Trades": range_trades,
-        "Mixed Trades": mixed_trades,
-    }
-
-# ================= RUN BACKTEST =================
-
-def run_backtest():
-    df = load_data()
-    df = add_indicators(df)
-
-    highs, lows = find_pivots(df)
-    levels = build_levels(highs + lows)
-
-    trades = simulate_trades(df, levels)
-    results = analyze_results(trades)
-
-    print("\n===== BACKTEST RESULTS =====")
-    for k, v in results.items():
-        print(f"{k}: {v}")
-
-    print("\n===== SAMPLE TRADES =====")
-    for t in trades[:10]:
-        print(
-            f"{t['mode']} | {t['direction']} | "
-            f"Entry={t['entry']:.1f} | Stop={t['stop']:.1f} | "
-            f"Target={t['target']:.1f} | Result={t['result_r']:+.1f}R"
-        )
-
-if __name__ == "__main__":
-    run_backtest()
+print("\n===== SAMPLE TRADES =====")
+for t in trades[:10]:
+    print(t)
