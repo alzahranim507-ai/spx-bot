@@ -1,39 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-SPX Backtest Bot — Hunter Smart v2 (Selective Mode)
+SPX Backtest Bot — Hunter Smart v2.1 (Balanced Selective Mode)
 For: محمد
 
-ما المختلف عن النسخة السابقة؟
-- انتقائية أعلى بكثير
-- يمنع التداول في Messy regime
-- يمنع counter-trend بالكامل
-- يشترط trend alignment بين structure + EMA trend
-- يشترط level quality أعلى
-- يشترط momentum confirmation
-- يشترط RR أدنى أعلى
-- فلتر جلسة نيويورك RTH افتراضيًا
-- cooldown بين الصفقات
-
-الهدف:
-تقليل عدد الصفقات ورفع الجودة، لا زيادة الإشارات.
+التعديل الرئيسي:
+- تخفيف فلتر المومنتوم بدل ما يكون strong confirmation فقط
+- السماح بالدخول إذا:
+    strong confirmation
+    OR momentum shift واضح
+- إصلاح تحذير resample باستخدام 1h / 4h بدل H
+- الإبقاء على الانتقائية بدون خنق كامل للإشارات
 
 تشغيل:
     pip install pandas numpy tvDatafeed ta
-    python spx_backtest_hunter_v2.py
-
-اختياري:
-    export TV_USERNAME="..."
-    export TV_PASSWORD="..."
-
-المخرجات:
-- trades_v2.csv
-- backtest_results_v2.csv
+    python spx_backtest_hunter_v2_1.py
 """
 
 import os
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
-
+from typing import List, Tuple, Dict
 import numpy as np
 import pandas as pd
 
@@ -42,10 +27,6 @@ from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.volatility import AverageTrueRange
 
-
-# =========================================================
-# CONFIG
-# =========================================================
 
 @dataclass
 class Config:
@@ -56,22 +37,18 @@ class Config:
 
     bars_5m: int = 14000
 
-    # resampling
     entry_tf: str = "5min"
     level_tf: str = "15min"
-    bias_tf: str = "1H"
-    trend_tf: str = "4H"
+    bias_tf: str = "1h"
+    trend_tf: str = "4h"
 
-    # session filter (New York regular session)
     use_rth_only: bool = True
-    ny_session_start: str = "14:35"   # UTC ≈ 09:35 NY (DST not handled perfectly)
-    ny_session_end: str = "20:55"     # UTC ≈ 15:55 NY
+    ny_session_start: str = "14:35"
+    ny_session_end: str = "20:55"
 
-    # warmup / pacing
     start_after_warmup_bars: int = 700
     cooldown_bars_after_exit: int = 6
 
-    # pivots / levels
     pivot_left: int = 3
     pivot_right: int = 3
     max_key_levels: int = 8
@@ -80,7 +57,6 @@ class Config:
     level_min_touch_count: int = 3
     level_strong_touch_count: int = 4
 
-    # indicators
     ema_fast: int = 9
     ema_mid: int = 21
     ema_slow: int = 50
@@ -89,53 +65,44 @@ class Config:
     atr_len: int = 14
     adx_window: int = 14
 
-    # regime
     adx_trending_on: float = 24.0
     adx_range_on: float = 18.0
     min_entry_adx_5m: float = 18.0
 
-    # wick logic
     wick_cluster_lookback_5m: int = 10
     wick_ratio_strong: float = 0.45
     wick_cluster_min_hits: int = 3
     wick_near_level_tolerance_frac: float = 0.0010
     wick_min_abs_pts: float = 1.2
 
-    # selective thresholds
     min_score: int = 4
     strong_score_threshold: int = 5
     min_rr_to_t1: float = 1.40
     min_atr_points: float = 4.0
     min_body_ratio: float = 0.40
 
-    # risk
     initial_capital: float = 100000.0
     risk_per_trade_pct: float = 0.75
     slippage_pts: float = 0.25
     commission_per_trade: float = 0.0
 
-    # targets / stop
     tp1_rr: float = 1.20
     tp2_rr: float = 2.00
     tp3_rr: float = 3.00
     atr_stop_floor_mult: float = 1.20
 
-    # export
-    export_trades_csv: str = "trades_v2.csv"
-    export_summary_csv: str = "backtest_results_v2.csv"
+    export_trades_csv: str = "trades_v2_1.csv"
+    export_summary_csv: str = "backtest_results_v2_1.csv"
 
 
 CFG = Config()
 
 
-# =========================================================
-# DATA
-# =========================================================
-
 def make_tv_client(cfg: Config) -> TvDatafeed:
     if cfg.tv_username and cfg.tv_password:
         return TvDatafeed(cfg.tv_username, cfg.tv_password)
     return TvDatafeed()
+
 
 def normalize_tv_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -147,21 +114,18 @@ def normalize_tv_df(df: pd.DataFrame) -> pd.DataFrame:
         out.index = out.index.tz_localize("UTC")
     for c in ["open", "high", "low", "close", "volume"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-    out = out.dropna(subset=["open", "high", "low", "close"])
-    return out
+    return out.dropna(subset=["open", "high", "low", "close"])
+
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-    return df.resample(rule).agg(agg).dropna(subset=["open","high","low","close"]).copy()
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    return df.resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close"]).copy()
+
 
 def is_rth_bar(ts: pd.Timestamp, cfg: Config) -> bool:
     hhmm = ts.strftime("%H:%M")
     return cfg.ny_session_start <= hhmm <= cfg.ny_session_end
 
-
-# =========================================================
-# INDICATORS
-# =========================================================
 
 def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     out = df.copy()
@@ -169,7 +133,6 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     out["ema21"] = EMAIndicator(close=out["close"], window=cfg.ema_mid).ema_indicator()
     out["ema50"] = EMAIndicator(close=out["close"], window=cfg.ema_slow).ema_indicator()
     out["ema200"] = EMAIndicator(close=out["close"], window=cfg.ema_trend).ema_indicator()
-
     out["rsi"] = RSIIndicator(close=out["close"], window=cfg.rsi_len).rsi()
 
     st = StochRSIIndicator(close=out["close"], window=14, smooth1=3, smooth2=3)
@@ -190,13 +153,8 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     body = (out["close"] - out["open"]).abs()
     rng = (out["high"] - out["low"]).replace(0, np.nan)
     out["body_ratio"] = (body / rng).fillna(0)
-
     return out
 
-
-# =========================================================
-# STRUCTURE / REGIME
-# =========================================================
 
 def find_pivots(series: pd.Series, left: int, right: int):
     arr = series.values
@@ -211,6 +169,7 @@ def find_pivots(series: pd.Series, left: int, right: int):
         if np.all(v < wl) and np.all(v <= wr):
             piv_lo.append(i)
     return piv_hi, piv_lo
+
 
 def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame, cfg: Config) -> str:
     def bias_from(df: pd.DataFrame):
@@ -235,6 +194,7 @@ def structure_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame, cfg: Config) -> str
         return "Bearish"
     return "Weak"
 
+
 def ema_trend_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
     r1 = df_1h.iloc[-1]
     r4 = df_4h.iloc[-1]
@@ -253,6 +213,7 @@ def ema_trend_bias(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> str:
     if short_ok:
         return "Bearish"
     return "Weak"
+
 
 def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, cfg: Config):
     if len(df_1h) < cfg.adx_window + 5:
@@ -274,10 +235,6 @@ def compute_market_state(df_1h: pd.DataFrame, df_4h: pd.DataFrame, cfg: Config):
     return "Messy", "Neutral", adx_val
 
 
-# =========================================================
-# LEVELS
-# =========================================================
-
 def cluster_levels(levels: List[float], tol_frac: float, price_ref: float) -> List[float]:
     if not levels:
         return []
@@ -290,26 +247,24 @@ def cluster_levels(levels: List[float], tol_frac: float, price_ref: float) -> Li
             clustered.append(lvl)
     return clustered
 
+
 def extract_key_levels(df_15m: pd.DataFrame, df_1h: pd.DataFrame, cfg: Config) -> List[float]:
     price = float(df_15m["close"].iloc[-1])
-
     hi_idx, lo_idx = find_pivots(df_1h["high"], cfg.pivot_left, cfg.pivot_right)
     swing_highs = [float(df_1h["high"].iloc[i]) for i in hi_idx][-14:] if hi_idx else []
     swing_lows = [float(df_1h["low"].iloc[i]) for i in lo_idx][-14:] if lo_idx else []
-
     recent = df_15m.tail(220)
     range_hi = float(recent["high"].max())
     range_lo = float(recent["low"].min())
-
     candidates = [x for x in swing_highs + swing_lows + [range_hi, range_lo] if np.isfinite(x)]
     merged = cluster_levels(candidates, cfg.level_cluster_tolerance_frac, price)
     merged = sorted(merged, key=lambda x: abs(x - price))[:max(cfg.max_key_levels * 4, 20)]
     merged = sorted(cluster_levels(merged, cfg.level_cluster_tolerance_frac, price))
-
     if len(merged) > cfg.max_key_levels:
-        closest = sorted(merged, key=lambda x: abs(x - price))[:cfg.max_key_levels]
-        merged = sorted(closest)
+        merged = sorted(merged, key=lambda x: abs(x - price))[:cfg.max_key_levels]
+        merged = sorted(merged)
     return merged
+
 
 def wick_cluster_near_level(df_5m: pd.DataFrame, level: float, cfg: Config) -> Dict:
     w = df_5m.tail(min(cfg.wick_cluster_lookback_5m, len(df_5m)))
@@ -331,13 +286,13 @@ def wick_cluster_near_level(df_5m: pd.DataFrame, level: float, cfg: Config) -> D
             upper_hits += 1
         if lower >= cfg.wick_min_abs_pts and (lower / rng) >= cfg.wick_ratio_strong:
             lower_hits += 1
-
     return {
         "upper_cluster": upper_hits >= cfg.wick_cluster_min_hits,
         "lower_cluster": lower_hits >= cfg.wick_cluster_min_hits,
         "upper_hits": upper_hits,
         "lower_hits": lower_hits,
     }
+
 
 def count_level_touches(df_5m: pd.DataFrame, level: float, lookback: int = 50, abs_tol: float = 2.0) -> int:
     recent = df_5m.tail(min(lookback, len(df_5m)))
@@ -347,6 +302,7 @@ def count_level_touches(df_5m: pd.DataFrame, level: float, lookback: int = 50, a
         if abs(h - level) <= abs_tol or abs(l - level) <= abs_tol or abs(c - level) <= abs_tol:
             touches += 1
     return touches
+
 
 def level_quality_info(df_5m: pd.DataFrame, level_now: float, level: float, cfg: Config) -> Dict:
     wick_info = wick_cluster_near_level(df_5m, level, cfg)
@@ -377,6 +333,7 @@ def level_quality_info(df_5m: pd.DataFrame, level_now: float, level: float, cfg:
         "wick_info": wick_info,
     }
 
+
 def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: List[float], cfg: Config) -> Tuple[float, Dict]:
     ranked = []
     for lvl in key_levels:
@@ -387,10 +344,6 @@ def choose_best_level(df_5m: pd.DataFrame, level_now: float, key_levels: List[fl
     chosen = near_candidates[0] if near_candidates else ranked[0]
     return chosen[1], chosen[2]
 
-
-# =========================================================
-# SIGNALS
-# =========================================================
 
 def stoch_cross(df_5m: pd.DataFrame, direction: str) -> bool:
     if len(df_5m) < 3:
@@ -407,6 +360,7 @@ def stoch_cross(df_5m: pd.DataFrame, direction: str) -> bool:
         return prev > 0 and curr < 0 and np.nanmax(k) > 0.75
     return False
 
+
 def momentum_shift(df_5m: pd.DataFrame, direction: str) -> bool:
     if len(df_5m) < 4:
         return False
@@ -420,6 +374,7 @@ def momentum_shift(df_5m: pd.DataFrame, direction: str) -> bool:
         return (c < ema and hist < hist_prev) or (hist_prev > 0 > hist)
     return False
 
+
 def strong_buy_confirmation(df_5m: pd.DataFrame, cfg: Config) -> bool:
     r = df_5m.iloc[-1]
     return (
@@ -431,6 +386,7 @@ def strong_buy_confirmation(df_5m: pd.DataFrame, cfg: Config) -> bool:
         and float(r["adx"]) >= cfg.min_entry_adx_5m
     )
 
+
 def strong_sell_confirmation(df_5m: pd.DataFrame, cfg: Config) -> bool:
     r = df_5m.iloc[-1]
     return (
@@ -441,6 +397,7 @@ def strong_sell_confirmation(df_5m: pd.DataFrame, cfg: Config) -> bool:
         and float(r["body_ratio"]) >= cfg.min_body_ratio
         and float(r["adx"]) >= cfg.min_entry_adx_5m
     )
+
 
 def rejection_lite(df_5m: pd.DataFrame, direction: str, cfg: Config) -> bool:
     c = df_5m.iloc[-1]
@@ -454,6 +411,7 @@ def rejection_lite(df_5m: pd.DataFrame, direction: str, cfg: Config) -> bool:
         return upper / rng >= 0.25 and cl < o and (abs(cl - o) / rng) >= cfg.min_body_ratio
     return False
 
+
 def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
     window = df_5m.tail(10)
     if len(window) < 4:
@@ -462,18 +420,12 @@ def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
     prev_close = float(window["close"].iloc[-2])
     last_low = float(window["low"].iloc[-1])
     last_high = float(window["high"].iloc[-1])
-
     if direction == "BUY":
-        broke = (window["close"] > level).sum() >= 2
-        retest = abs(last_low - level) <= 2.0 or abs(prev_close - level) <= 2.0
-        hold = last_close > level
-        return broke and retest and hold
+        return (window["close"] > level).sum() >= 2 and (abs(last_low - level) <= 2.0 or abs(prev_close - level) <= 2.0) and last_close > level
     if direction == "SELL":
-        broke = (window["close"] < level).sum() >= 2
-        retest = abs(last_high - level) <= 2.0 or abs(prev_close - level) <= 2.0
-        hold = last_close < level
-        return broke and retest and hold
+        return (window["close"] < level).sum() >= 2 and (abs(last_high - level) <= 2.0 or abs(prev_close - level) <= 2.0) and last_close < level
     return False
+
 
 def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info: Dict, cfg: Config):
     score = 0
@@ -509,13 +461,8 @@ def score_setup(df_5m: pd.DataFrame, level_hit: float, direction: str, wick_info
         score += 1
         reasons.append("Momentum shift")
 
-    score = int(min(score, 6))
-    return score, reasons, trigger
+    return int(min(score, 6)), reasons, trigger
 
-
-# =========================================================
-# TRADE PLAN
-# =========================================================
 
 def pick_targets(levels: List[float], entry: float, direction: str):
     if direction == "BUY":
@@ -523,6 +470,7 @@ def pick_targets(levels: List[float], entry: float, direction: str):
         return above[0] if len(above) >= 1 else None, above[1] if len(above) >= 2 else None
     below = sorted([lvl for lvl in levels if lvl < entry], reverse=True)
     return below[0] if len(below) >= 1 else None, below[1] if len(below) >= 2 else None
+
 
 def compute_trade_plan(df_5m: pd.DataFrame, levels: List[float], level_hit: float, direction: str, trigger: str, cfg: Config):
     last = df_5m.iloc[-1]
@@ -545,7 +493,6 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: List[float], level_hit: floa
 
     risk = abs(entry - stop)
     raw_t1, raw_t2 = pick_targets(levels, entry, direction)
-
     if direction == "BUY":
         t1 = raw_t1 if raw_t1 is not None else entry + risk * cfg.tp1_rr
         t2 = raw_t2 if raw_t2 is not None else entry + risk * cfg.tp2_rr
@@ -556,7 +503,6 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: List[float], level_hit: floa
         t3 = entry - risk * cfg.tp3_rr
 
     rr = abs(t1 - entry) / risk if risk > 0 else None
-
     return {
         "entry": float(entry),
         "initial_stop": float(stop),
@@ -564,35 +510,25 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: List[float], level_hit: floa
         "t2": float(t2),
         "t3": float(t3),
         "rr": rr,
-        "risk_pts": risk,
     }
 
 
-# =========================================================
-# BACKTEST
-# =========================================================
-
 def prepare_all_frames(cfg: Config):
     tv = make_tv_client(cfg)
-    raw_5m = tv.get_hist(
-        symbol=cfg.tv_symbol,
-        exchange=cfg.tv_exchange,
-        interval=Interval.in_5_minute,
-        n_bars=cfg.bars_5m,
-    )
+    raw_5m = tv.get_hist(symbol=cfg.tv_symbol, exchange=cfg.tv_exchange, interval=Interval.in_5_minute, n_bars=cfg.bars_5m)
     if raw_5m is None or raw_5m.empty:
         raise RuntimeError("TradingView returned empty 5m data.")
-
     df_5m = compute_indicators(normalize_tv_df(raw_5m), cfg)
-    base = df_5m[["open","high","low","close","volume"]]
-
+    base = df_5m[["open", "high", "low", "close", "volume"]]
     df_15m = compute_indicators(resample_ohlcv(base, cfg.level_tf), cfg)
     df_1h = compute_indicators(resample_ohlcv(base, cfg.bias_tf), cfg)
     df_4h = compute_indicators(resample_ohlcv(base, cfg.trend_tf), cfg)
     return df_5m, df_15m, df_1h, df_4h
 
+
 def closed_slice(df: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
     return df[df.index < ts].copy()
+
 
 def summarize_trades(trades_df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if trades_df.empty:
@@ -631,6 +567,7 @@ def summarize_trades(trades_df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         "final_capital": float(trades_df["equity_after"].iloc[-1]),
     }])
 
+
 def run_backtest(cfg: Config):
     df_5m, df_15m, df_1h, df_4h = prepare_all_frames(cfg)
 
@@ -649,7 +586,6 @@ def run_backtest(cfg: Config):
         if cfg.use_rth_only and not is_rth_bar(ts, cfg):
             continue
 
-        # activate next-bar entry
         if pending_signal is not None and active_trade is None:
             active_trade = pending_signal.copy()
             active_trade["entry_time"] = ts
@@ -657,7 +593,6 @@ def run_backtest(cfg: Config):
             active_trade["stop_live"] = active_trade["initial_stop"]
             pending_signal = None
 
-        # manage live trade
         if active_trade is not None:
             high = float(row["high"])
             low = float(row["low"])
@@ -725,7 +660,9 @@ def run_backtest(cfg: Config):
                     "entry": entry,
                     "initial_stop": initial_stop,
                     "exit": exit_price,
-                    "t1": t1, "t2": t2, "t3": t3,
+                    "t1": t1,
+                    "t2": t2,
+                    "t3": t3,
                     "tp1_hit": active_trade["tp1_hit"],
                     "tp2_hit": active_trade["tp2_hit"],
                     "exit_reason": exit_reason,
@@ -736,9 +673,7 @@ def run_backtest(cfg: Config):
                 cooldown_until_idx = i + cfg.cooldown_bars_after_exit
                 continue
 
-        if active_trade is not None or pending_signal is not None:
-            continue
-        if i <= cooldown_until_idx:
+        if active_trade is not None or pending_signal is not None or i <= cooldown_until_idx:
             continue
 
         hist_5m = closed_slice(df_5m.iloc[:i], ts)
@@ -751,7 +686,6 @@ def run_backtest(cfg: Config):
 
         level_now = float(hist_5m["close"].iloc[-1])
         atr_now = float(hist_5m["atr"].iloc[-1])
-
         if not np.isfinite(atr_now) or atr_now < cfg.min_atr_points:
             continue
 
@@ -783,13 +717,14 @@ def run_backtest(cfg: Config):
         if score < cfg.min_score or trigger is None:
             continue
 
-        # strong momentum confirmation mandatory
-        if direction == "BUY" and not strong_buy_confirmation(hist_5m, cfg):
-            continue
-        if direction == "SELL" and not strong_sell_confirmation(hist_5m, cfg):
-            continue
+        momentum_ok = momentum_shift(hist_5m, direction)
+        if direction == "BUY":
+            if not (momentum_ok or strong_buy_confirmation(hist_5m, cfg)):
+                continue
+        else:
+            if not (momentum_ok or strong_sell_confirmation(hist_5m, cfg)):
+                continue
 
-        # must have level reaction aligned with trend
         if direction == "BUY":
             if not (wick_info["lower_cluster"] or break_retest(hist_5m, level_hit, "BUY") or rejection_lite(hist_5m, "BUY", cfg)):
                 continue
@@ -830,10 +765,10 @@ def run_backtest(cfg: Config):
 
 
 def main():
-    print("starting Hunter Smart v2 backtest...")
+    print("starting Hunter Smart v2.1 backtest...")
     trades_df, summary_df = run_backtest(CFG)
 
-    print("\n------ BACKTEST SUMMARY V2 ------")
+    print("\n------ BACKTEST SUMMARY V2.1 ------")
     print(summary_df.to_string(index=False))
 
     print(f"\nSaved trades to: {CFG.export_trades_csv}")
