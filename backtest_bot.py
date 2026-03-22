@@ -1,28 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-SPX Backtest Bot — Hunter Smart v2.1 (Balanced Selective Mode)
+SPX Backtest Bot — Yahoo Version
 For: محمد
 
-التعديل الرئيسي:
-- تخفيف فلتر المومنتوم بدل ما يكون strong confirmation فقط
-- السماح بالدخول إذا:
-    strong confirmation
-    OR momentum shift واضح
-- إصلاح تحذير resample باستخدام 1h / 4h بدل H
-- الإبقاء على الانتقائية بدون خنق كامل للإشارات
+الفكرة:
+- باك تست بدون TradingView login
+- بيانات من Yahoo Finance
+- يستخدم:
+    * ^GSPC أثناء السوق الرسمي
+    * ES=F كبديل عملي لبيانات 5m/15m/1h/4h
+- منطق متوازن وأخف من النسخ السابقة
+- مناسب لـ Railway و GitHub
 
 تشغيل:
-    pip install pandas numpy tvDatafeed ta
-    python spx_backtest_hunter_v2_1.py
+    pip install pandas numpy yfinance ta
+    python spx_backtest_yahoo.py
 """
 
-import os
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
-from tvDatafeed import TvDatafeed, Interval
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.volatility import AverageTrueRange
@@ -30,32 +30,26 @@ from ta.volatility import AverageTrueRange
 
 @dataclass
 class Config:
-    tv_symbol: str = "SPX500"
-    tv_exchange: str = "FOREXCOM"
-    tv_username: str = os.getenv("TV_USERNAME", "")
-    tv_password: str = os.getenv("TV_PASSWORD", "")
+    intraday_symbol: str = "ES=F"
+    daily_symbol: str = "^GSPC"
 
-    bars_5m: int = 14000
+    period_5m: str = "60d"
+    interval_5m: str = "5m"
 
-    entry_tf: str = "5min"
-    level_tf: str = "15min"
-    bias_tf: str = "1h"
-    trend_tf: str = "4h"
-
-    use_rth_only: bool = True
+    use_rth_only: bool = False
     ny_session_start: str = "14:35"
     ny_session_end: str = "20:55"
 
-    start_after_warmup_bars: int = 700
-    cooldown_bars_after_exit: int = 6
+    start_after_warmup_bars: int = 500
+    cooldown_bars_after_exit: int = 4
 
     pivot_left: int = 3
     pivot_right: int = 3
     max_key_levels: int = 8
     level_cluster_tolerance_frac: float = 0.0010
-    level_zone_near_pts: float = 16.0
-    level_min_touch_count: int = 3
-    level_strong_touch_count: int = 4
+    level_zone_near_pts: float = 22.0
+    level_min_touch_count: int = 2
+    level_strong_touch_count: int = 3
 
     ema_fast: int = 9
     ema_mid: int = 21
@@ -65,56 +59,59 @@ class Config:
     atr_len: int = 14
     adx_window: int = 14
 
-    adx_trending_on: float = 24.0
+    adx_trending_on: float = 22.0
     adx_range_on: float = 18.0
-    min_entry_adx_5m: float = 18.0
+    min_entry_adx_5m: float = 14.0
 
     wick_cluster_lookback_5m: int = 10
     wick_ratio_strong: float = 0.45
-    wick_cluster_min_hits: int = 3
+    wick_cluster_min_hits: int = 2
     wick_near_level_tolerance_frac: float = 0.0010
-    wick_min_abs_pts: float = 1.2
+    wick_min_abs_pts: float = 1.0
 
-    min_score: int = 4
+    min_score: int = 3
     strong_score_threshold: int = 5
-    min_rr_to_t1: float = 1.40
-    min_atr_points: float = 4.0
-    min_body_ratio: float = 0.40
+    min_rr_to_t1: float = 1.15
+    min_atr_points: float = 2.0
+    min_body_ratio: float = 0.32
 
     initial_capital: float = 100000.0
     risk_per_trade_pct: float = 0.75
     slippage_pts: float = 0.25
     commission_per_trade: float = 0.0
 
-    tp1_rr: float = 1.20
-    tp2_rr: float = 2.00
-    tp3_rr: float = 3.00
-    atr_stop_floor_mult: float = 1.20
+    tp1_rr: float = 1.00
+    tp2_rr: float = 1.70
+    tp3_rr: float = 2.50
+    atr_stop_floor_mult: float = 1.10
 
-    export_trades_csv: str = "trades_v2_1.csv"
-    export_summary_csv: str = "backtest_results_v2_1.csv"
+    export_trades_csv: str = "trades_yahoo.csv"
+    export_summary_csv: str = "backtest_results_yahoo.csv"
 
 
 CFG = Config()
 
 
-def make_tv_client(cfg: Config) -> TvDatafeed:
-    if cfg.tv_username and cfg.tv_password:
-        return TvDatafeed(cfg.tv_username, cfg.tv_password)
-    return TvDatafeed()
+def fetch_yahoo(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        raise RuntimeError(f"Yahoo returned empty data for {symbol} {interval}")
 
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0].lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
 
-def normalize_tv_df(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [str(c).lower() for c in out.columns]
-    if "volume" not in out.columns:
-        out["volume"] = np.nan
-    out = out.sort_index()
-    if getattr(out.index, "tz", None) is None:
-        out.index = out.index.tz_localize("UTC")
-    for c in ["open", "high", "low", "close", "volume"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out.dropna(subset=["open", "high", "low", "close"])
+    if "adj close" in df.columns and "close" not in df.columns:
+        df["close"] = df["adj close"]
+
+    if "volume" not in df.columns:
+        df["volume"] = np.nan
+
+    df = df.rename_axis("datetime")
+    df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"]).sort_index()
+    return df[["open", "high", "low", "close", "volume"]].copy()
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -133,6 +130,7 @@ def compute_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     out["ema21"] = EMAIndicator(close=out["close"], window=cfg.ema_mid).ema_indicator()
     out["ema50"] = EMAIndicator(close=out["close"], window=cfg.ema_slow).ema_indicator()
     out["ema200"] = EMAIndicator(close=out["close"], window=cfg.ema_trend).ema_indicator()
+
     out["rsi"] = RSIIndicator(close=out["close"], window=cfg.rsi_len).rsi()
 
     st = StochRSIIndicator(close=out["close"], window=14, smooth1=3, smooth2=3)
@@ -381,7 +379,7 @@ def strong_buy_confirmation(df_5m: pd.DataFrame, cfg: Config) -> bool:
         float(r["close"]) > float(r["ema21"])
         and float(r["ema9"]) > float(r["ema21"])
         and float(r["macd_hist"]) > 0
-        and float(r["rsi"]) >= 52
+        and float(r["rsi"]) >= 50
         and float(r["body_ratio"]) >= cfg.min_body_ratio
         and float(r["adx"]) >= cfg.min_entry_adx_5m
     )
@@ -393,7 +391,7 @@ def strong_sell_confirmation(df_5m: pd.DataFrame, cfg: Config) -> bool:
         float(r["close"]) < float(r["ema21"])
         and float(r["ema9"]) < float(r["ema21"])
         and float(r["macd_hist"]) < 0
-        and float(r["rsi"]) <= 48
+        and float(r["rsi"]) <= 50
         and float(r["body_ratio"]) >= cfg.min_body_ratio
         and float(r["adx"]) >= cfg.min_entry_adx_5m
     )
@@ -406,9 +404,9 @@ def rejection_lite(df_5m: pd.DataFrame, direction: str, cfg: Config) -> bool:
     upper = h - max(o, cl)
     lower = min(o, cl) - l
     if direction == "BUY":
-        return lower / rng >= 0.25 and cl > o and (abs(cl - o) / rng) >= cfg.min_body_ratio
+        return lower / rng >= 0.22 and (abs(cl - o) / rng) >= cfg.min_body_ratio * 0.8
     if direction == "SELL":
-        return upper / rng >= 0.25 and cl < o and (abs(cl - o) / rng) >= cfg.min_body_ratio
+        return upper / rng >= 0.22 and (abs(cl - o) / rng) >= cfg.min_body_ratio * 0.8
     return False
 
 
@@ -421,9 +419,9 @@ def break_retest(df_5m: pd.DataFrame, level: float, direction: str) -> bool:
     last_low = float(window["low"].iloc[-1])
     last_high = float(window["high"].iloc[-1])
     if direction == "BUY":
-        return (window["close"] > level).sum() >= 2 and (abs(last_low - level) <= 2.0 or abs(prev_close - level) <= 2.0) and last_close > level
+        return (window["close"] > level).sum() >= 2 and (abs(last_low - level) <= 2.5 or abs(prev_close - level) <= 2.5) and last_close > level
     if direction == "SELL":
-        return (window["close"] < level).sum() >= 2 and (abs(last_high - level) <= 2.0 or abs(prev_close - level) <= 2.0) and last_close < level
+        return (window["close"] < level).sum() >= 2 and (abs(last_high - level) <= 2.5 or abs(prev_close - level) <= 2.5) and last_close < level
     return False
 
 
@@ -513,19 +511,6 @@ def compute_trade_plan(df_5m: pd.DataFrame, levels: List[float], level_hit: floa
     }
 
 
-def prepare_all_frames(cfg: Config):
-    tv = make_tv_client(cfg)
-    raw_5m = tv.get_hist(symbol=cfg.tv_symbol, exchange=cfg.tv_exchange, interval=Interval.in_5_minute, n_bars=cfg.bars_5m)
-    if raw_5m is None or raw_5m.empty:
-        raise RuntimeError("TradingView returned empty 5m data.")
-    df_5m = compute_indicators(normalize_tv_df(raw_5m), cfg)
-    base = df_5m[["open", "high", "low", "close", "volume"]]
-    df_15m = compute_indicators(resample_ohlcv(base, cfg.level_tf), cfg)
-    df_1h = compute_indicators(resample_ohlcv(base, cfg.bias_tf), cfg)
-    df_4h = compute_indicators(resample_ohlcv(base, cfg.trend_tf), cfg)
-    return df_5m, df_15m, df_1h, df_4h
-
-
 def closed_slice(df: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
     return df[df.index < ts].copy()
 
@@ -569,7 +554,13 @@ def summarize_trades(trades_df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 def run_backtest(cfg: Config):
-    df_5m, df_15m, df_1h, df_4h = prepare_all_frames(cfg)
+    df_5m = fetch_yahoo(cfg.intraday_symbol, cfg.period_5m, cfg.interval_5m)
+    df_5m = compute_indicators(df_5m, cfg)
+
+    base = df_5m[["open", "high", "low", "close", "volume"]]
+    df_15m = compute_indicators(resample_ohlcv(base, "15min"), cfg)
+    df_1h = compute_indicators(resample_ohlcv(base, "1h"), cfg)
+    df_4h = compute_indicators(resample_ohlcv(base, "4h"), cfg)
 
     trades = []
     equity = cfg.initial_capital
@@ -690,7 +681,7 @@ def run_backtest(cfg: Config):
             continue
 
         market_label, market_dir, _adx = compute_market_state(hist_1h, hist_4h, cfg)
-        if market_label != "Trending":
+        if market_label == "Messy":
             continue
 
         sbias = structure_bias(hist_1h, hist_4h, cfg)
@@ -719,25 +710,18 @@ def run_backtest(cfg: Config):
 
         momentum_ok = momentum_shift(hist_5m, direction)
         if direction == "BUY":
-            if not (momentum_ok or strong_buy_confirmation(hist_5m, cfg)):
+            if not (momentum_ok or strong_buy_confirmation(hist_5m, cfg) or stoch_cross(hist_5m, direction)):
                 continue
         else:
-            if not (momentum_ok or strong_sell_confirmation(hist_5m, cfg)):
+            if not (momentum_ok or strong_sell_confirmation(hist_5m, cfg) or stoch_cross(hist_5m, direction)):
                 continue
 
-        if direction == "BUY":
-            if not (wick_info["lower_cluster"] or break_retest(hist_5m, level_hit, "BUY") or rejection_lite(hist_5m, "BUY", cfg)):
-                continue
-        else:
-            if not (wick_info["upper_cluster"] or break_retest(hist_5m, level_hit, "SELL") or rejection_lite(hist_5m, "SELL", cfg)):
-                continue
-
-        trade_type = "Strong" if score >= cfg.strong_score_threshold else "Standard"
         plan = compute_trade_plan(hist_5m, key_levels, level_hit, direction, trigger, cfg)
-
         rr = plan["rr"]
         if rr is None or not np.isfinite(rr) or rr < cfg.min_rr_to_t1:
             continue
+
+        trade_type = "Strong" if score >= cfg.strong_score_threshold else "Standard"
 
         pending_signal = {
             "signal_time": ts,
@@ -765,10 +749,10 @@ def run_backtest(cfg: Config):
 
 
 def main():
-    print("starting Hunter Smart v2.1 backtest...")
+    print("starting Yahoo backtest...")
     trades_df, summary_df = run_backtest(CFG)
 
-    print("\n------ BACKTEST SUMMARY V2.1 ------")
+    print("\n------ BACKTEST SUMMARY YAHOO ------")
     print(summary_df.to_string(index=False))
 
     print(f"\nSaved trades to: {CFG.export_trades_csv}")
