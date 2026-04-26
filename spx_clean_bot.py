@@ -31,10 +31,10 @@ ZoneInfo = None
 
 @dataclass
 class Config:
-tv_symbol:    str = "SPX500"
-tv_exchange:  str = "FOREXCOM"
-tv_username:  str = os.getenv("TV_USERNAME", "")
-tv_password:  str = os.getenv("TV_PASSWORD", "")
+tv_symbol:    str = “SPX500”
+tv_exchange:  str = “FOREXCOM”
+tv_username:  str = os.getenv(“TV_USERNAME”, “”)
+tv_password:  str = os.getenv(“TV_PASSWORD”, “”)
 
 ```
 telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -197,9 +197,9 @@ LAST_GOOD_DATA = {}
 
 def tzinfo(name):
 if ZoneInfo is None:
-if name == "Asia/Riyadh":
+if name == “Asia/Riyadh”:
 return timezone(timedelta(hours=3))
-if name == "America/New_York":
+if name == “America/New_York”:
 return timezone(timedelta(hours=-5))
 return timezone.utc
 return ZoneInfo(name)
@@ -217,13 +217,13 @@ def session_label():
 t  = now_ny()
 hm = t.hour * 60 + t.minute
 if 4 * 60 <= hm < 9 * 60 + 30:
-return "Pre-Market"
+return “Pre-Market”
 if 9 * 60 + 30 <= hm < 16 * 60:
-return "Market"
-return "After-Hours"
+return “Market”
+return “After-Hours”
 
 def is_offhours(session):
-return session in ("After-Hours", "Pre-Market")
+return session in (“After-Hours”, “Pre-Market”)
 
 # =========================
 
@@ -249,11 +249,11 @@ if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
 return
 try:
 requests.post(
-"https://api.telegram.org/bot" + CFG.telegram_bot_token + "/sendMessage",
+“https://api.telegram.org/bot” + CFG.telegram_bot_token + “/sendMessage”,
 json={
-"chat_id": CFG.telegram_chat_id,
-"text": text,
-"disable_web_page_preview": True,
+“chat_id”: CFG.telegram_chat_id,
+“text”: text,
+“disable_web_page_preview”: True,
 },
 timeout=15,
 )
@@ -265,16 +265,16 @@ t = now_riyadh()
 ts = t.strftime(”%Y-%m-%d %H:%M”)
 if entering:
 text = (
-CFG.user_title + " - Weekend Mode ON\n"
-+ ts + " (Riyadh)\n\n"
-+ "Bot paused until Monday 01:00 Riyadh time.\n"
-+ "No signals during this period."
+CFG.user_title + “ - Weekend Mode ON\n”
++ ts + “ (Riyadh)\n\n”
++ “Bot paused until Monday 01:00 Riyadh time.\n”
++ “No signals during this period.”
 )
 else:
 text = (
-CFG.user_title + " - Back to Work\n"
-+ ts + " (Riyadh)\n\n"
-+ "Bot resuming analysis and signals."
+CFG.user_title + “ - Back to Work\n”
++ ts + “ (Riyadh)\n\n”
++ “Bot resuming analysis and signals.”
 )
 _send_direct(text)
 
@@ -284,25 +284,25 @@ _send_direct(text)
 
 # =========================
 
-def safe_f1(x, default="N/A"):
+def safe_f1(x, default=“N/A”):
 try:
 if x is None:
 return default
 v = float(x)
 if not np.isfinite(v):
 return default
-return "{:.1f}".format(v)
+return “{:.1f}”.format(v)
 except Exception:
 return default
 
-def safe_f2(x, default="N/A"):
+def safe_f2(x, default=“N/A”):
 try:
 if x is None:
 return default
 v = float(x)
 if not np.isfinite(v):
 return default
-return "{:.2f}".format(v)
+return “{:.2f}”.format(v)
 except Exception:
 return default
 
@@ -315,9 +315,9 @@ return default
 def level_bucket_x(level):
 try:
 b = int(float(level) // 10) * 10
-return str(b) + "x"
+return str(b) + “x”
 except Exception:
-return "N/A"
+return “N/A”
 
 # =========================
 
@@ -327,7 +327,7 @@ return "N/A"
 
 def send_telegram(text):
 if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
-print("[WARN] Telegram not configured")
+print(”[WARN] Telegram not configured”)
 return
 
 ```
@@ -411,27 +411,27 @@ winrate        = (wins / total * 100.0) if total > 0 else 0.0
 best_trade  = max(records, key=lambda r: r.r_result, default=None)
 worst_trade = min(records, key=lambda r: r.r_result, default=None)
 return {
-"total": total, "wins": wins, "losses": losses, "breakeven": breakeven,
-"net_r": net_r, "winrate": winrate,
-"t1_only": t1_only, "t2_hit": t2_hit, "t3_hit": t3_hit, "t4_plus": t4_plus,
-"range_count": range_count, "trending_count": trending_count,
-"messy_count": messy_count, "weak_count": weak_count,
-"best_trade": best_trade, "worst_trade": worst_trade,
+“total”: total, “wins”: wins, “losses”: losses, “breakeven”: breakeven,
+“net_r”: net_r, “winrate”: winrate,
+“t1_only”: t1_only, “t2_hit”: t2_hit, “t3_hit”: t3_hit, “t4_plus”: t4_plus,
+“range_count”: range_count, “trending_count”: trending_count,
+“messy_count”: messy_count, “weak_count”: weak_count,
+“best_trade”: best_trade, “worst_trade”: worst_trade,
 }
 
 def daily_stats_message(summary, target_date):
-best_txt  = "N/A"
-worst_txt = "N/A"
-if summary["best_trade"]:
-bt = summary["best_trade"]
-best_txt = bt.direction + " | " + bt.result_label + " | " + "{:+.2f}".format(bt.r_result) + "R"
-if summary["worst_trade"]:
-wt = summary["worst_trade"]
-worst_txt = wt.direction + " | " + wt.result_label + " | " + "{:+.2f}".format(wt.r_result) + "R"
+best_txt  = “N/A”
+worst_txt = “N/A”
+if summary[“best_trade”]:
+bt = summary[“best_trade”]
+best_txt = bt.direction + “ | “ + bt.result_label + “ | “ + “{:+.2f}”.format(bt.r_result) + “R”
+if summary[“worst_trade”]:
+wt = summary[“worst_trade”]
+worst_txt = wt.direction + “ | “ + wt.result_label + “ | “ + “{:+.2f}”.format(wt.r_result) + “R”
 return (
-CFG.user_title + " - Daily Stats\n"
-"Date: " + target_date.isoformat() + " (Riyadh)\n\n"
-"Total: " + str(summary["total"]) + "\n"
+CFG.user_title + “ - Daily Stats\n”
+“Date: “ + target_date.isoformat() + “ (Riyadh)\n\n”
+“Total: “ + str(summary[“total”]) + “\n”
 “Wins: “ + str(summary[“wins”]) + “ | Losses: “ + str(summary[“losses”]) + “ | BE: “ + str(summary[“breakeven”]) + “\n”
 “Win Rate: “ + “{:.1f}”.format(summary[“winrate”]) + “%\n”
 “Net: “ + “{:+.2f}”.format(summary[“net_r”]) + “R\n\n”
@@ -2225,6 +2225,7 @@ if tr.get("stop_pending"):
 # === END PART 3 ===
 
 # === PART 4 ===
+
 # evaluate_once, main, SPXW Evaluator Module
 
 import json
@@ -2235,1207 +2236,1246 @@ import queue
 from pathlib import Path
 
 try:
-    from webull import paper_webull
-    WEBULL_AVAILABLE = True
+from webull import paper_webull
+WEBULL_AVAILABLE = True
 except ImportError:
-    WEBULL_AVAILABLE = False
-    print("[WARN] pip install webull")
-
+WEBULL_AVAILABLE = False
+print(”[WARN] pip install webull”)
 
 # =========================
+
 # evaluate_once
+
 # =========================
 
 def evaluate_once():
-    if is_weekend_blackout():
-        return
+if is_weekend_blackout():
+return
 
-    maybe_daily_reset()
+```
+maybe_daily_reset()
 
-    session   = session_label()
-    symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
-    df_5m     = compute_indicators_5m(df_5m)
-    level_now = float(df_5m["close"].iloc[-1])
+session   = session_label()
+symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
+df_5m     = compute_indicators_5m(df_5m)
+level_now = float(df_5m["close"].iloc[-1])
 
-    maybe_update_market_state(df_1h, df_4h)
-    adx_txt = "N/A" if STATE.market_adx is None else safe_f1(STATE.market_adx)
-    market_state_str = STATE.market_label + " | " + STATE.market_dir + " | ADX: " + adx_txt
+maybe_update_market_state(df_1h, df_4h)
+adx_txt = "N/A" if STATE.market_adx is None else safe_f1(STATE.market_adx)
+market_state_str = STATE.market_label + " | " + STATE.market_dir + " | ADX: " + adx_txt
 
-    liq_state, _ = liquidity_state(df_5m)
-    bias         = structure_bias(df_1h, df_4h)
-    key_levels   = extract_key_levels(df_15m, df_1h)
-    exp_move_val = expected_move_1h(df_1h)
+liq_state, _ = liquidity_state(df_5m)
+bias         = structure_bias(df_1h, df_4h)
+key_levels   = extract_key_levels(df_15m, df_1h)
+exp_move_val = expected_move_1h(df_1h)
 
-    if STATE.active_trade is not None:
-        update_active_trade(df_5m, df_15m, df_1h, level_now)
+if STATE.active_trade is not None:
+    update_active_trade(df_5m, df_15m, df_1h, level_now)
 
-    if CFG.hourly_update:
-        current_hour = now_riyadh().replace(minute=0, second=0, microsecond=0)
-        if STATE.last_hour_sent is None or current_hour > STATE.last_hour_sent:
-            send_telegram(hourly_update_message(
-                session, symbol, bias, market_state_str,
-                key_levels, level_now, STATE.active_trade
-            ))
-            STATE.last_hour_sent = current_hour
+if CFG.hourly_update:
+    current_hour = now_riyadh().replace(minute=0, second=0, microsecond=0)
+    if STATE.last_hour_sent is None or current_hour > STATE.last_hour_sent:
+        send_telegram(hourly_update_message(
+            session, symbol, bias, market_state_str,
+            key_levels, level_now, STATE.active_trade
+        ))
+        STATE.last_hour_sent = current_hour
 
-    maybe_send_daily_stats()
-    maybe_send_weekly_stats()
+maybe_send_daily_stats()
+maybe_send_weekly_stats()
 
-    if (STATE.no_signal_until_utc is not None
-            and datetime.utcnow() < STATE.no_signal_until_utc):
-        return
+if (STATE.no_signal_until_utc is not None
+        and datetime.utcnow() < STATE.no_signal_until_utc):
+    return
 
-    if STATE.active_trade is not None:
-        return
+if STATE.active_trade is not None:
+    return
 
-    if not key_levels:
-        return
+if not key_levels:
+    return
 
-    level_hit, level_info = choose_best_level(df_5m, level_now, key_levels)
-    wick_info             = level_info["wick_info"]
+level_hit, level_info = choose_best_level(df_5m, level_now, key_levels)
+wick_info             = level_info["wick_info"]
 
-    if bias == "Bullish":
-        direction = "BUY"
-    elif bias == "Bearish":
-        direction = "SELL"
-    else:
-        if STATE.market_label == "Messy":
-            if momentum_breakout(df_5m, level_hit, "BUY"):
-                direction = "BUY"
-            elif momentum_breakout(df_5m, level_hit, "SELL"):
-                direction = "SELL"
-            else:
-                direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
+if bias == "Bullish":
+    direction = "BUY"
+elif bias == "Bearish":
+    direction = "SELL"
+else:
+    if STATE.market_label == "Messy":
+        if momentum_breakout(df_5m, level_hit, "BUY"):
+            direction = "BUY"
+        elif momentum_breakout(df_5m, level_hit, "SELL"):
+            direction = "SELL"
         else:
             direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
+    else:
+        direction = "BUY" if momentum_shift(df_5m, "BUY") else "SELL"
 
-    sell_confirm = (
-        momentum_shift(df_5m, "SELL")
-        or stoch_cross(df_5m, "SELL")
-        or break_retest(df_5m, level_hit, "SELL")
-        or momentum_breakout(df_5m, level_hit, "SELL")
-    )
-    buy_confirm = (
-        momentum_shift(df_5m, "BUY")
-        or stoch_cross(df_5m, "BUY")
-        or break_retest(df_5m, level_hit, "BUY")
-        or momentum_breakout(df_5m, level_hit, "BUY")
-    )
+sell_confirm = (
+    momentum_shift(df_5m, "SELL")
+    or stoch_cross(df_5m, "SELL")
+    or break_retest(df_5m, level_hit, "SELL")
+    or momentum_breakout(df_5m, level_hit, "SELL")
+)
+buy_confirm = (
+    momentum_shift(df_5m, "BUY")
+    or stoch_cross(df_5m, "BUY")
+    or break_retest(df_5m, level_hit, "BUY")
+    or momentum_breakout(df_5m, level_hit, "BUY")
+)
 
-    blocked = False
-    if direction == "BUY" and wick_info.get("upper_cluster"):
-        direction = "SELL" if sell_confirm else None
-        if direction is None:
-            blocked = True
-    if direction == "SELL" and wick_info.get("lower_cluster"):
-        direction = "BUY" if buy_confirm else None
-        if direction is None:
-            blocked = True
+blocked = False
+if direction == "BUY" and wick_info.get("upper_cluster"):
+    direction = "SELL" if sell_confirm else None
+    if direction is None:
+        blocked = True
+if direction == "SELL" and wick_info.get("lower_cluster"):
+    direction = "BUY" if buy_confirm else None
+    if direction is None:
+        blocked = True
 
-    if blocked or direction is None:
+if blocked or direction is None:
+    return
+
+score, reasons, trigger = score_setup(df_5m, level_hit, direction, wick_info)
+if score <= 0:
+    return
+
+conf       = confidence_percent(score, direction, bias, session,
+                                STATE.market_label, liq_state)
+trade_type = classify_trade_strength(score, conf)
+
+if CFG.block_all_weak_trades and trade_type == "Weak":
+    return
+
+if is_offhours(session):
+    if score < CFG.offhours_min_score:
+        return
+    if CFG.offhours_block_weak and trade_type == "Weak":
         return
 
-    score, reasons, trigger = score_setup(df_5m, level_hit, direction, wick_info)
-    if score <= 0:
-        return
-
-    conf       = confidence_percent(score, direction, bias, session,
-                                    STATE.market_label, liq_state)
-    trade_type = classify_trade_strength(score, conf)
-
-    if CFG.block_all_weak_trades and trade_type == "Weak":
-        return
-
-    if is_offhours(session):
-        if score < CFG.offhours_min_score:
+if CFG.block_counter_trend_in_trending_market and STATE.market_label == "Trending":
+    if STATE.market_dir == "Bullish" and direction == "SELL":
+        if not (CFG.allow_counter_trend_wick_if_strong and wick_trade_is_valid(
+            direction=direction, trigger=trigger, level_info=level_info,
+            market_label=STATE.market_label, market_dir=STATE.market_dir,
+            df_5m=df_5m, score=score,
+        )):
             return
-        if CFG.offhours_block_weak and trade_type == "Weak":
-            return
-
-    if CFG.block_counter_trend_in_trending_market and STATE.market_label == "Trending":
-        if STATE.market_dir == "Bullish" and direction == "SELL":
-            if not (CFG.allow_counter_trend_wick_if_strong and wick_trade_is_valid(
-                direction=direction, trigger=trigger, level_info=level_info,
-                market_label=STATE.market_label, market_dir=STATE.market_dir,
-                df_5m=df_5m, score=score,
-            )):
-                return
-        if STATE.market_dir == "Bearish" and direction == "BUY":
-            if not (CFG.allow_counter_trend_wick_if_strong and wick_trade_is_valid(
-                direction=direction, trigger=trigger, level_info=level_info,
-                market_label=STATE.market_label, market_dir=STATE.market_dir,
-                df_5m=df_5m, score=score,
-            )):
-                return
-
-    if not wick_trade_is_valid(
-        direction=direction, trigger=trigger, level_info=level_info,
-        market_label=STATE.market_label, market_dir=STATE.market_dir,
-        df_5m=df_5m, score=score,
-    ):
-        return
-
-    range_ok, range_reason = range_level_is_clean(
-        levels=key_levels, level_hit=level_hit, direction=direction,
-        level_info=level_info, market_label=STATE.market_label,
-        market_adx=STATE.market_adx, exp_move_val=exp_move_val,
-    )
-    if not range_ok:
-        return
-
-    messy_ok, messy_reason = messy_trade_is_allowed(
-        direction=direction, trigger=trigger, level_info=level_info,
-        df_5m=df_5m, session=session,
-    )
-    if not messy_ok:
-        return
-
-    if CFG.require_momentum_confirmation:
-        if direction == "BUY" and not strong_buy_confirmation(df_5m):
-            allow_buy = (
-                trigger == "Wick Rejection near Level"
-                and level_info["strong"]
-                and wick_info["lower_hits"] >= 2
-            ) or (
-                trigger == "Momentum Breakout"
-                and momentum_breakout(df_5m, level_hit, "BUY")
-            )
-            if not allow_buy:
-                return
-        if direction == "SELL" and not strong_sell_confirmation(df_5m):
-            allow_sell = (
-                trigger == "Wick Rejection near Level"
-                and level_info["strong"]
-                and wick_info["upper_hits"] >= 2
-            ) or (
-                trigger == "Momentum Breakout"
-                and momentum_breakout(df_5m, level_hit, "SELL")
-            )
-            if not allow_sell:
-                return
-
-    if trade_type == "Weak" and trigger != "Wick Rejection near Level":
-        if not level_info["strong"]:
+    if STATE.market_dir == "Bearish" and direction == "BUY":
+        if not (CFG.allow_counter_trend_wick_if_strong and wick_trade_is_valid(
+            direction=direction, trigger=trigger, level_info=level_info,
+            market_label=STATE.market_label, market_dir=STATE.market_dir,
+            df_5m=df_5m, score=score,
+        )):
             return
 
-    plan = compute_trade_plan(
-        df_5m=df_5m, levels=key_levels, level_hit=level_hit,
-        direction=direction, trigger=trigger, trade_type=trade_type,
-        exp_move_val=exp_move_val, market_label=STATE.market_label,
-        market_dir=STATE.market_dir, liq_state=liq_state,
-    )
+if not wick_trade_is_valid(
+    direction=direction, trigger=trigger, level_info=level_info,
+    market_label=STATE.market_label, market_dir=STATE.market_dir,
+    df_5m=df_5m, score=score,
+):
+    return
 
-    rr = plan.get("rr")
-    if rr is not None and np.isfinite(float(rr)) and float(rr) < CFG.min_rr_to_t1:
-        return
+range_ok, range_reason = range_level_is_clean(
+    levels=key_levels, level_hit=level_hit, direction=direction,
+    level_info=level_info, market_label=STATE.market_label,
+    market_adx=STATE.market_adx, exp_move_val=exp_move_val,
+)
+if not range_ok:
+    return
 
-    key = (STATE.market_label + ":" + direction + ":"
-           + str(round(level_hit, 1)) + ":" + trigger + ":" + trade_type)
-    if not STATE.can_signal(key):
-        return
+messy_ok, messy_reason = messy_trade_is_allowed(
+    direction=direction, trigger=trigger, level_info=level_info,
+    df_5m=df_5m, session=session,
+)
+if not messy_ok:
+    return
 
-    dist_t1 = abs(float(plan["t1"]) - level_now) if plan.get("t1") else None
-    dist_t2 = abs(float(plan["t2"]) - level_now) if plan.get("t2") else None
-    p1, p2  = probability_t1_t2(conf, rr, dist_t1, dist_t2,
-                                 exp_move_val, liq_state, STATE.market_label)
-    eta     = (eta_to_t1_minutes(df_5m, level_now, float(plan["t1"]),
-                                  direction, liq_state)
-               if plan.get("t1") else None)
-
-    extra_reasons = []
-    if range_reason not in ("not range", "range filter off",
-                             "range adx too strong", "range level accepted"):
-        extra_reasons.append(range_reason)
-    if messy_reason not in ("not messy", "messy filter off"):
-        extra_reasons.append(messy_reason)
-
-    msg = signal_message(
-        session=session, symbol=symbol,
-        market_state_str=market_state_str, liq_state=liq_state,
-        level_now=level_now, direction=direction, level_hit=level_hit,
-        plan=plan, score=score, conf=conf, p_t1=p1, p_t2=p2,
-        exp_move=exp_move_val, eta_band=eta,
-        reasons=reasons + extra_reasons,
-    )
-    send_telegram(msg)
-    STATE.mark_signal(key)
-
-    try:
-        spxw_evaluate_and_report(
-            direction=direction,
-            plan=plan,
-            score=score,
-            conf=conf,
-            current_price=level_now,
+if CFG.require_momentum_confirmation:
+    if direction == "BUY" and not strong_buy_confirmation(df_5m):
+        allow_buy = (
+            trigger == "Wick Rejection near Level"
+            and level_info["strong"]
+            and wick_info["lower_hits"] >= 2
+        ) or (
+            trigger == "Momentum Breakout"
+            and momentum_breakout(df_5m, level_hit, "BUY")
         )
-    except Exception as e:
-        print("[WARN] SPXW error (non-fatal): " + repr(e))
+        if not allow_buy:
+            return
+    if direction == "SELL" and not strong_sell_confirmation(df_5m):
+        allow_sell = (
+            trigger == "Wick Rejection near Level"
+            and level_info["strong"]
+            and wick_info["upper_hits"] >= 2
+        ) or (
+            trigger == "Momentum Breakout"
+            and momentum_breakout(df_5m, level_hit, "SELL")
+        )
+        if not allow_sell:
+            return
 
-    dynamic_targets = {}
-    for t in plan.get("target_map", []):
-        dynamic_targets[t["name"]] = {
-            "price": float(t["price"]), "prob": int(t["prob"]),
-            "zone": str(t["zone"]), "defined": True, "hit": False,
-        }
+if trade_type == "Weak" and trigger != "Wick Rejection near Level":
+    if not level_info["strong"]:
+        return
 
-    all_target_prices = [float(t["price"]) for t in plan.get("target_map", [])]
-    initial_highest   = (max(int(t["name"].replace("T", ""))
-                             for t in plan["target_map"])
-                         if plan.get("target_map") else 0)
+plan = compute_trade_plan(
+    df_5m=df_5m, levels=key_levels, level_hit=level_hit,
+    direction=direction, trigger=trigger, trade_type=trade_type,
+    exp_move_val=exp_move_val, market_label=STATE.market_label,
+    market_dir=STATE.market_dir, liq_state=liq_state,
+)
 
-    STATE.active_trade = {
-        "direction":    direction,
-        "level":        float(level_hit),
-        "entry":        float(plan["entry"]),
-        "stop":         float(plan["stop"]),
-        "initial_stop": float(plan["initial_stop"]),
-        "t1": None if plan.get("t1") is None else float(plan["t1"]),
-        "t2": None if plan.get("t2") is None else float(plan["t2"]),
-        "t3": None if plan.get("t3") is None else float(plan["t3"]),
-        "t4": None,
-        "status":       "pending",
-        "created_utc":  datetime.utcnow(),
-        "trade_type":   trade_type,
-        "market_label_at_entry": STATE.market_label,
-        "session_at_entry":      session,
-        "target_map":            plan.get("target_map", []),
-        "all_target_candidates": plan.get("all_target_candidates", []),
-        "dynamic_targets":       dynamic_targets,
-        "all_target_prices":     all_target_prices,
-        "next_target_idx_to_define": max(3, initial_highest + 1),
-        "last_target_hit_idx":   0,
-        "reversal_watch_sent":   False,
+rr = plan.get("rr")
+if rr is not None and np.isfinite(float(rr)) and float(rr) < CFG.min_rr_to_t1:
+    return
+
+key = (STATE.market_label + ":" + direction + ":"
+       + str(round(level_hit, 1)) + ":" + trigger + ":" + trade_type)
+if not STATE.can_signal(key):
+    return
+
+dist_t1 = abs(float(plan["t1"]) - level_now) if plan.get("t1") else None
+dist_t2 = abs(float(plan["t2"]) - level_now) if plan.get("t2") else None
+p1, p2  = probability_t1_t2(conf, rr, dist_t1, dist_t2,
+                             exp_move_val, liq_state, STATE.market_label)
+eta     = (eta_to_t1_minutes(df_5m, level_now, float(plan["t1"]),
+                              direction, liq_state)
+           if plan.get("t1") else None)
+
+extra_reasons = []
+if range_reason not in ("not range", "range filter off",
+                         "range adx too strong", "range level accepted"):
+    extra_reasons.append(range_reason)
+if messy_reason not in ("not messy", "messy filter off"):
+    extra_reasons.append(messy_reason)
+
+msg = signal_message(
+    session=session, symbol=symbol,
+    market_state_str=market_state_str, liq_state=liq_state,
+    level_now=level_now, direction=direction, level_hit=level_hit,
+    plan=plan, score=score, conf=conf, p_t1=p1, p_t2=p2,
+    exp_move=exp_move_val, eta_band=eta,
+    reasons=reasons + extra_reasons,
+)
+send_telegram(msg)
+STATE.mark_signal(key)
+
+try:
+    spxw_evaluate_and_report(
+        direction=direction,
+        plan=plan,
+        score=score,
+        conf=conf,
+        current_price=level_now,
+    )
+except Exception as e:
+    print("[WARN] SPXW error (non-fatal): " + repr(e))
+
+dynamic_targets = {}
+for t in plan.get("target_map", []):
+    dynamic_targets[t["name"]] = {
+        "price": float(t["price"]), "prob": int(t["prob"]),
+        "zone": str(t["zone"]), "defined": True, "hit": False,
     }
 
+all_target_prices = [float(t["price"]) for t in plan.get("target_map", [])]
+initial_highest   = (max(int(t["name"].replace("T", ""))
+                         for t in plan["target_map"])
+                     if plan.get("target_map") else 0)
+
+STATE.active_trade = {
+    "direction":    direction,
+    "level":        float(level_hit),
+    "entry":        float(plan["entry"]),
+    "stop":         float(plan["stop"]),
+    "initial_stop": float(plan["initial_stop"]),
+    "t1": None if plan.get("t1") is None else float(plan["t1"]),
+    "t2": None if plan.get("t2") is None else float(plan["t2"]),
+    "t3": None if plan.get("t3") is None else float(plan["t3"]),
+    "t4": None,
+    "status":       "pending",
+    "created_utc":  datetime.utcnow(),
+    "trade_type":   trade_type,
+    "market_label_at_entry": STATE.market_label,
+    "session_at_entry":      session,
+    "target_map":            plan.get("target_map", []),
+    "all_target_candidates": plan.get("all_target_candidates", []),
+    "dynamic_targets":       dynamic_targets,
+    "all_target_prices":     all_target_prices,
+    "next_target_idx_to_define": max(3, initial_highest + 1),
+    "last_target_hit_idx":   0,
+    "reversal_watch_sent":   False,
+}
+```
 
 # =========================
+
 # Main Loop
+
 # =========================
 
 def main():
+send_telegram(
+CFG.user_title + “ - Bot Started\n”
+“- Source: TradingView (” + CFG.tv_exchange + “:” + CFG.tv_symbol + “)\n”
+“- Direction: Bias(1H/4H) -> Wick / Break-Retest / Momentum\n”
+“- Targets: Unlimited (auto-extend after T4)\n”
+“- Pending cancel: at stop level\n”
+“- Weekend blackout: Sat 01:00 -> Mon 01:00\n”
+“- SPXW Evaluator: ON (Delta + Theta tracking)\n”
+“- Stats: Daily + Weekly”
+)
+
+```
+try:
+    spxw_evaluator_start()
+except Exception as e:
+    print("[WARN] SPXW init failed: " + repr(e))
     send_telegram(
-        CFG.user_title + " - Bot Started\n"
-        "- Source: TradingView (" + CFG.tv_exchange + ":" + CFG.tv_symbol + ")\n"
-        "- Direction: Bias(1H/4H) -> Wick / Break-Retest / Momentum\n"
-        "- Targets: Unlimited (auto-extend after T4)\n"
-        "- Pending cancel: at stop level\n"
-        "- Weekend blackout: Sat 01:00 -> Mon 01:00\n"
-        "- SPXW Evaluator: ON (Delta + Theta tracking)\n"
-        "- Stats: Daily + Weekly"
+        CFG.user_title + " - SPXW\n"
+        "Webull init failed - bot running normally without it."
     )
 
+while True:
     try:
-        spxw_evaluator_start()
+        if is_weekend_blackout():
+            if not STATE.weekend_blackout_notified:
+                STATE.weekend_blackout_notified = True
+                send_weekend_notification(entering=True)
+            time.sleep(60)
+            continue
+
+        if STATE.weekend_blackout_notified:
+            STATE.weekend_blackout_notified = False
+            send_weekend_notification(entering=False)
+
+        evaluate_once()
+
     except Exception as e:
-        print("[WARN] SPXW init failed: " + repr(e))
-        send_telegram(
-            CFG.user_title + " - SPXW\n"
-            "Webull init failed - bot running normally without it."
-        )
-
-    while True:
+        print("[ERROR]", repr(e))
         try:
-            if is_weekend_blackout():
-                if not STATE.weekend_blackout_notified:
-                    STATE.weekend_blackout_notified = True
-                    send_weekend_notification(entering=True)
-                time.sleep(60)
-                continue
+            reinit_tv_client()
+        except Exception as reinit_err:
+            print("[WARN] TV reinit failed:", repr(reinit_err))
+        if STATE.should_notify_error():
+            send_telegram(
+                CFG.user_title + " - Data Error\n" + repr(e)
+            )
+        time.sleep(15)
 
-            if STATE.weekend_blackout_notified:
-                STATE.weekend_blackout_notified = False
-                send_weekend_notification(entering=False)
-
-            evaluate_once()
-
-        except Exception as e:
-            print("[ERROR]", repr(e))
-            try:
-                reinit_tv_client()
-            except Exception as reinit_err:
-                print("[WARN] TV reinit failed:", repr(reinit_err))
-            if STATE.should_notify_error():
-                send_telegram(
-                    CFG.user_title + " - Data Error\n" + repr(e)
-                )
-            time.sleep(15)
-
-        time.sleep(CFG.loop_sleep_seconds)
-
+    time.sleep(CFG.loop_sleep_seconds)
+```
 
 # =========================
+
 # SPXW Config & State
+
 # =========================
 
 @dataclass
 class SPXWConfig:
-    username:       str   = os.getenv("WB_USERNAME",       "")
-    password:       str   = os.getenv("WB_PASSWORD",       "")
-    session_secret: str   = os.getenv("WB_SESSION_SECRET", "change_this_secret")
-    budget_max:     float = float(os.getenv("WB_BUDGET_MAX", "300"))
-    budget_min:     float = float(os.getenv("WB_BUDGET_MIN", "50"))
-    symbol:         str   = "SPXW"
-    session_path:   str   = str(Path.home() / ".wb_spxw" / "session.enc")
-    retry_attempts: int   = 3
-    retry_sleep:    float = 2.0
-
+username:       str   = os.getenv(“WB_USERNAME”,       “”)
+password:       str   = os.getenv(“WB_PASSWORD”,       “”)
+session_secret: str   = os.getenv(“WB_SESSION_SECRET”, “change_this_secret”)
+budget_max:     float = float(os.getenv(“WB_BUDGET_MAX”, “300”))
+budget_min:     float = float(os.getenv(“WB_BUDGET_MIN”, “50”))
+symbol:         str   = “SPXW”
+session_path:   str   = str(Path.home() / “.wb_spxw” / “session.enc”)
+retry_attempts: int   = 3
+retry_sleep:    float = 2.0
 
 SPXW_CFG = SPXWConfig()
 
-
 class SPXWState:
-    def __init__(self):
-        self.client        = None
-        self.logged_in     = False
-        self.last_login    = None
-        self.otp_waiting   = False
-        self._otp_q        = queue.Queue()
-        self._lock         = threading.Lock()
-        self.active_delta  = None
-        self.active_theta  = None
-        self.active_entry_time = None
-        self.active_spx_entry  = None
-        self.active_cost_usd   = None
+def **init**(self):
+self.client        = None
+self.logged_in     = False
+self.last_login    = None
+self.otp_waiting   = False
+self._otp_q        = queue.Queue()
+self._lock         = threading.Lock()
+self.active_delta  = None
+self.active_theta  = None
+self.active_entry_time = None
+self.active_spx_entry  = None
+self.active_cost_usd   = None
 
-    def wait_otp(self, timeout=120.0):
-        try:
-            return self._otp_q.get(timeout=timeout)
-        except queue.Empty:
-            return None
+```
+def wait_otp(self, timeout=120.0):
+    try:
+        return self._otp_q.get(timeout=timeout)
+    except queue.Empty:
+        return None
 
-    def deliver_otp(self, code):
-        self._otp_q.put(code.strip())
+def deliver_otp(self, code):
+    self._otp_q.put(code.strip())
 
-    def save_contract_data(self, delta, theta, spx_entry, cost_usd):
-        self.active_delta      = delta
-        self.active_theta      = theta
-        self.active_entry_time = datetime.utcnow()
-        self.active_spx_entry  = spx_entry
-        self.active_cost_usd   = cost_usd
+def save_contract_data(self, delta, theta, spx_entry, cost_usd):
+    self.active_delta      = delta
+    self.active_theta      = theta
+    self.active_entry_time = datetime.utcnow()
+    self.active_spx_entry  = spx_entry
+    self.active_cost_usd   = cost_usd
 
-    def clear_contract_data(self):
-        self.active_delta      = None
-        self.active_theta      = None
-        self.active_entry_time = None
-        self.active_spx_entry  = None
-        self.active_cost_usd   = None
-
+def clear_contract_data(self):
+    self.active_delta      = None
+    self.active_theta      = None
+    self.active_entry_time = None
+    self.active_spx_entry  = None
+    self.active_cost_usd   = None
+```
 
 SPXW_STATE = SPXWState()
 
-
 # =========================
+
 # Session helpers
+
 # =========================
 
 def _fernet_key(secret):
-    return base64.urlsafe_b64encode(
-        hashlib.sha256(secret.encode()).digest()
-    )
-
+return base64.urlsafe_b64encode(
+hashlib.sha256(secret.encode()).digest()
+)
 
 def _save_wb_session(data):
-    try:
-        p   = Path(SPXW_CFG.session_path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        raw = json.dumps(data).encode()
-        try:
-            from cryptography.fernet import Fernet
-            raw = Fernet(_fernet_key(SPXW_CFG.session_secret)).encrypt(raw)
-        except ImportError:
-            raw = base64.b64encode(raw)
-        p.write_bytes(raw)
-    except Exception as e:
-        print("[WARN] SPXW session save: " + repr(e))
-
+try:
+p   = Path(SPXW_CFG.session_path)
+p.parent.mkdir(parents=True, exist_ok=True)
+raw = json.dumps(data).encode()
+try:
+from cryptography.fernet import Fernet
+raw = Fernet(_fernet_key(SPXW_CFG.session_secret)).encrypt(raw)
+except ImportError:
+raw = base64.b64encode(raw)
+p.write_bytes(raw)
+except Exception as e:
+print(”[WARN] SPXW session save: “ + repr(e))
 
 def _load_wb_session():
-    try:
-        p = Path(SPXW_CFG.session_path)
-        if not p.exists():
-            return None
-        raw = p.read_bytes()
-        try:
-            from cryptography.fernet import Fernet
-            raw = Fernet(_fernet_key(SPXW_CFG.session_secret)).decrypt(raw)
-        except ImportError:
-            raw = base64.b64decode(raw)
-        return json.loads(raw.decode())
-    except Exception:
-        return None
-
+try:
+p = Path(SPXW_CFG.session_path)
+if not p.exists():
+return None
+raw = p.read_bytes()
+try:
+from cryptography.fernet import Fernet
+raw = Fernet(_fernet_key(SPXW_CFG.session_secret)).decrypt(raw)
+except ImportError:
+raw = base64.b64decode(raw)
+return json.loads(raw.decode())
+except Exception:
+return None
 
 # =========================
+
 # Login
+
 # =========================
 
 def spxw_login(from_command=False):
-    if not WEBULL_AVAILABLE:
-        return False
-    if not SPXW_CFG.username or not SPXW_CFG.password:
-        return False
+if not WEBULL_AVAILABLE:
+return False
+if not SPXW_CFG.username or not SPXW_CFG.password:
+return False
 
-    with SPXW_STATE._lock:
-        try:
-            wb = paper_webull()
+```
+with SPXW_STATE._lock:
+    try:
+        wb = paper_webull()
 
-            if not from_command:
-                sess = _load_wb_session()
-                if sess:
-                    try:
-                        wb._access_token  = sess.get("access_token",  "")
-                        wb._refresh_token = sess.get("refresh_token", "")
-                        wb._uuid          = sess.get("uuid",          "")
-                        wb._device_id     = sess.get("device_id",     "")
-                        if wb.get_account():
-                            SPXW_STATE.client     = wb
-                            SPXW_STATE.logged_in  = True
-                            SPXW_STATE.last_login = datetime.utcnow()
-                            print("[INFO] SPXW: session restored")
-                            return True
-                    except Exception:
-                        pass
+        if not from_command:
+            sess = _load_wb_session()
+            if sess:
+                try:
+                    wb._access_token  = sess.get("access_token",  "")
+                    wb._refresh_token = sess.get("refresh_token", "")
+                    wb._uuid          = sess.get("uuid",          "")
+                    wb._device_id     = sess.get("device_id",     "")
+                    if wb.get_account():
+                        SPXW_STATE.client     = wb
+                        SPXW_STATE.logged_in  = True
+                        SPXW_STATE.last_login = datetime.utcnow()
+                        print("[INFO] SPXW: session restored")
+                        return True
+                except Exception:
+                    pass
 
-            result = wb.login(
-                username=SPXW_CFG.username,
-                password=SPXW_CFG.password,
-                device_name="SPXWBot",
-                save_token=True,
+        result = wb.login(
+            username=SPXW_CFG.username,
+            password=SPXW_CFG.password,
+            device_name="SPXWBot",
+            save_token=True,
+        )
+
+        if isinstance(result, dict) and result.get("uuid"):
+            SPXW_STATE.otp_waiting = True
+            _send_direct(
+                CFG.user_title + " - SPXW OTP Required\n"
+                "Check your email or SMS then reply with the code here."
             )
+            otp = SPXW_STATE.wait_otp(timeout=120)
+            SPXW_STATE.otp_waiting = False
+            if not otp:
+                _send_direct(CFG.user_title + " - SPXW OTP timeout.")
+                return False
+            wb.login_step2(result["uuid"], otp)
 
-            if isinstance(result, dict) and result.get("uuid"):
-                SPXW_STATE.otp_waiting = True
-                _send_direct(
-                    CFG.user_title + " - SPXW OTP Required\n"
-                    "Check your email or SMS then reply with the code here."
-                )
-                otp = SPXW_STATE.wait_otp(timeout=120)
-                SPXW_STATE.otp_waiting = False
-                if not otp:
-                    _send_direct(CFG.user_title + " - SPXW OTP timeout.")
-                    return False
-                wb.login_step2(result["uuid"], otp)
+        _save_wb_session({
+            "access_token":  getattr(wb, "_access_token",  ""),
+            "refresh_token": getattr(wb, "_refresh_token", ""),
+            "uuid":          getattr(wb, "_uuid",          ""),
+            "device_id":     getattr(wb, "_device_id",     ""),
+        })
 
-            _save_wb_session({
-                "access_token":  getattr(wb, "_access_token",  ""),
-                "refresh_token": getattr(wb, "_refresh_token", ""),
-                "uuid":          getattr(wb, "_uuid",          ""),
-                "device_id":     getattr(wb, "_device_id",     ""),
-            })
+        SPXW_STATE.client     = wb
+        SPXW_STATE.logged_in  = True
+        SPXW_STATE.last_login = datetime.utcnow()
+        _send_direct(CFG.user_title + " - SPXW connected. Session saved.")
+        return True
 
-            SPXW_STATE.client     = wb
-            SPXW_STATE.logged_in  = True
-            SPXW_STATE.last_login = datetime.utcnow()
-            _send_direct(CFG.user_title + " - SPXW connected. Session saved.")
-            return True
-
-        except Exception as e:
-            print("[ERROR] spxw_login: " + repr(e))
-            SPXW_STATE.logged_in = False
-            return False
-
+    except Exception as e:
+        print("[ERROR] spxw_login: " + repr(e))
+        SPXW_STATE.logged_in = False
+        return False
+```
 
 def _spxw_ensure():
-    if not SPXW_STATE.logged_in or SPXW_STATE.client is None:
-        return spxw_login()
-    if SPXW_STATE.last_login:
-        if (datetime.utcnow() - SPXW_STATE.last_login).total_seconds() > 6 * 3600:
-            return spxw_login()
-    return True
-
+if not SPXW_STATE.logged_in or SPXW_STATE.client is None:
+return spxw_login()
+if SPXW_STATE.last_login:
+if (datetime.utcnow() - SPXW_STATE.last_login).total_seconds() > 6 * 3600:
+return spxw_login()
+return True
 
 # =========================
+
 # Market time helpers
+
 # =========================
 
 def _hours_to_close():
-    now_et = datetime.now(TZ_NY)
-    close  = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    return max(0.0, (close - now_et).total_seconds() / 3600.0)
-
+now_et = datetime.now(TZ_NY)
+close  = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+return max(0.0, (close - now_et).total_seconds() / 3600.0)
 
 def _time_zone_label(hours):
-    if hours >= 5.0:
-        return "OPEN"
-    if hours >= 3.0:
-        return "MIDDAY"
-    if hours >= 1.5:
-        return "AFTERNOON"
-    if hours >= 0.5:
-        return "CLOSING"
-    return "FINAL"
-
+if hours >= 5.0:
+return “OPEN”
+if hours >= 3.0:
+return “MIDDAY”
+if hours >= 1.5:
+return “AFTERNOON”
+if hours >= 0.5:
+return “CLOSING”
+return “FINAL”
 
 # =========================
+
 # Expiry selection
+
 # =========================
 
 def _choose_expiry(available):
-    if not available:
-        return None
-    today_str = date.today().isoformat()
-    hrs       = _hours_to_close()
-    is_weak   = (
-        STATE.market_label in ("Weak", "Range", "Messy")
-        or (STATE.market_adx is not None and STATE.market_adx < 20.0)
-    )
-    avoid_0dte = hrs < SPXW_CFG.budget_max / 100 and is_weak and hrs > 0
-    sorted_d   = sorted(available)
+if not available:
+return None
+today_str = date.today().isoformat()
+hrs       = _hours_to_close()
+is_weak   = (
+STATE.market_label in (“Weak”, “Range”, “Messy”)
+or (STATE.market_adx is not None and STATE.market_adx < 20.0)
+)
+avoid_0dte = hrs < SPXW_CFG.budget_max / 100 and is_weak and hrs > 0
+sorted_d   = sorted(available)
 
-    if avoid_0dte:
-        for d in sorted_d:
-            if d > today_str:
-                return d
-
+```
+if avoid_0dte:
     for d in sorted_d:
-        if d >= today_str:
+        if d > today_str:
             return d
-    return sorted_d[-1] if sorted_d else None
 
+for d in sorted_d:
+    if d >= today_str:
+        return d
+return sorted_d[-1] if sorted_d else None
+```
 
 # =========================
+
 # Delta / Theta evaluation
+
 # =========================
 
 def _eval_delta(delta, trade_type):
-    d = abs(delta)
-    ranges = {
-        "Strong":   (0.38, 0.58),
-        "Standard": (0.42, 0.62),
-        "Weak":     (0.45, 0.65),
-    }
-    lo, hi = ranges.get(trade_type, (0.42, 0.62))
+d = abs(delta)
+ranges = {
+“Strong”:   (0.38, 0.58),
+“Standard”: (0.42, 0.62),
+“Weak”:     (0.45, 0.65),
+}
+lo, hi = ranges.get(trade_type, (0.42, 0.62))
 
-    if lo <= d <= hi:
-        return {"rating": "Excellent",
-                "reason": "Delta " + "{:.3f}".format(d) + " in ideal range (" + str(lo) + "-" + str(hi) + ")",
-                "suitable": True}
-    if 0.30 <= d < lo:
-        return {"rating": "Acceptable",
-                "reason": "Delta " + "{:.3f}".format(d) + " - OTM, needs bigger move",
-                "suitable": True}
-    if hi < d <= 0.75:
-        return {"rating": "Acceptable",
-                "reason": "Delta " + "{:.3f}".format(d) + " - near ATM, higher cost but safer",
-                "suitable": True}
-    if d < 0.30:
-        return {"rating": "Weak",
-                "reason": "Delta " + "{:.3f}".format(d) + " - too far OTM for 0DTE",
-                "suitable": False}
+```
+if lo <= d <= hi:
+    return {"rating": "Excellent",
+            "reason": "Delta " + "{:.3f}".format(d) + " in ideal range (" + str(lo) + "-" + str(hi) + ")",
+            "suitable": True}
+if 0.30 <= d < lo:
+    return {"rating": "Acceptable",
+            "reason": "Delta " + "{:.3f}".format(d) + " - OTM, needs bigger move",
+            "suitable": True}
+if hi < d <= 0.75:
+    return {"rating": "Acceptable",
+            "reason": "Delta " + "{:.3f}".format(d) + " - near ATM, higher cost but safer",
+            "suitable": True}
+if d < 0.30:
     return {"rating": "Weak",
-            "reason": "Delta " + "{:.3f}".format(d) + " - too deep ITM, high Theta",
+            "reason": "Delta " + "{:.3f}".format(d) + " - too far OTM for 0DTE",
             "suitable": False}
-
+return {"rating": "Weak",
+        "reason": "Delta " + "{:.3f}".format(d) + " - too deep ITM, high Theta",
+        "suitable": False}
+```
 
 def _eval_theta(theta, hours, trade_type):
-    t    = abs(theta)
-    zone = _time_zone_label(hours)
-    zone_labels = {
-        "OPEN":      "Market Open",
-        "MIDDAY":    "Midday",
-        "AFTERNOON": "Afternoon",
-        "CLOSING":   "Near Close",
-        "FINAL":     "Last 30min",
-    }
-    zone_lbl = zone_labels.get(zone, zone)
-    limits = {
-        "OPEN":      (0.25, 0.45, 0.70),
-        "MIDDAY":    (0.35, 0.60, 0.90),
-        "AFTERNOON": (0.50, 0.85, 1.20),
-        "CLOSING":   (0.70, 1.10, 1.80),
-        "FINAL":     (0.90, 1.50, 9.99),
-    }
-    ok, warn, danger = limits[zone]
+t    = abs(theta)
+zone = _time_zone_label(hours)
+zone_labels = {
+“OPEN”:      “Market Open”,
+“MIDDAY”:    “Midday”,
+“AFTERNOON”: “Afternoon”,
+“CLOSING”:   “Near Close”,
+“FINAL”:     “Last 30min”,
+}
+zone_lbl = zone_labels.get(zone, zone)
+limits = {
+“OPEN”:      (0.25, 0.45, 0.70),
+“MIDDAY”:    (0.35, 0.60, 0.90),
+“AFTERNOON”: (0.50, 0.85, 1.20),
+“CLOSING”:   (0.70, 1.10, 1.80),
+“FINAL”:     (0.90, 1.50, 9.99),
+}
+ok, warn, danger = limits[zone]
 
-    if zone == "FINAL" and trade_type != "Strong":
-        return {"rating": "Dangerous",
-                "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - last 30min",
-                "suitable": False}
-    if t <= ok:
-        return {"rating": "Excellent",
-                "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - low decay",
-                "suitable": True}
-    if t <= warn:
-        return {"rating": "High",
-                "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - needs fast move",
-                "suitable": trade_type in ("Strong", "Standard")}
-    if t <= danger:
-        return {"rating": "Very High",
-                "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - needs strong fast move",
-                "suitable": trade_type == "Strong"}
+```
+if zone == "FINAL" and trade_type != "Strong":
     return {"rating": "Dangerous",
-            "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - decay eating contract",
+            "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - last 30min",
             "suitable": False}
-
+if t <= ok:
+    return {"rating": "Excellent",
+            "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - low decay",
+            "suitable": True}
+if t <= warn:
+    return {"rating": "High",
+            "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - needs fast move",
+            "suitable": trade_type in ("Strong", "Standard")}
+if t <= danger:
+    return {"rating": "Very High",
+            "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - needs strong fast move",
+            "suitable": trade_type == "Strong"}
+return {"rating": "Dangerous",
+        "reason": "Theta " + "{:.3f}".format(-t) + " at " + zone_lbl + " - decay eating contract",
+        "suitable": False}
+```
 
 # =========================
+
 # Chain liquidity
+
 # =========================
 
 def _chain_liquidity(calls, puts):
-    def sv(lst):
-        return sum(float(x.get("volume", 0) or 0) for x in lst)
-    cv  = sv(calls)
-    pv  = sv(puts)
-    pcr = pv / max(cv, 1.0)
-    if pcr > 1.2:
-        flow = "Bearish"
-    elif pcr < 0.8:
-        flow = "Bullish"
-    else:
-        flow = "Neutral"
-    total = max(cv + pv, 1)
-    return {
-        "flow":      flow,
-        "pcr":       round(pcr, 2),
-        "call_vol":  int(cv),
-        "put_vol":   int(pv),
-        "call_pct":  round(cv / total * 100, 1),
-        "put_pct":   round(pv / total * 100, 1),
-    }
-
+def sv(lst):
+return sum(float(x.get(“volume”, 0) or 0) for x in lst)
+cv  = sv(calls)
+pv  = sv(puts)
+pcr = pv / max(cv, 1.0)
+if pcr > 1.2:
+flow = “Bearish”
+elif pcr < 0.8:
+flow = “Bullish”
+else:
+flow = “Neutral”
+total = max(cv + pv, 1)
+return {
+“flow”:      flow,
+“pcr”:       round(pcr, 2),
+“call_vol”:  int(cv),
+“put_vol”:   int(pv),
+“call_pct”:  round(cv / total * 100, 1),
+“put_pct”:   round(pv / total * 100, 1),
+}
 
 # =========================
+
 # Contract selection
+
 # =========================
 
 def _pick_contract(contracts, direction, trade_type):
-    target_d = {"Strong": 0.48, "Standard": 0.52}.get(trade_type, 0.52)
-    max_p    = SPXW_CFG.budget_max / 100.0
-    min_p    = SPXW_CFG.budget_min / 100.0
-    cands    = []
+target_d = {“Strong”: 0.48, “Standard”: 0.52}.get(trade_type, 0.52)
+max_p    = SPXW_CFG.budget_max / 100.0
+min_p    = SPXW_CFG.budget_min / 100.0
+cands    = []
 
-    for c in contracts:
-        try:
-            ask   = float(c.get("askPrice", 0) or 0)
-            vol   = float(c.get("volume",   0) or 0)
-            oi    = float(c.get("openInterest", 0) or 0)
-            delta = abs(float(c.get("delta", 0) or 0))
-            theta = float(c.get("theta",    0) or 0)
-            iv    = float(c.get("impliedVolatility", 0) or 0)
+```
+for c in contracts:
+    try:
+        ask   = float(c.get("askPrice", 0) or 0)
+        vol   = float(c.get("volume",   0) or 0)
+        oi    = float(c.get("openInterest", 0) or 0)
+        delta = abs(float(c.get("delta", 0) or 0))
+        theta = float(c.get("theta",    0) or 0)
+        iv    = float(c.get("impliedVolatility", 0) or 0)
 
-            if ask <= 0 or ask < min_p or ask > max_p:
-                continue
-            if delta < 0.20:
-                continue
-
-            bid = float(c.get("bidPrice", 0) or 0)
-            cands.append({
-                "raw":         c,
-                "strike":      float(c.get("strikePrice", 0)),
-                "ticker_id":   c.get("tickerId", ""),
-                "bid":         bid,
-                "ask":         ask,
-                "mid":         round((bid + ask) / 2, 2),
-                "cost_usd":    round(ask * 100, 0),
-                "delta":       delta,
-                "theta":       theta,
-                "iv":          round(iv * 100, 1) if iv < 5 else round(iv, 1),
-                "volume":      int(vol),
-                "oi":          int(oi),
-                "delta_score": abs(delta - target_d),
-            })
-        except Exception:
+        if ask <= 0 or ask < min_p or ask > max_p:
+            continue
+        if delta < 0.20:
             continue
 
-    if not cands:
-        return None
-    cands.sort(key=lambda x: (x["delta_score"], -x["volume"]))
-    return cands[0]
+        bid = float(c.get("bidPrice", 0) or 0)
+        cands.append({
+            "raw":         c,
+            "strike":      float(c.get("strikePrice", 0)),
+            "ticker_id":   c.get("tickerId", ""),
+            "bid":         bid,
+            "ask":         ask,
+            "mid":         round((bid + ask) / 2, 2),
+            "cost_usd":    round(ask * 100, 0),
+            "delta":       delta,
+            "theta":       theta,
+            "iv":          round(iv * 100, 1) if iv < 5 else round(iv, 1),
+            "volume":      int(vol),
+            "oi":          int(oi),
+            "delta_score": abs(delta - target_d),
+        })
+    except Exception:
+        continue
 
+if not cands:
+    return None
+cands.sort(key=lambda x: (x["delta_score"], -x["volume"]))
+return cands[0]
+```
 
 # =========================
+
 # Full evaluation
+
 # =========================
 
 def _fetch_and_evaluate(direction, trade_type):
-    wb    = SPXW_STATE.client
-    hours = _hours_to_close()
+wb    = SPXW_STATE.client
+hours = _hours_to_close()
 
-    try:
-        exp_dates = wb.get_options_expiration_dates(stock=SPXW_CFG.symbol)
-        if not exp_dates:
-            return None
-
-        expiry = _choose_expiry(exp_dates)
-        if not expiry:
-            return None
-
-        opt_type  = "call" if direction == "BUY" else "put"
-        all_calls = wb.get_options(SPXW_CFG.symbol, expiry, "call") or []
-        all_puts  = wb.get_options(SPXW_CFG.symbol, expiry, "put")  or []
-        target_l  = all_calls if opt_type == "call" else all_puts
-        liq       = _chain_liquidity(all_calls, all_puts)
-        chosen    = _pick_contract(target_l, direction, trade_type)
-
-        if chosen is None:
-            return None
-
-        is_0dte    = (expiry == date.today().isoformat())
-        delta_eval = _eval_delta(chosen["delta"], trade_type)
-        theta_eval = _eval_theta(chosen["theta"], hours, trade_type)
-
-        return {
-            "expiry":      expiry,
-            "is_0dte":     is_0dte,
-            "option_type": opt_type.upper(),
-            "chosen":      chosen,
-            "liquidity":   liq,
-            "delta_eval":  delta_eval,
-            "theta_eval":  theta_eval,
-            "hours_left":  hours,
-            "tz_label":    _time_zone_label(hours),
-        }
-    except Exception as e:
-        print("[ERROR] SPXW _fetch_and_evaluate: " + repr(e))
+```
+try:
+    exp_dates = wb.get_options_expiration_dates(stock=SPXW_CFG.symbol)
+    if not exp_dates:
         return None
 
+    expiry = _choose_expiry(exp_dates)
+    if not expiry:
+        return None
+
+    opt_type  = "call" if direction == "BUY" else "put"
+    all_calls = wb.get_options(SPXW_CFG.symbol, expiry, "call") or []
+    all_puts  = wb.get_options(SPXW_CFG.symbol, expiry, "put")  or []
+    target_l  = all_calls if opt_type == "call" else all_puts
+    liq       = _chain_liquidity(all_calls, all_puts)
+    chosen    = _pick_contract(target_l, direction, trade_type)
+
+    if chosen is None:
+        return None
+
+    is_0dte    = (expiry == date.today().isoformat())
+    delta_eval = _eval_delta(chosen["delta"], trade_type)
+    theta_eval = _eval_theta(chosen["theta"], hours, trade_type)
+
+    return {
+        "expiry":      expiry,
+        "is_0dte":     is_0dte,
+        "option_type": opt_type.upper(),
+        "chosen":      chosen,
+        "liquidity":   liq,
+        "delta_eval":  delta_eval,
+        "theta_eval":  theta_eval,
+        "hours_left":  hours,
+        "tz_label":    _time_zone_label(hours),
+    }
+except Exception as e:
+    print("[ERROR] SPXW _fetch_and_evaluate: " + repr(e))
+    return None
+```
 
 # =========================
+
 # Verdict
+
 # =========================
 
 def _verdict(delta_eval, theta_eval, chosen, liq, hours, direction, trade_type):
-    for_r     = []
-    warn_r    = []
-    against_r = []
+for_r     = []
+warn_r    = []
+against_r = []
 
-    if delta_eval["suitable"]:
-        for_r.append("Delta " + delta_eval["rating"])
-    else:
-        against_r.append(delta_eval["reason"])
+```
+if delta_eval["suitable"]:
+    for_r.append("Delta " + delta_eval["rating"])
+else:
+    against_r.append(delta_eval["reason"])
 
-    if theta_eval["suitable"]:
-        for_r.append("Theta " + theta_eval["rating"])
-    else:
-        against_r.append(theta_eval["reason"])
+if theta_eval["suitable"]:
+    for_r.append("Theta " + theta_eval["rating"])
+else:
+    against_r.append(theta_eval["reason"])
 
-    cost = chosen["cost_usd"]
-    if SPXW_CFG.budget_min <= cost <= SPXW_CFG.budget_max:
-        for_r.append("Within budget ($" + str(int(cost)) + ")")
-    else:
-        against_r.append("Outside budget ($" + str(int(cost)) + ")")
+cost = chosen["cost_usd"]
+if SPXW_CFG.budget_min <= cost <= SPXW_CFG.budget_max:
+    for_r.append("Within budget ($" + str(int(cost)) + ")")
+else:
+    against_r.append("Outside budget ($" + str(int(cost)) + ")")
 
-    vol = chosen["volume"]
-    oi  = chosen["oi"]
-    if vol >= 500 and oi >= 1000:
-        for_r.append("Excellent liquidity (Vol: " + str(vol) + ")")
-    elif vol >= 100 and oi >= 200:
-        warn_r.append("Medium liquidity (Vol: " + str(vol) + " | OI: " + str(oi) + ")")
-    else:
-        against_r.append("Weak liquidity (Vol: " + str(vol) + " | OI: " + str(oi) + ")")
+vol = chosen["volume"]
+oi  = chosen["oi"]
+if vol >= 500 and oi >= 1000:
+    for_r.append("Excellent liquidity (Vol: " + str(vol) + ")")
+elif vol >= 100 and oi >= 200:
+    warn_r.append("Medium liquidity (Vol: " + str(vol) + " | OI: " + str(oi) + ")")
+else:
+    against_r.append("Weak liquidity (Vol: " + str(vol) + " | OI: " + str(oi) + ")")
 
-    flow = liq["flow"]
-    if (flow == "Bullish" and direction == "BUY") or \
-       (flow == "Bearish" and direction == "SELL"):
-        for_r.append("Chain flow confirms direction (" + flow + ")")
-    elif flow == "Neutral":
-        warn_r.append("Chain flow neutral")
-    else:
-        warn_r.append("Chain flow against direction (" + flow + ") - caution")
+flow = liq["flow"]
+if (flow == "Bullish" and direction == "BUY") or \
+   (flow == "Bearish" and direction == "SELL"):
+    for_r.append("Chain flow confirms direction (" + flow + ")")
+elif flow == "Neutral":
+    warn_r.append("Chain flow neutral")
+else:
+    warn_r.append("Chain flow against direction (" + flow + ") - caution")
 
-    if STATE.market_label == "Trending":
-        for_r.append("Trending market - good for 0DTE")
-    elif STATE.market_label == "Range":
-        warn_r.append("Range market - 0DTE riskier")
-    elif STATE.market_label in ("Messy", "Weak"):
-        against_r.append(STATE.market_label + " market - 0DTE risky")
+if STATE.market_label == "Trending":
+    for_r.append("Trending market - good for 0DTE")
+elif STATE.market_label == "Range":
+    warn_r.append("Range market - 0DTE riskier")
+elif STATE.market_label in ("Messy", "Weak"):
+    against_r.append(STATE.market_label + " market - 0DTE risky")
 
-    if hours >= 3.0:
-        for_r.append("{:.1f}h remaining - enough time".format(hours))
-    elif hours >= 1.5:
-        warn_r.append("{:.1f}h remaining - needs fast move".format(hours))
-    else:
-        against_r.append("{:.1f}h remaining - too little time".format(hours))
+if hours >= 3.0:
+    for_r.append("{:.1f}h remaining - enough time".format(hours))
+elif hours >= 1.5:
+    warn_r.append("{:.1f}h remaining - needs fast move".format(hours))
+else:
+    against_r.append("{:.1f}h remaining - too little time".format(hours))
 
-    n_against = len(against_r)
-    is_ok     = (delta_eval["suitable"] and theta_eval["suitable"]
-                 and SPXW_CFG.budget_min <= cost <= SPXW_CFG.budget_max
-                 and n_against == 0)
-    is_cond   = (not is_ok and n_against <= 1
-                 and delta_eval["suitable"]
-                 and SPXW_CFG.budget_min <= cost <= SPXW_CFG.budget_max)
+n_against = len(against_r)
+is_ok     = (delta_eval["suitable"] and theta_eval["suitable"]
+             and SPXW_CFG.budget_min <= cost <= SPXW_CFG.budget_max
+             and n_against == 0)
+is_cond   = (not is_ok and n_against <= 1
+             and delta_eval["suitable"]
+             and SPXW_CFG.budget_min <= cost <= SPXW_CFG.budget_max)
 
-    if is_ok:
-        verdict = "SUITABLE - Ready to enter"
-        detail  = "Contract meets Delta, Theta and budget criteria."
-    elif is_cond:
-        verdict = "CONDITIONAL - Enter with caution"
-        detail  = "Contract acceptable but has one concern."
-    else:
-        verdict = "NOT SUITABLE - Wait for better setup"
-        detail  = "Contract does not meet criteria."
+if is_ok:
+    verdict = "SUITABLE - Ready to enter"
+    detail  = "Contract meets Delta, Theta and budget criteria."
+elif is_cond:
+    verdict = "CONDITIONAL - Enter with caution"
+    detail  = "Contract acceptable but has one concern."
+else:
+    verdict = "NOT SUITABLE - Wait for better setup"
+    detail  = "Contract does not meet criteria."
 
-    return {
-        "verdict":  verdict,
-        "detail":   detail,
-        "for":      for_r,
-        "warnings": warn_r,
-        "against":  against_r,
-    }
-
+return {
+    "verdict":  verdict,
+    "detail":   detail,
+    "for":      for_r,
+    "warnings": warn_r,
+    "against":  against_r,
+}
+```
 
 # =========================
+
 # Report message
+
 # =========================
 
 def _report_msg(result, direction, plan, score, conf):
-    c      = result["chosen"]
-    liq    = result["liquidity"]
-    d_eval = result["delta_eval"]
-    t_eval = result["theta_eval"]
-    hrs    = result["hours_left"]
-    tz_lbl = result["tz_label"]
-    tz_map = {
-        "OPEN":      "Market Open",
-        "MIDDAY":    "Midday",
-        "AFTERNOON": "Afternoon",
-        "CLOSING":   "Near Close",
-        "FINAL":     "Last 30min",
-    }
-    tz_str = tz_map.get(tz_lbl, tz_lbl)
+c      = result[“chosen”]
+liq    = result[“liquidity”]
+d_eval = result[“delta_eval”]
+t_eval = result[“theta_eval”]
+hrs    = result[“hours_left”]
+tz_lbl = result[“tz_label”]
+tz_map = {
+“OPEN”:      “Market Open”,
+“MIDDAY”:    “Midday”,
+“AFTERNOON”: “Afternoon”,
+“CLOSING”:   “Near Close”,
+“FINAL”:     “Last 30min”,
+}
+tz_str = tz_map.get(tz_lbl, tz_lbl)
 
-    vrd = _verdict(d_eval, t_eval, c, liq, hrs,
-                   direction, plan.get("trade_type", "Standard"))
+```
+vrd = _verdict(d_eval, t_eval, c, liq, hrs,
+               direction, plan.get("trade_type", "Standard"))
 
-    is_0dte = result["is_0dte"]
-    if is_0dte:
-        dte_lbl = "0DTE"
-    else:
-        try:
-            days_diff = (datetime.strptime(result["expiry"], "%Y-%m-%d").date() - date.today()).days
-            dte_lbl = str(days_diff) + "DTE"
-        except Exception:
-            dte_lbl = result["expiry"]
+is_0dte = result["is_0dte"]
+if is_0dte:
+    dte_lbl = "0DTE"
+else:
+    try:
+        days_diff = (datetime.strptime(result["expiry"], "%Y-%m-%d").date() - date.today()).days
+        dte_lbl = str(days_diff) + "DTE"
+    except Exception:
+        dte_lbl = result["expiry"]
 
-    flow_map = {"Bullish": "[Bull]", "Bearish": "[Bear]", "Neutral": "[Neut]"}
-    flow_e   = flow_map.get(liq["flow"], "[?]")
+flow_map = {"Bullish": "[Bull]", "Bearish": "[Bear]", "Neutral": "[Neut]"}
+flow_e   = flow_map.get(liq["flow"], "[?]")
 
-    for_txt     = "\n".join("  [+] " + r for r in vrd["for"])      or "  -"
-    warn_txt    = "\n".join("  [!] " + r for r in vrd["warnings"]) or ""
-    against_txt = "\n".join("  [-] " + r for r in vrd["against"])  or ""
-    eval_parts  = [x for x in [for_txt, warn_txt, against_txt] if x]
-    eval_txt    = "\n".join(eval_parts)
+for_txt     = "\n".join("  [+] " + r for r in vrd["for"])      or "  -"
+warn_txt    = "\n".join("  [!] " + r for r in vrd["warnings"]) or ""
+against_txt = "\n".join("  [-] " + r for r in vrd["against"])  or ""
+eval_parts  = [x for x in [for_txt, warn_txt, against_txt] if x]
+eval_txt    = "\n".join(eval_parts)
 
-    ts = now_riyadh().strftime("%Y-%m-%d %H:%M")
+ts = now_riyadh().strftime("%Y-%m-%d %H:%M")
 
-    return (
-        CFG.user_title + " - SPXW 0DTE Report\n"
-        + ts + " (Riyadh)\n"
-        "Time remaining: " + "{:.1f}".format(hrs) + "h | " + tz_str + "\n\n"
+return (
+    CFG.user_title + " - SPXW 0DTE Report\n"
+    + ts + " (Riyadh)\n"
+    "Time remaining: " + "{:.1f}".format(hrs) + "h | " + tz_str + "\n\n"
 
-        "--- Bot Signal ---\n"
-        "Direction: " + direction + " | " + plan.get("trade_type", "N/A") + "\n"
-        "Score: " + str(score) + "/6 | Confidence: " + str(conf) + "%\n"
-        "Entry: " + safe_f1(plan.get("entry")) + " | Stop: " + safe_f1(plan.get("stop")) + "\n"
-        "T1: " + safe_f1(plan.get("t1")) + " | T2: " + safe_f1(plan.get("t2")) + "\n\n"
+    "--- Bot Signal ---\n"
+    "Direction: " + direction + " | " + plan.get("trade_type", "N/A") + "\n"
+    "Score: " + str(score) + "/6 | Confidence: " + str(conf) + "%\n"
+    "Entry: " + safe_f1(plan.get("entry")) + " | Stop: " + safe_f1(plan.get("stop")) + "\n"
+    "T1: " + safe_f1(plan.get("t1")) + " | T2: " + safe_f1(plan.get("t2")) + "\n\n"
 
-        "--- Contract ---\n"
-        "SPXW " + result["option_type"] + " " + "{:.0f}".format(c["strike"]) + "\n"
-        "Expiry: " + result["expiry"] + " (" + dte_lbl + ")\n"
-        "Bid: " + "{:.2f}".format(c["bid"]) + " | Ask: " + "{:.2f}".format(c["ask"]) + " | Mid: " + "{:.2f}".format(c["mid"]) + "\n"
-        "Cost: $" + "{:.0f}".format(c["cost_usd"]) + " (Budget: $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + ")\n\n"
+    "--- Contract ---\n"
+    "SPXW " + result["option_type"] + " " + "{:.0f}".format(c["strike"]) + "\n"
+    "Expiry: " + result["expiry"] + " (" + dte_lbl + ")\n"
+    "Bid: " + "{:.2f}".format(c["bid"]) + " | Ask: " + "{:.2f}".format(c["ask"]) + " | Mid: " + "{:.2f}".format(c["mid"]) + "\n"
+    "Cost: $" + "{:.0f}".format(c["cost_usd"]) + " (Budget: $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + ")\n\n"
 
-        "--- Greeks ---\n"
-        "Delta: " + "{:.3f}".format(c["delta"]) + " -> " + d_eval["rating"] + "\n"
-        "  " + d_eval["reason"] + "\n\n"
-        "Theta: " + "{:.3f}".format(c["theta"]) + "/day -> " + t_eval["rating"] + "\n"
-        "  " + t_eval["reason"] + "\n"
-        "IV: " + str(c["iv"]) + "% | Vol: " + "{:,}".format(c["volume"]) + " | OI: " + "{:,}".format(c["oi"]) + "\n\n"
+    "--- Greeks ---\n"
+    "Delta: " + "{:.3f}".format(c["delta"]) + " -> " + d_eval["rating"] + "\n"
+    "  " + d_eval["reason"] + "\n\n"
+    "Theta: " + "{:.3f}".format(c["theta"]) + "/day -> " + t_eval["rating"] + "\n"
+    "  " + t_eval["reason"] + "\n"
+    "IV: " + str(c["iv"]) + "% | Vol: " + "{:,}".format(c["volume"]) + " | OI: " + "{:,}".format(c["oi"]) + "\n\n"
 
-        "--- Chain Liquidity ---\n"
-        + flow_e + " " + liq["flow"] + " | PCR: " + str(liq["pcr"]) + "\n"
-        "Call: " + str(liq["call_pct"]) + "% | Put: " + str(liq["put_pct"]) + "%\n\n"
+    "--- Chain Liquidity ---\n"
+    + flow_e + " " + liq["flow"] + " | PCR: " + str(liq["pcr"]) + "\n"
+    "Call: " + str(liq["call_pct"]) + "% | Put: " + str(liq["put_pct"]) + "%\n\n"
 
-        "--- Assessment ---\n"
-        + eval_txt + "\n\n"
+    "--- Assessment ---\n"
+    + eval_txt + "\n\n"
 
-        "========================\n"
-        "VERDICT: " + vrd["verdict"] + "\n"
-        + vrd["detail"] + "\n"
-        "========================\n\n"
-        "Decision is yours."
-    )
-
+    "========================\n"
+    "VERDICT: " + vrd["verdict"] + "\n"
+    + vrd["detail"] + "\n"
+    "========================\n\n"
+    "Decision is yours."
+)
+```
 
 # =========================
+
 # Delta + Theta PnL estimation
+
 # =========================
 
 def _estimate_contract_pnl(spx_price_now):
-    delta      = SPXW_STATE.active_delta
-    theta      = SPXW_STATE.active_theta
-    entry_time = SPXW_STATE.active_entry_time
-    spx_entry  = SPXW_STATE.active_spx_entry
-    cost_usd   = SPXW_STATE.active_cost_usd
+delta      = SPXW_STATE.active_delta
+theta      = SPXW_STATE.active_theta
+entry_time = SPXW_STATE.active_entry_time
+spx_entry  = SPXW_STATE.active_spx_entry
+cost_usd   = SPXW_STATE.active_cost_usd
 
-    if delta is None or spx_entry is None or entry_time is None:
-        return {"available": False}
+```
+if delta is None or spx_entry is None or entry_time is None:
+    return {"available": False}
 
-    spx_move      = spx_price_now - spx_entry
-    delta_pnl     = spx_move * abs(delta) * 100
-    hours_elapsed = (datetime.utcnow() - entry_time).total_seconds() / 3600.0
-    theta_loss    = abs(theta or 0) * (hours_elapsed / 24.0) * 100
-    net_pnl       = delta_pnl - theta_loss
-    pct           = (net_pnl / cost_usd * 100) if cost_usd else 0.0
+spx_move      = spx_price_now - spx_entry
+delta_pnl     = spx_move * abs(delta) * 100
+hours_elapsed = (datetime.utcnow() - entry_time).total_seconds() / 3600.0
+theta_loss    = abs(theta or 0) * (hours_elapsed / 24.0) * 100
+net_pnl       = delta_pnl - theta_loss
+pct           = (net_pnl / cost_usd * 100) if cost_usd else 0.0
 
-    return {
-        "available":  True,
-        "spx_entry":  spx_entry,
-        "spx_now":    spx_price_now,
-        "spx_move":   spx_move,
-        "delta":      delta,
-        "theta":      theta,
-        "hours":      hours_elapsed,
-        "delta_pnl":  delta_pnl,
-        "theta_loss": theta_loss,
-        "net_pnl":    net_pnl,
-        "cost_usd":   cost_usd,
-        "pct":        pct,
-    }
-
+return {
+    "available":  True,
+    "spx_entry":  spx_entry,
+    "spx_now":    spx_price_now,
+    "spx_move":   spx_move,
+    "delta":      delta,
+    "theta":      theta,
+    "hours":      hours_elapsed,
+    "delta_pnl":  delta_pnl,
+    "theta_loss": theta_loss,
+    "net_pnl":    net_pnl,
+    "cost_usd":   cost_usd,
+    "pct":        pct,
+}
+```
 
 def spxw_on_target_hit(target_name, spx_price_at_target, target_idx):
-    if not WEBULL_AVAILABLE:
-        return
-    if SPXW_STATE.active_delta is None:
-        return
+if not WEBULL_AVAILABLE:
+return
+if SPXW_STATE.active_delta is None:
+return
 
-    pnl = _estimate_contract_pnl(spx_price_at_target)
-    if not pnl["available"]:
-        return
+```
+pnl = _estimate_contract_pnl(spx_price_at_target)
+if not pnl["available"]:
+    return
 
-    status = "[+]" if pnl["net_pnl"] >= 0 else "[-]"
-    sign   = "+" if pnl["net_pnl"] >= 0 else ""
+status = "[+]" if pnl["net_pnl"] >= 0 else "[-]"
+sign   = "+" if pnl["net_pnl"] >= 0 else ""
 
-    send_telegram(
-        CFG.user_title + " - SPXW at " + target_name + "\n\n"
-        "--- SPX ---\n"
-        "Entry: " + safe_f1(pnl["spx_entry"]) + "\n"
-        "Now:   " + safe_f1(pnl["spx_now"]) + "\n"
-        "Move:  " + "{:+.1f}".format(pnl["spx_move"]) + " pts\n\n"
-        "--- Contract Estimate ---\n"
-        "Delta gain:  " + "{:+.0f}".format(pnl["delta_pnl"]) + "$\n"
-        "  (SPX " + "{:+.1f}".format(pnl["spx_move"]) + " x Delta " + "{:.2f}".format(pnl["delta"]) + " x 100)\n\n"
-        "Theta loss:  -" + "{:.0f}".format(pnl["theta_loss"]) + "$\n"
-        "  (Theta " + "{:.3f}".format(abs(pnl["theta"] or 0)) + " x " + "{:.1f}".format(pnl["hours"]) + "h)\n\n"
-        "========================\n"
-        + status + " Net estimate: " + sign + "{:.0f}".format(pnl["net_pnl"]) + "$ (" + sign + "{:.1f}".format(pnl["pct"]) + "%)\n"
-        "Original cost: $" + "{:.0f}".format(pnl["cost_usd"]) + "\n"
-        "========================\n\n"
-        "Note: estimate only - actual price may differ.\n"
-        "Decision is yours."
-    )
-
+send_telegram(
+    CFG.user_title + " - SPXW at " + target_name + "\n\n"
+    "--- SPX ---\n"
+    "Entry: " + safe_f1(pnl["spx_entry"]) + "\n"
+    "Now:   " + safe_f1(pnl["spx_now"]) + "\n"
+    "Move:  " + "{:+.1f}".format(pnl["spx_move"]) + " pts\n\n"
+    "--- Contract Estimate ---\n"
+    "Delta gain:  " + "{:+.0f}".format(pnl["delta_pnl"]) + "$\n"
+    "  (SPX " + "{:+.1f}".format(pnl["spx_move"]) + " x Delta " + "{:.2f}".format(pnl["delta"]) + " x 100)\n\n"
+    "Theta loss:  -" + "{:.0f}".format(pnl["theta_loss"]) + "$\n"
+    "  (Theta " + "{:.3f}".format(abs(pnl["theta"] or 0)) + " x " + "{:.1f}".format(pnl["hours"]) + "h)\n\n"
+    "========================\n"
+    + status + " Net estimate: " + sign + "{:.0f}".format(pnl["net_pnl"]) + "$ (" + sign + "{:.1f}".format(pnl["pct"]) + "%)\n"
+    "Original cost: $" + "{:.0f}".format(pnl["cost_usd"]) + "\n"
+    "========================\n\n"
+    "Note: estimate only - actual price may differ.\n"
+    "Decision is yours."
+)
+```
 
 def spxw_on_stop_hit(spx_price_at_stop):
-    if not WEBULL_AVAILABLE:
-        return
-    if SPXW_STATE.active_delta is None:
-        return
+if not WEBULL_AVAILABLE:
+return
+if SPXW_STATE.active_delta is None:
+return
 
-    pnl = _estimate_contract_pnl(spx_price_at_stop)
+```
+pnl = _estimate_contract_pnl(spx_price_at_stop)
 
-    if pnl["available"]:
-        send_telegram(
-            CFG.user_title + " - SPXW Stop Hit\n\n"
-            "--- SPX ---\n"
-            "Entry: " + safe_f1(pnl["spx_entry"]) + "\n"
-            "Stop:  " + safe_f1(pnl["spx_now"]) + "\n"
-            "Move:  " + "{:+.1f}".format(pnl["spx_move"]) + " pts\n\n"
-            "--- Contract Estimate ---\n"
-            "Delta P&L:   " + "{:+.0f}".format(pnl["delta_pnl"]) + "$\n"
-            "Theta loss:  -" + "{:.0f}".format(pnl["theta_loss"]) + "$\n\n"
-            "========================\n"
-            "[-] Net estimate: " + "{:+.0f}".format(pnl["net_pnl"]) + "$ (" + "{:+.1f}".format(pnl["pct"]) + "%)\n"
-            "Original cost: $" + "{:.0f}".format(pnl["cost_usd"]) + "\n"
-            "========================\n\n"
-            "Close contract manually in Webull if not done.\n"
-            "Note: estimate only - actual price may differ."
-        )
+if pnl["available"]:
+    send_telegram(
+        CFG.user_title + " - SPXW Stop Hit\n\n"
+        "--- SPX ---\n"
+        "Entry: " + safe_f1(pnl["spx_entry"]) + "\n"
+        "Stop:  " + safe_f1(pnl["spx_now"]) + "\n"
+        "Move:  " + "{:+.1f}".format(pnl["spx_move"]) + " pts\n\n"
+        "--- Contract Estimate ---\n"
+        "Delta P&L:   " + "{:+.0f}".format(pnl["delta_pnl"]) + "$\n"
+        "Theta loss:  -" + "{:.0f}".format(pnl["theta_loss"]) + "$\n\n"
+        "========================\n"
+        "[-] Net estimate: " + "{:+.0f}".format(pnl["net_pnl"]) + "$ (" + "{:+.1f}".format(pnl["pct"]) + "%)\n"
+        "Original cost: $" + "{:.0f}".format(pnl["cost_usd"]) + "\n"
+        "========================\n\n"
+        "Close contract manually in Webull if not done.\n"
+        "Note: estimate only - actual price may differ."
+    )
 
-    SPXW_STATE.clear_contract_data()
-
+SPXW_STATE.clear_contract_data()
+```
 
 # =========================
+
 # Main entry points
+
 # =========================
 
 def spxw_evaluate_and_report(direction, plan, score, conf, current_price):
-    if not WEBULL_AVAILABLE:
-        return
-    if not _spxw_ensure():
-        send_telegram(
-            CFG.user_title + " - SPXW\n"
-            "No Webull session - send /wb_login"
-        )
-        return
+if not WEBULL_AVAILABLE:
+return
+if not _spxw_ensure():
+send_telegram(
+CFG.user_title + “ - SPXW\n”
+“No Webull session - send /wb_login”
+)
+return
 
-    hours = _hours_to_close()
-    if hours <= 0:
-        send_telegram(
-            CFG.user_title + " - SPXW 0DTE\n"
-            "Bot signal: " + direction + " | Score " + str(score) + "/6\n"
-            "Market closed - no 0DTE contracts available."
-        )
-        return
-
-    trade_type = plan.get("trade_type", "Standard")
-    result     = None
-
-    for attempt in range(SPXW_CFG.retry_attempts):
-        try:
-            result = _fetch_and_evaluate(direction, trade_type)
-            if result:
-                break
-        except Exception as e:
-            print("[WARN] SPXW eval attempt " + str(attempt + 1) + ": " + repr(e))
-            time.sleep(SPXW_CFG.retry_sleep)
-
-    if result is None:
-        send_telegram(
-            CFG.user_title + " - SPXW 0DTE\n"
-            "Bot signal: " + direction + " | Score " + str(score) + "/6\n"
-            "No contract found within budget $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + ".\n"
-            "Check chain manually in Webull."
-        )
-        return
-
-    chosen = result["chosen"]
-    SPXW_STATE.save_contract_data(
-        delta=chosen["delta"],
-        theta=chosen["theta"],
-        spx_entry=current_price,
-        cost_usd=chosen["cost_usd"],
+```
+hours = _hours_to_close()
+if hours <= 0:
+    send_telegram(
+        CFG.user_title + " - SPXW 0DTE\n"
+        "Bot signal: " + direction + " | Score " + str(score) + "/6\n"
+        "Market closed - no 0DTE contracts available."
     )
+    return
 
-    send_telegram(_report_msg(result, direction, plan, score, conf))
+trade_type = plan.get("trade_type", "Standard")
+result     = None
 
+for attempt in range(SPXW_CFG.retry_attempts):
+    try:
+        result = _fetch_and_evaluate(direction, trade_type)
+        if result:
+            break
+    except Exception as e:
+        print("[WARN] SPXW eval attempt " + str(attempt + 1) + ": " + repr(e))
+        time.sleep(SPXW_CFG.retry_sleep)
+
+if result is None:
+    send_telegram(
+        CFG.user_title + " - SPXW 0DTE\n"
+        "Bot signal: " + direction + " | Score " + str(score) + "/6\n"
+        "No contract found within budget $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + ".\n"
+        "Check chain manually in Webull."
+    )
+    return
+
+chosen = result["chosen"]
+SPXW_STATE.save_contract_data(
+    delta=chosen["delta"],
+    theta=chosen["theta"],
+    spx_entry=current_price,
+    cost_usd=chosen["cost_usd"],
+)
+
+send_telegram(_report_msg(result, direction, plan, score, conf))
+```
 
 # =========================
+
 # Command Handler
+
 # =========================
 
 class _SPXWHandler:
-    def __init__(self):
-        self._offset  = 0
-        self._running = False
+def **init**(self):
+self._offset  = 0
+self._running = False
 
-    def start(self):
-        self._running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+```
+def start(self):
+    self._running = True
+    threading.Thread(target=self._loop, daemon=True).start()
 
-    def _get_updates(self):
+def _get_updates(self):
+    try:
+        r = requests.get(
+            "https://api.telegram.org/bot" + CFG.telegram_bot_token + "/getUpdates",
+            params={"offset": self._offset, "timeout": 20,
+                    "allowed_updates": ["message"]},
+            timeout=30,
+        )
+        if r.ok:
+            return r.json().get("result", [])
+    except Exception:
+        pass
+    return []
+
+def _reply(self, chat_id, text):
+    try:
+        requests.post(
+            "https://api.telegram.org/bot" + CFG.telegram_bot_token + "/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+def _loop(self):
+    while self._running:
         try:
-            r = requests.get(
-                "https://api.telegram.org/bot" + CFG.telegram_bot_token + "/getUpdates",
-                params={"offset": self._offset, "timeout": 20,
-                        "allowed_updates": ["message"]},
-                timeout=30,
-            )
-            if r.ok:
-                return r.json().get("result", [])
-        except Exception:
-            pass
-        return []
+            for upd in self._get_updates():
+                self._offset = upd["update_id"] + 1
+                msg     = upd.get("message", {})
+                text    = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
 
-    def _reply(self, chat_id, text):
-        try:
-            requests.post(
-                "https://api.telegram.org/bot" + CFG.telegram_bot_token + "/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=10,
-            )
-        except Exception:
-            pass
+                if chat_id != str(CFG.telegram_chat_id) or not text:
+                    continue
 
-    def _loop(self):
-        while self._running:
-            try:
-                for upd in self._get_updates():
-                    self._offset = upd["update_id"] + 1
-                    msg     = upd.get("message", {})
-                    text    = msg.get("text", "").strip()
-                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                cmd = text.lower().split()[0]
 
-                    if chat_id != str(CFG.telegram_chat_id) or not text:
-                        continue
+                if cmd == "/wb_login":
+                    self._reply(chat_id, CFG.user_title + " - SPXW: logging in...")
+                    threading.Thread(target=spxw_login,
+                                     kwargs={"from_command": True},
+                                     daemon=True).start()
 
-                    cmd = text.lower().split()[0]
+                elif cmd == "/wb_status":
+                    hrs = _hours_to_close()
+                    if SPXW_STATE.active_delta is not None:
+                        contract_str = ("Delta " + "{:.2f}".format(SPXW_STATE.active_delta)
+                                        + " | Theta " + "{:.3f}".format(SPXW_STATE.active_theta or 0))
+                    else:
+                        contract_str = "No active contract"
+                    self._reply(chat_id,
+                        CFG.user_title + " - SPXW Status\n"
+                        "Webull: " + ("Connected" if SPXW_STATE.logged_in else "Disconnected") + "\n"
+                        "Time remaining: " + "{:.1f}".format(hrs) + "h\n"
+                        "Market: " + STATE.market_label + " | ADX: " + safe_f1(STATE.market_adx) + "\n"
+                        "Budget: $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + "\n"
+                        "Contract: " + contract_str
+                    )
 
-                    if cmd == "/wb_login":
-                        self._reply(chat_id, CFG.user_title + " - SPXW: logging in...")
-                        threading.Thread(target=spxw_login,
-                                         kwargs={"from_command": True},
-                                         daemon=True).start()
+                elif SPXW_STATE.otp_waiting:
+                    SPXW_STATE.deliver_otp(text)
+                    self._reply(chat_id, "Code received.")
 
-                    elif cmd == "/wb_status":
-                        hrs = _hours_to_close()
-                        if SPXW_STATE.active_delta is not None:
-                            contract_str = ("Delta " + "{:.2f}".format(SPXW_STATE.active_delta)
-                                            + " | Theta " + "{:.3f}".format(SPXW_STATE.active_theta or 0))
-                        else:
-                            contract_str = "No active contract"
-                        self._reply(chat_id,
-                            CFG.user_title + " - SPXW Status\n"
-                            "Webull: " + ("Connected" if SPXW_STATE.logged_in else "Disconnected") + "\n"
-                            "Time remaining: " + "{:.1f}".format(hrs) + "h\n"
-                            "Market: " + STATE.market_label + " | ADX: " + safe_f1(STATE.market_adx) + "\n"
-                            "Budget: $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + "\n"
-                            "Contract: " + contract_str
-                        )
-
-                    elif SPXW_STATE.otp_waiting:
-                        SPXW_STATE.deliver_otp(text)
-                        self._reply(chat_id, "Code received.")
-
-                time.sleep(1)
-            except Exception as e:
-                print("[WARN] SPXWHandler: " + repr(e))
-                time.sleep(5)
-
+            time.sleep(1)
+        except Exception as e:
+            print("[WARN] SPXWHandler: " + repr(e))
+            time.sleep(5)
+```
 
 _HANDLER = _SPXWHandler()
 
-
 def spxw_evaluator_start():
-    if not WEBULL_AVAILABLE:
-        print("[WARN] SPXW: pip install webull")
-        return
-    if not SPXW_CFG.username:
-        print("[WARN] SPXW: WB_USERNAME not set")
-        return
+if not WEBULL_AVAILABLE:
+print(”[WARN] SPXW: pip install webull”)
+return
+if not SPXW_CFG.username:
+print(”[WARN] SPXW: WB_USERNAME not set”)
+return
 
-    _HANDLER.start()
-    success = spxw_login(from_command=False)
-    hrs     = _hours_to_close()
-    hrs_txt = "{:.1f}h".format(hrs) if hrs > 0 else "Market closed"
+```
+_HANDLER.start()
+success = spxw_login(from_command=False)
+hrs     = _hours_to_close()
+hrs_txt = "{:.1f}h".format(hrs) if hrs > 0 else "Market closed"
 
-    if success:
-        _send_direct(
-            CFG.user_title + " - SPXW Evaluator Ready\n\n"
-            "Connected to Webull\n"
-            "Mode: evaluate + Delta/Theta tracking\n"
-            "Time: " + hrs_txt + "\n"
-            "Budget: $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + "\n\n"
-            "Commands:\n"
-            "  /wb_login  -> re-login\n"
-            "  /wb_status -> connection status\n\n"
-            "Read-only mode (no PIN required)"
-        )
-    else:
-        _send_direct(
-            CFG.user_title + " - SPXW\n"
-            "Connection failed - bot running normally.\n"
-            "Send /wb_login to retry."
-        )
-
+if success:
+    _send_direct(
+        CFG.user_title + " - SPXW Evaluator Ready\n\n"
+        "Connected to Webull\n"
+        "Mode: evaluate + Delta/Theta tracking\n"
+        "Time: " + hrs_txt + "\n"
+        "Budget: $" + "{:.0f}".format(SPXW_CFG.budget_min) + "-$" + "{:.0f}".format(SPXW_CFG.budget_max) + "\n\n"
+        "Commands:\n"
+        "  /wb_login  -> re-login\n"
+        "  /wb_status -> connection status\n\n"
+        "Read-only mode (no PIN required)"
+    )
+else:
+    _send_direct(
+        CFG.user_title + " - SPXW\n"
+        "Connection failed - bot running normally.\n"
+        "Send /wb_login to retry."
+    )
+```
 
 # =========================
+
 # Entry point
+
 # =========================
 
-if __name__ == "__main__":
-    main()
+if **name** == “**main**”:
+main()
 
 # === END PART 4 ===
