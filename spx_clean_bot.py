@@ -31,10 +31,10 @@ ZoneInfo = None
 
 @dataclass
 class Config:
-tv_symbol:    str = “SPX500”
-tv_exchange:  str = “FOREXCOM”
-tv_username:  str = os.getenv(“TV_USERNAME”, “”)
-tv_password:  str = os.getenv(“TV_PASSWORD”, “”)
+tv_symbol:    str = "SPX500"
+tv_exchange:  str = "FOREXCOM"
+tv_username:  str = os.getenv("TV_USERNAME", "")
+tv_password:  str = os.getenv(“TV_PASSWORD”, "")
 
 ```
 telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
