@@ -223,7 +223,7 @@ return "Market"
 return "After-Hours"
 
 def is_offhours(session):
-return session in (“After-Hours”, “Pre-Market”)
+return session in ("After-Hours", "Pre-Market")
 
 # =========================
 
