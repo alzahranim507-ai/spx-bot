@@ -249,11 +249,11 @@ if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
 return
 try:
 requests.post(
-“https://api.telegram.org/bot” + CFG.telegram_bot_token + "/sendMessage",
+"https://api.telegram.org/bot" + CFG.telegram_bot_token + "/sendMessage",
 json={
-“chat_id”: CFG.telegram_chat_id,
-“text”: text,
-“disable_web_page_preview”: True,
+"chat_id": CFG.telegram_chat_id,
+"text": text,
+"disable_web_page_preview": True,
 },
 timeout=15,
 )
@@ -265,16 +265,16 @@ t = now_riyadh()
 ts = t.strftime(”%Y-%m-%d %H:%M”)
 if entering:
 text = (
-CFG.user_title + “ - Weekend Mode ON\n”
-+ ts + “ (Riyadh)\n\n”
-+ “Bot paused until Monday 01:00 Riyadh time.\n”
-+ “No signals during this period.”
+CFG.user_title + " - Weekend Mode ON\n"
++ ts + " (Riyadh)\n\n"
++ "Bot paused until Monday 01:00 Riyadh time.\n"
++ "No signals during this period."
 )
 else:
 text = (
-CFG.user_title + “ - Back to Work\n”
-+ ts + “ (Riyadh)\n\n”
-+ “Bot resuming analysis and signals.”
+CFG.user_title + " - Back to Work\n"
++ ts + " (Riyadh)\n\n"
++ "Bot resuming analysis and signals."
 )
 _send_direct(text)
 
@@ -284,25 +284,25 @@ _send_direct(text)
 
 # =========================
 
-def safe_f1(x, default=“N/A”):
+def safe_f1(x, default="N/A"):
 try:
 if x is None:
 return default
 v = float(x)
 if not np.isfinite(v):
 return default
-return “{:.1f}”.format(v)
+return "{:.1f}".format(v)
 except Exception:
 return default
 
-def safe_f2(x, default=“N/A”):
+def safe_f2(x, default="N/A"):
 try:
 if x is None:
 return default
 v = float(x)
 if not np.isfinite(v):
 return default
-return “{:.2f}”.format(v)
+return "{:.2f}".format(v)
 except Exception:
 return default
 
@@ -315,9 +315,9 @@ return default
 def level_bucket_x(level):
 try:
 b = int(float(level) // 10) * 10
-return str(b) + “x”
+return str(b) + "x"
 except Exception:
-return “N/A”
+return "N/A"
 
 # =========================
 
@@ -327,7 +327,7 @@ return “N/A”
 
 def send_telegram(text):
 if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
-print(”[WARN] Telegram not configured”)
+print("[WARN] Telegram not configured")
 return
 
 ```
@@ -411,27 +411,27 @@ winrate        = (wins / total * 100.0) if total > 0 else 0.0
 best_trade  = max(records, key=lambda r: r.r_result, default=None)
 worst_trade = min(records, key=lambda r: r.r_result, default=None)
 return {
-“total”: total, “wins”: wins, “losses”: losses, “breakeven”: breakeven,
-“net_r”: net_r, “winrate”: winrate,
-“t1_only”: t1_only, “t2_hit”: t2_hit, “t3_hit”: t3_hit, “t4_plus”: t4_plus,
-“range_count”: range_count, “trending_count”: trending_count,
-“messy_count”: messy_count, “weak_count”: weak_count,
-“best_trade”: best_trade, “worst_trade”: worst_trade,
+"total": total, "wins": wins, "losses": losses, "breakeven": breakeven,
+"net_r": net_r, "winrate": winrate,
+"t1_only": t1_only, "t2_hit": t2_hit, "t3_hit": t3_hit, "t4_plus": t4_plus,
+"range_count": range_count, "trending_count": trending_count,
+"messy_count": messy_count, "weak_count": weak_count,
+"best_trade": best_trade, "worst_trade": worst_trade,
 }
 
 def daily_stats_message(summary, target_date):
-best_txt  = “N/A”
-worst_txt = “N/A”
-if summary[“best_trade”]:
-bt = summary[“best_trade”]
-best_txt = bt.direction + “ | “ + bt.result_label + “ | “ + “{:+.2f}”.format(bt.r_result) + “R”
-if summary[“worst_trade”]:
-wt = summary[“worst_trade”]
-worst_txt = wt.direction + “ | “ + wt.result_label + “ | “ + “{:+.2f}”.format(wt.r_result) + “R”
+best_txt  = "N/A"
+worst_txt = "N/A"
+if summary["best_trade"]:
+bt = summary["best_trade"]
+best_txt = bt.direction + " | " + bt.result_label + " | " + "{:+.2f}".format(bt.r_result) + "R"
+if summary["worst_trade"]:
+wt = summary["worst_trade"]
+worst_txt = wt.direction + " | " + wt.result_label + " | " + "{:+.2f}".format(wt.r_result) + "R"
 return (
-CFG.user_title + “ - Daily Stats\n”
-“Date: “ + target_date.isoformat() + “ (Riyadh)\n\n”
-“Total: “ + str(summary[“total”]) + “\n”
+CFG.user_title + " - Daily Stats\n"
+"Date: " + target_date.isoformat() + " (Riyadh)\n\n"
+"Total: " + str(summary["total"]) + "\n"
 “Wins: “ + str(summary[“wins”]) + “ | Losses: “ + str(summary[“losses”]) + “ | BE: “ + str(summary[“breakeven”]) + “\n”
 “Win Rate: “ + “{:.1f}”.format(summary[“winrate”]) + “%\n”
 “Net: “ + “{:+.2f}”.format(summary[“net_r”]) + “R\n\n”
