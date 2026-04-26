@@ -1,2 +1,2 @@
-worker: python spx_clean_bot.py
+worker: python spx_bot_full.py
 
