@@ -197,9 +197,9 @@ LAST_GOOD_DATA = {}
 
 def tzinfo(name):
 if ZoneInfo is None:
-if name == “Asia/Riyadh”:
+if name == "Asia/Riyadh":
 return timezone(timedelta(hours=3))
-if name == “America/New_York”:
+if name == "America/New_York":
 return timezone(timedelta(hours=-5))
 return timezone.utc
 return ZoneInfo(name)
@@ -217,10 +217,10 @@ def session_label():
 t  = now_ny()
 hm = t.hour * 60 + t.minute
 if 4 * 60 <= hm < 9 * 60 + 30:
-return “Pre-Market”
+return "Pre-Market"
 if 9 * 60 + 30 <= hm < 16 * 60:
-return “Market”
-return “After-Hours”
+return "Market"
+return "After-Hours"
 
 def is_offhours(session):
 return session in (“After-Hours”, “Pre-Market”)
