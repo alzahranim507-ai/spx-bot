@@ -249,7 +249,7 @@ if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
 return
 try:
 requests.post(
-“https://api.telegram.org/bot” + CFG.telegram_bot_token + “/sendMessage”,
+“https://api.telegram.org/bot” + CFG.telegram_bot_token + "/sendMessage",
 json={
 “chat_id”: CFG.telegram_chat_id,
 “text”: text,
