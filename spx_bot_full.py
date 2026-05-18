@@ -1524,16 +1524,37 @@ def detect_weakening_or_reversal_watch(df_5m, direction):
         if c > pc and l >= pl:
             return True, "sell follow-through weakening"
     return False, "no weakness"
-def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price):
+def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price,
+                             manual=False, notify_skip=False):
     tr = STATE.active_trade
     if tr is None or tr.get("status") != "live":
-        return
+        return False, "no live trade"
     direction    = tr["direction"]
     used_targets = [x for x in tr.get("all_target_prices", []) if x is not None]
     exp_move_val = expected_move_1h(df_1h)
     levels       = extract_key_levels(df_15m, df_1h)
+    override_notes = []
+    if manual:
+        dynamic_targets = tr.get("dynamic_targets", {})
+        if dynamic_targets:
+            highest_defined = max(int(k.replace("T", "")) for k in dynamic_targets.keys())
+            max_hit_idx = current_max_target_hit(tr)
+            if max_hit_idx < highest_defined:
+                reason = "يوجد هدف حالي غير محقق: T" + str(highest_defined)
+                if notify_skip:
+                    send_telegram(CFG.user_title + " - Target Refresh\n" + reason)
+                return False, reason
     if CFG.extension_momentum_required and not dynamic_extension_allowed(df_5m, direction):
-        return
+        if not manual:
+            reason = "momentum not strong enough for extension"
+            tr["last_extension_skip_reason"] = reason
+            if notify_skip:
+                send_telegram(
+                    CFG.user_title + " - Target Extension Skipped\n"
+                    "Reason: " + reason
+                )
+            return False, reason
+        override_notes.append("manual override: momentum weak")
     next_idx   = int(tr.get("next_target_idx_to_define", 4))
     if next_idx < 3:
         next_idx = 3
@@ -1544,14 +1565,31 @@ def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price):
         used_targets=used_targets, stage=stage_name,
     )
     if candidate is None:
-        return
-    ok, _ = target_behavior_check(
+        reason = "no valid next target found"
+        tr["last_extension_skip_reason"] = reason
+        if notify_skip:
+            send_telegram(
+                CFG.user_title + " - Target Extension Skipped\n"
+                "Reason: " + reason
+            )
+        return False, reason
+    ok, behavior_reason = target_behavior_check(
         df_5m=df_5m, direction=direction,
         market_label=STATE.market_label, exp_move_val=exp_move_val,
         current_price=last_price, candidate_target=candidate,
     )
     if not ok:
-        return
+        if not manual:
+            reason = behavior_reason
+            tr["last_extension_skip_reason"] = reason
+            if notify_skip:
+                send_telegram(
+                    CFG.user_title + " - Target Extension Skipped\n"
+                    "Candidate: " + safe_f1(candidate) + "\n"
+                    "Reason: " + reason
+                )
+            return False, reason
+        override_notes.append("manual override: " + behavior_reason)
     liq_state_val = liquidity_state(df_5m)[0]
     prob = probability_for_extension_target(
         df_5m=df_5m, direction=direction,
@@ -1564,7 +1602,17 @@ def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price):
     )
     min_prob = max(35, CFG.target_probability_min_to_extend - (next_idx - 3) * 3)
     if prob < min_prob:
-        return
+        if not manual:
+            reason = "probability low (" + str(prob) + "% < " + str(min_prob) + "%)"
+            tr["last_extension_skip_reason"] = reason
+            if notify_skip:
+                send_telegram(
+                    CFG.user_title + " - Target Extension Skipped\n"
+                    "Candidate: " + safe_f1(candidate) + "\n"
+                    "Reason: " + reason
+                )
+            return False, reason
+        override_notes.append("manual override: probability low " + str(prob) + "%")
     zone = classify_target_zone(next_idx, prob)
     tr["dynamic_targets"][stage_name] = {
         "price": float(candidate), "prob": int(prob),
@@ -1588,9 +1636,11 @@ def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price):
         "Probability: " + str(prob) + "%\n"
         "Zone: " + zone + "\n"
         "Stop: " + safe_f1(tr["stop"])
+        + (("\nNotes: " + " | ".join(override_notes)) if override_notes else "")
     )
     if prob >= 65 and dynamic_extension_allowed(df_5m, direction):
         maybe_extend_next_target(df_5m, df_15m, df_1h, last_price)
+    return True, stage_name + " created"
 # =========================
 # Trade result recording
 # =========================
@@ -1690,6 +1740,8 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
     tr = STATE.active_trade
     if tr is None:
         return
+    tr["last_price"]         = float(last_price)
+    tr["last_update_riyadh"] = now_riyadh().strftime("%Y-%m-%d %H:%M")
     direction = tr["direction"]
     entry     = float(tr["entry"])
     stop      = float(tr["stop"])
@@ -1797,7 +1849,8 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
         # Extend next target
         highest_defined = max(int(k.replace("T", "")) for k in dynamic_targets.keys())
         if idx >= highest_defined:
-            maybe_extend_next_target(df_5m, df_15m, df_1h, last_price)
+            maybe_extend_next_target(df_5m, df_15m, df_1h, last_price,
+                                     notify_skip=True)
     # --- Weakness Exit ---
     max_hit_idx = current_max_target_hit(tr)
     if max_hit_idx >= 2:
@@ -1903,8 +1956,13 @@ import queue
 from pathlib import Path
 try:
     from webull import paper_webull
+    try:
+        from webull import webull as live_webull
+    except ImportError:
+        live_webull = None
     WEBULL_AVAILABLE = True
 except ImportError:
+    live_webull = None
     WEBULL_AVAILABLE = False
     print("[WARN] pip install webull")
 # =========================
@@ -2124,6 +2182,8 @@ def evaluate_once():
         "t4": None,
         "status":       "pending",
         "created_utc":  datetime.utcnow(),
+        "last_price":   float(level_now),
+        "last_update_riyadh": now_riyadh().strftime("%Y-%m-%d %H:%M"),
         "trade_type":   trade_type,
         "market_label_at_entry": STATE.market_label,
         "session_at_entry":      session,
@@ -2146,9 +2206,13 @@ def main():
         "- Targets: Unlimited (auto-extend after T4)\n"
         "- Pending cancel: at stop level\n"
         "- Weekend blackout: Sat 01:00 -> Mon 01:00\n"
-        "- SPXW Evaluator: ON (Delta + Theta tracking)\n"
+        "- SPXW Evaluator: " + ("ON (Delta + Theta tracking)" if SPXW_CFG.enabled else "OFF") + "\n" +
         "- Stats: Daily + Weekly"
     )
+    try:
+        _HANDLER.start()
+    except Exception as e:
+        print("[WARN] Telegram command handler failed: " + repr(e))
     try:
         spxw_evaluator_start()
     except Exception as e:
@@ -2186,16 +2250,30 @@ def main():
 # =========================
 @dataclass
 class SPXWConfig:
+    enabled:        bool  = os.getenv("SPXW_EVALUATOR_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+    client_mode:    str   = os.getenv("WB_CLIENT_MODE", "paper").strip().lower()
     username:       str   = os.getenv("WB_USERNAME",       "")
     password:       str   = os.getenv("WB_PASSWORD",       "")
     session_secret: str   = os.getenv("WB_SESSION_SECRET", "change_this_secret")
     budget_max:     float = float(os.getenv("WB_BUDGET_MAX", "300"))
     budget_min:     float = float(os.getenv("WB_BUDGET_MIN", "50"))
     symbol:         str   = "SPXW"
-    session_path:   str   = str(Path.home() / ".wb_spxw" / "session.enc")
-    retry_attempts: int   = 3
+    session_path:   str   = os.getenv("WB_SESSION_PATH", str(Path.home() / ".wb_spxw" / "session.enc"))
+    device_name:    str   = os.getenv("WB_DEVICE_NAME", "SPXWBotRailway")
+    retry_attempts: int   = int(os.getenv("WB_RETRY_ATTEMPTS", "3"))
     retry_sleep:    float = 2.0
 SPXW_CFG = SPXWConfig()
+
+def _is_json_decode_error(err):
+    return isinstance(err, json.JSONDecodeError) or err.__class__.__name__ == "JSONDecodeError"
+
+def _make_wb_client():
+    if SPXW_CFG.client_mode == "live":
+        if live_webull is None:
+            raise RuntimeError("WB_CLIENT_MODE=live was requested, but this webull package has no live webull client")
+        return live_webull()
+    return paper_webull()
+
 class SPXWState:
     def __init__(self):
         self.client        = None
@@ -2267,13 +2345,17 @@ def _load_wb_session():
 # Login
 # =========================
 def spxw_login(from_command=False):
+    if not SPXW_CFG.enabled:
+        print("[INFO] SPXW: evaluator disabled by SPXW_EVALUATOR_ENABLED")
+        return False
     if not WEBULL_AVAILABLE:
         return False
     if not SPXW_CFG.username or not SPXW_CFG.password:
+        print("[WARN] SPXW: WB_USERNAME or WB_PASSWORD is missing")
         return False
     with SPXW_STATE._lock:
         try:
-            wb = paper_webull()
+            wb = _make_wb_client()
             if not from_command:
                 sess = _load_wb_session()
                 if sess:
@@ -2290,12 +2372,22 @@ def spxw_login(from_command=False):
                             return True
                     except Exception:
                         pass
-            result = wb.login(
-                username=SPXW_CFG.username,
-                password=SPXW_CFG.password,
-                device_name="SPXWBot",
-                save_token=True,
-            )
+            result = None
+            for attempt in range(SPXW_CFG.retry_attempts):
+                try:
+                    print("[INFO] SPXW: Webull login attempt " + str(attempt + 1) + "/" + str(SPXW_CFG.retry_attempts))
+                    result = wb.login(
+                        username=SPXW_CFG.username,
+                        password=SPXW_CFG.password,
+                        device_name=SPXW_CFG.device_name,
+                        save_token=True,
+                    )
+                    break
+                except Exception as e:
+                    if attempt >= SPXW_CFG.retry_attempts - 1:
+                        raise
+                    print("[WARN] SPXW login retry: " + repr(e))
+                    time.sleep(SPXW_CFG.retry_sleep * (attempt + 1))
             if isinstance(result, dict) and result.get("uuid"):
                 SPXW_STATE.otp_waiting = True
                 _send_direct(
@@ -2320,7 +2412,21 @@ def spxw_login(from_command=False):
             _send_direct(CFG.user_title + " - SPXW connected. Session saved.")
             return True
         except Exception as e:
-            print("[ERROR] spxw_login: " + repr(e))
+            if _is_json_decode_error(e):
+                print(
+                    "[ERROR] spxw_login: Webull returned an empty/non-JSON response. "
+                    "This usually means the cloud login was blocked, credentials are wrong, "
+                    "MFA/captcha is required, or the installed webull package is incompatible. "
+                    "Set SPXW_EVALUATOR_ENABLED=false to run the bot without Webull. "
+                    "Details: " + repr(e)
+                )
+                _send_direct(
+                    CFG.user_title + " - SPXW login failed\n"
+                    "Webull returned an empty/non-JSON response.\n"
+                    "Bot will continue without SPXW evaluator."
+                )
+            else:
+                print("[ERROR] spxw_login: " + repr(e))
             SPXW_STATE.logged_in = False
             return False
 def _spxw_ensure():
@@ -2767,7 +2873,7 @@ def spxw_on_stop_hit(spx_price_at_stop):
 # Main entry points
 # =========================
 def spxw_evaluate_and_report(direction, plan, score, conf, current_price):
-    if not WEBULL_AVAILABLE:
+    if not SPXW_CFG.enabled or not WEBULL_AVAILABLE:
         return
     if not _spxw_ensure():
         send_telegram(
@@ -2810,13 +2916,321 @@ def spxw_evaluate_and_report(direction, plan, score, conf, current_price):
     )
     send_telegram(_report_msg(result, direction, plan, score, conf))
 # =========================
+# Command helpers
+# =========================
+_SCAN_LOCK = threading.Lock()
+
+def normalize_number_text(text):
+    trans = str.maketrans({
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+        "٫": ".", "٬": "", ",": "",
+    })
+    return str(text).translate(trans).strip()
+
+def parse_price_arg(arg):
+    if arg is None:
+        return None
+    raw = normalize_number_text(str(arg).split()[0])
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+def active_trade_status_message():
+    tr = STATE.active_trade
+    if tr is None:
+        return (
+            CFG.user_title + " - حالة الصفقة\n"
+            "لا توجد صفقة نشطة الآن.\n"
+            "استخدم /scan للبحث اليدوي عن فرصة."
+        )
+    max_hit = current_max_target_hit(tr)
+    status_map = {"pending": "معلقة", "live": "مفعلة"}
+    status = status_map.get(tr.get("status"), str(tr.get("status", "Unknown")))
+    msg = (
+        CFG.user_title + " - حالة الصفقة\n\n"
+        "الحالة: " + status + "\n"
+        "الاتجاه: " + str(tr.get("direction", "N/A")) + "\n"
+        "الدخول: " + safe_f1(tr.get("entry")) + "\n"
+        "السعر الأخير: " + safe_f1(tr.get("last_price")) + "\n"
+        "الوقف الحالي: " + safe_f1(tr.get("stop")) + "\n"
+        "آخر هدف تحقق: " + ("T" + str(max_hit) if max_hit > 0 else "لم يتحقق هدف بعد") + "\n"
+        "آخر تحديث: " + str(tr.get("last_update_riyadh", "N/A")) + " (Riyadh)\n\n"
+        "الأهداف:\n" + format_target_map_for_message(tr.get("target_map", []))
+    )
+    skip = tr.get("last_extension_skip_reason")
+    if skip:
+        msg += "\n\nآخر سبب لتعذر هدف جديد:\n" + str(skip)
+    return msg
+
+def update_manual_stop_from_command(text):
+    tr = STATE.active_trade
+    if tr is None:
+        return CFG.user_title + " - Stop Update\nلا توجد صفقة نشطة لتعديل الوقف."
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return (
+            CFG.user_title + " - Stop Update\n"
+            "اكتب مستوى الوقف بعد الأمر.\n"
+            "مثال: /stop 6788.5"
+        )
+    new_stop = parse_price_arg(parts[1])
+    if new_stop is None:
+        return CFG.user_title + " - Stop Update\nلم أفهم الرقم. مثال صحيح: /stop 6788.5"
+    if new_stop < 1000:
+        return (
+            CFG.user_title + " - Stop Update\n"
+            "الرقم يبدو سعر عقد أوبشن وليس مستوى SPX.\n"
+            "اكتب مستوى المؤشر مثل: /stop 6788.5"
+        )
+    direction = tr.get("direction")
+    last_price = tr.get("last_price")
+    entry = float(tr.get("entry", 0))
+    ref_price = float(last_price) if last_price is not None else entry
+    if direction == "BUY" and new_stop >= ref_price:
+        return (
+            CFG.user_title + " - Stop Update Rejected\n"
+            "صفقة BUY تحتاج وقف تحت السعر الحالي.\n"
+            "السعر المرجعي: " + safe_f1(ref_price) + "\n"
+            "الوقف المطلوب: " + safe_f1(new_stop)
+        )
+    if direction == "SELL" and new_stop <= ref_price:
+        return (
+            CFG.user_title + " - Stop Update Rejected\n"
+            "صفقة SELL تحتاج وقف فوق السعر الحالي.\n"
+            "السعر المرجعي: " + safe_f1(ref_price) + "\n"
+            "الوقف المطلوب: " + safe_f1(new_stop)
+        )
+    old_stop = float(tr.get("stop", np.nan))
+    tr["stop"] = float(new_stop)
+    tr["manual_stop_updated_riyadh"] = now_riyadh().strftime("%Y-%m-%d %H:%M")
+    tr["stop_pending"] = False
+    tr.pop("stop_pending_since_utc", None)
+    return (
+        CFG.user_title + " - Stop Updated\n"
+        "Old: " + safe_f1(old_stop) + "\n"
+        "New: " + safe_f1(new_stop) + "\n"
+        "Direction: " + str(direction)
+    )
+
+def close_active_trade_manually(text):
+    tr = STATE.active_trade
+    if tr is None:
+        return CFG.user_title + " - Manual Close\nلا توجد صفقة نشطة لإغلاقها."
+    parts = text.split(maxsplit=1)
+    reason = parts[1].strip() if len(parts) > 1 else "manual command"
+    max_hit = current_max_target_hit(tr)
+    if max_hit > 0:
+        r_result, _, _ = compute_scored_result_from_targets(tr)
+    else:
+        r_result = 0.0
+    label = "Manual Close" + ((" @ T" + str(max_hit)) if max_hit > 0 else "")
+    record_closed_trade(label, max_hit, r_result)
+    direction = tr.get("direction", "N/A")
+    entry = tr.get("entry")
+    stop = tr.get("stop")
+    last_price = tr.get("last_price")
+    STATE.active_trade = None
+    try:
+        SPXW_STATE.clear_contract_data()
+    except Exception:
+        pass
+    return (
+        CFG.user_title + " - Trade Closed Manually\n"
+        "Direction: " + str(direction) + "\n"
+        "Entry: " + safe_f1(entry) + "\n"
+        "Last Price: " + safe_f1(last_price) + "\n"
+        "Stop: " + safe_f1(stop) + "\n"
+        "Highest Target Hit: " + ("T" + str(max_hit) if max_hit > 0 else "0") + "\n"
+        "Result: " + "{:+.2f}".format(float(r_result)) + "R\n"
+        "Reason: " + reason + "\n\n"
+        "تنبيه: هذا يغلق الصفقة داخل البوت فقط، ولا يبيع العقد في الوسيط."
+    )
+
+def manual_targets_refresh_message():
+    if STATE.active_trade is None:
+        return CFG.user_title + " - Target Refresh\nلا توجد صفقة نشطة لتحديث أهدافها."
+    if STATE.active_trade.get("status") != "live":
+        return CFG.user_title + " - Target Refresh\nالصفقة لم تتفعل بعد. لا يمكن تحديث الأهداف الآن."
+    try:
+        _, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
+        df_5m = compute_indicators_5m(df_5m)
+        last_price = float(df_5m["close"].iloc[-1])
+        maybe_update_market_state(df_1h, df_4h)
+        ok, reason = maybe_extend_next_target(
+            df_5m, df_15m, df_1h, last_price,
+            manual=True, notify_skip=False,
+        )
+        if ok:
+            return CFG.user_title + " - Target Refresh\nتم تحديث الأهداف.\n" + str(reason)
+        return CFG.user_title + " - Target Refresh\nلم أضف هدف جديد.\nالسبب: " + str(reason)
+    except Exception as e:
+        return CFG.user_title + " - Target Refresh Error\n" + repr(e)
+
+def command_help_message():
+    return (
+        CFG.user_title + " - أوامر البوت\n\n"
+        "/status - حالة الصفقة الحالية\n"
+        "/stop 6788.5 - تعديل وقف الصفقة على مستوى SPX\n"
+        "/close - إغلاق الصفقة داخل البوت يدويًا\n"
+        "/scan - بحث يدوي عن فرصة الآن\n"
+        "/daily_bias - تقرير تنفيذي عربي لحركة اليوم\n"
+        "/targets_refresh - محاولة تحديث الهدف التالي يدويًا\n"
+        "/wb_login - إعادة تسجيل Webull\n"
+        "/wb_status - حالة Webull"
+    )
+
+def _levels_around_price(levels, price):
+    supports = sorted([float(x) for x in levels if float(x) < price], reverse=True)[:3]
+    resistances = sorted([float(x) for x in levels if float(x) > price])[:3]
+    return supports, resistances
+
+def _fmt_short_levels(levels):
+    if not levels:
+        return "N/A"
+    return " / ".join(safe_f1(x) for x in levels)
+
+def _daily_view_text(market_label, bias, price, supports, resistances):
+    nearest_support = supports[0] if supports else None
+    nearest_resistance = resistances[0] if resistances else None
+    if market_label == "Trending" and bias == "Bullish":
+        return (
+            "السوق يميل للصعود والزخم العام داعم، لكن الأفضل انتظار رجوع السعر إلى منطقة دعم "
+            "بدل مطاردة الشمعة الممتدة."
+        )
+    if market_label == "Trending" and bias == "Bearish":
+        return (
+            "السوق يميل للهبوط والزخم العام ضاغط، والفرص الأفضل تكون مع الارتدادات الضعيفة "
+            "باتجاه مقاومة ثم رفض واضح."
+        )
+    if market_label == "Range":
+        return (
+            "السوق داخل نطاق، لذلك الأفضل التعامل معه كمناطق: شراء من الدعم مع تأكيد، "
+            "أو بيع من المقاومة مع رفض واضح، وتجنب منتصف النطاق."
+        )
+    if market_label == "Messy":
+        return (
+            "السوق غير نظيف حاليًا. لا توجد أفضلية قوية، لذلك الأولوية للحفاظ على رأس المال "
+            "وانتظار كسر واضح أو رفض قوي من مستوى مهم."
+        )
+    if bias == "Bullish":
+        return "الصورة تميل للصعود، لكن نحتاج تأكيد زخم قبل اعتماد دخول هجومي."
+    if bias == "Bearish":
+        return "الصورة تميل للهبوط، لكن نحتاج تأكيد كسر أو رفض قبل اعتماد دخول هجومي."
+    if nearest_support and nearest_resistance:
+        return (
+            "السعر بين دعم " + safe_f1(nearest_support) +
+            " ومقاومة " + safe_f1(nearest_resistance) +
+            ". الأفضل انتظار وصول السعر إلى أحد الطرفين."
+        )
+    return "الصورة غير كافية لاتجاه واضح. الانتظار أفضل من إجبار صفقة."
+
+def daily_bias_message():
+    symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
+    df_5m = compute_indicators_5m(df_5m)
+    price = float(df_5m["close"].iloc[-1])
+    label, market_dir, adx_val = compute_market_state(df_1h, df_4h, STATE.market_label)
+    STATE.market_label = label
+    STATE.market_dir = market_dir
+    STATE.market_adx = adx_val
+    STATE.market_state_last_calc_utc = datetime.utcnow()
+    bias = structure_bias(df_1h, df_4h)
+    levels = extract_key_levels(df_15m, df_1h)
+    supports, resistances = _levels_around_price(levels, price)
+    liq_state_val, liq_ratio = liquidity_state(df_5m)
+    exp_move_val = expected_move_1h(df_1h)
+    view = _daily_view_text(label, bias, price, supports, resistances)
+    adx_txt = safe_f1(adx_val)
+    exp_txt = safe_f1(exp_move_val) + " نقطة" if exp_move_val else "N/A"
+    liq_txt = liq_state_val
+    if liq_ratio is not None:
+        liq_txt += " (" + safe_f2(liq_ratio) + "x)"
+    primary = "محايد"
+    if bias == "Bullish" or market_dir == "Bullish":
+        primary = "صاعد بشرط الثبات فوق أقرب دعم"
+    elif bias == "Bearish" or market_dir == "Bearish":
+        primary = "هابط بشرط الفشل تحت أقرب مقاومة"
+    buy_line = "أفضل شراء يكون من دعم واضح مع شمعة تأكيد، وليس بعد اندفاع طويل."
+    sell_line = "أفضل بيع يكون من مقاومة واضحة مع رفض أو كسر مستوى مهم."
+    if supports:
+        buy_line = "إذا حافظ السعر على " + safe_f1(supports[0]) + " ففرص BUY من الرجوع تكون أفضل."
+    if resistances:
+        sell_line = "إذا رفض السعر " + safe_f1(resistances[0]) + " ففرصة SELL السريعة تصبح قابلة للمراقبة."
+    break_line = "إذا كسر أقرب دعم/مقاومة بإغلاق 5 دقائق، نغير السيناريو بدل العناد."
+    if supports:
+        break_line = "كسر " + safe_f1(supports[0]) + " بإغلاق 5 دقائق يضعف سيناريو الصعود."
+    if resistances and bias == "Bullish":
+        break_line = "اختراق " + safe_f1(resistances[0]) + " بإغلاق 5 دقائق يدعم استمرار الصعود."
+    ts = now_riyadh().strftime("%Y-%m-%d %H:%M")
+    return (
+        CFG.user_title + " - التقرير التنفيذي اليومي\n\n" +
+        "الوقت: " + ts + " (Riyadh)\n" +
+        "الرمز: " + symbol + "\n" +
+        "السعر الحالي: " + safe_f1(price) + "\n\n" +
+        "النظرة التنفيذية:\n" +
+        view + "\n\n" +
+        "وضع السوق:\n" +
+        "الحالة: " + label + "\n" +
+        "الاتجاه العام: " + market_dir + "\n" +
+        "Bias 1H/4H: " + bias + "\n" +
+        "ADX: " + adx_txt + "\n" +
+        "السيولة: " + liq_txt + "\n" +
+        "الحركة المتوقعة 1H: " + exp_txt + "\n\n" +
+        "الاتجاه الرئيسي:\n" +
+        primary + "\n\n" +
+        "المستويات المهمة:\n" +
+        "مقاومات: " + _fmt_short_levels(resistances) + "\n" +
+        "دعوم: " + _fmt_short_levels(supports) + "\n\n" +
+        "خطة اليوم:\n" +
+        "1. " + buy_line + "\n" +
+        "2. " + sell_line + "\n" +
+        "3. " + break_line + "\n\n" +
+        "ملاحظات المخاطر:\n" +
+        "لا تطارد الشموع الممتدة.\n" +
+        "تجنب الدخول في منتصف الرينج.\n" +
+        "لعقود 0DTE ركز على Delta بين 0.35 و0.55 وسبريد ضيق.\n\n" +
+        "الخلاصة التنفيذية:\n" +
+        "خل السعر يجي لمستواك. إذا الصورة غير نظيفة، الكاش قرار."
+    )
+
+def run_manual_scan(reply_fn):
+    if STATE.active_trade is not None:
+        reply_fn(
+            CFG.user_title + " - Manual Scan\n"
+            "يوجد صفقة نشطة حاليًا. لن أبحث عن صفقة جديدة فوقها.\n"
+            "استخدم /status لعرض الصفقة أو /close لإغلاقها داخل البوت."
+        )
+        return
+    if not _SCAN_LOCK.acquire(blocking=False):
+        reply_fn(CFG.user_title + " - Manual Scan\nيوجد بحث يدوي يعمل الآن.")
+        return
+    try:
+        reply_fn(CFG.user_title + " - Manual Scan\nبدأت البحث اليدوي الآن...")
+        evaluate_once()
+        if STATE.active_trade is None:
+            reply_fn(CFG.user_title + " - Manual Scan\nانتهى البحث: لا توجد فرصة مطابقة للشروط الآن.")
+        else:
+            reply_fn(CFG.user_title + " - Manual Scan\nتم العثور على فرصة وإرسالها.")
+    except Exception as e:
+        reply_fn(CFG.user_title + " - Manual Scan Error\n" + repr(e))
+    finally:
+        _SCAN_LOCK.release()
+
 # Command Handler
 # =========================
-class _SPXWHandler:
+class _TelegramCommandHandler:
     def __init__(self):
         self._offset  = 0
         self._running = False
     def start(self):
+        if self._running:
+            return
+        if not CFG.telegram_bot_token or not CFG.telegram_chat_id:
+            print("[WARN] Telegram command handler not configured")
+            return
         self._running = True
         threading.Thread(target=self._loop, daemon=True).start()
     def _get_updates(self):
@@ -2852,7 +3266,28 @@ class _SPXWHandler:
                     if chat_id != str(CFG.telegram_chat_id) or not text:
                         continue
                     cmd = text.lower().split()[0]
-                    if cmd == "/wb_login":
+                    if cmd in ("/help", "/commands"):
+                        self._reply(chat_id, command_help_message())
+                    elif cmd == "/status":
+                        self._reply(chat_id, active_trade_status_message())
+                    elif cmd == "/stop":
+                        self._reply(chat_id, update_manual_stop_from_command(text))
+                    elif cmd == "/close":
+                        self._reply(chat_id, close_active_trade_manually(text))
+                    elif cmd == "/targets_refresh":
+                        self._reply(chat_id, manual_targets_refresh_message())
+                    elif cmd == "/daily_bias":
+                        try:
+                            self._reply(chat_id, daily_bias_message())
+                        except Exception as e:
+                            self._reply(chat_id, CFG.user_title + " - Daily Bias Error\n" + repr(e))
+                    elif cmd == "/scan":
+                        threading.Thread(
+                            target=run_manual_scan,
+                            args=(lambda msg, cid=chat_id: self._reply(cid, msg),),
+                            daemon=True,
+                        ).start()
+                    elif cmd == "/wb_login":
                         self._reply(chat_id, CFG.user_title + " - SPXW: logging in...")
                         threading.Thread(target=spxw_login,
                                          kwargs={"from_command": True},
@@ -2877,10 +3312,13 @@ class _SPXWHandler:
                         self._reply(chat_id, "Code received.")
                 time.sleep(1)
             except Exception as e:
-                print("[WARN] SPXWHandler: " + repr(e))
+                print("[WARN] TelegramCommandHandler: " + repr(e))
                 time.sleep(5)
-_HANDLER = _SPXWHandler()
+_HANDLER = _TelegramCommandHandler()
 def spxw_evaluator_start():
+    if not SPXW_CFG.enabled:
+        print("[INFO] SPXW: evaluator disabled by SPXW_EVALUATOR_ENABLED")
+        return
     if not WEBULL_AVAILABLE:
         print("[WARN] SPXW: pip install webull")
         return
