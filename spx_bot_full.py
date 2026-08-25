@@ -124,6 +124,14 @@ class Config:
     stats_weekly_send_weekday: int  = 4
     stats_weekly_send_hour:    int  = 23
     stats_weekly_send_minute:  int  = 59
+    audit_enabled: bool = os.getenv("AUDIT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+    audit_send_hour: int = int(os.getenv("AUDIT_SEND_HOUR", "23"))
+    audit_send_minute: int = int(os.getenv("AUDIT_SEND_MINUTE", "55"))
+    audit_min_rr: float = float(os.getenv("AUDIT_MIN_RR", "1.20"))
+    audit_min_t1_points: float = float(os.getenv("AUDIT_MIN_T1_POINTS", "8"))
+    audit_max_stop_to_t1_ratio: float = float(os.getenv("AUDIT_MAX_STOP_TO_T1_RATIO", "2.0"))
+    audit_min_target_gap_points: float = float(os.getenv("AUDIT_MIN_TARGET_GAP_POINTS", "5"))
+    audit_repeat_min_count: int = int(os.getenv("AUDIT_REPEAT_MIN_COUNT", "2"))
     messy_filter_enabled:                    bool = True
     messy_reject_if_no_wick_and_no_momentum: bool = True
     momentum_breakout_enabled:               bool = True
@@ -292,14 +300,30 @@ class ClosedTradeRecord:
     market_label:     str
     session:          str
 @dataclass
+class AuditIssue:
+    created_at_riyadh: datetime
+    issue_key:         str
+    title:             str
+    detail:            str
+    suggestion:        str
+    direction:         str
+    result_label:      str
+    r_result:          float
+@dataclass
 class StatsState:
     closed_trades: list = field(default_factory=list)
+    audit_issues: list = field(default_factory=list)
     last_daily_stats_sent_date:      object = None
     last_weekly_stats_sent_week_key: object = None
+    last_daily_audit_sent_date:      object = None
     def add_trade(self, rec):
         self.closed_trades.append(rec)
+    def add_audit_issue(self, issue):
+        self.audit_issues.append(issue)
     def get_day_records(self, target_date):
         return [x for x in self.closed_trades if x.closed_at_riyadh.date() == target_date]
+    def get_day_audit_issues(self, target_date):
+        return [x for x in self.audit_issues if x.created_at_riyadh.date() == target_date]
     def get_week_records_mon_to_fri(self, target_date):
         wd     = target_date.weekday()
         monday = target_date - timedelta(days=wd)
@@ -375,6 +399,183 @@ def weekly_stats_message(summary, monday, friday):
         "Best: " + best_txt + "\n"
         "Worst: " + worst_txt
     )
+
+def _audit_add_issue(tr, issue_key, title, detail, suggestion,
+                     result_label, r_result):
+    issue = AuditIssue(
+        created_at_riyadh=now_riyadh(),
+        issue_key=str(issue_key),
+        title=str(title),
+        detail=str(detail),
+        suggestion=str(suggestion),
+        direction=str(tr.get("direction", "?")),
+        result_label=str(result_label),
+        r_result=float(r_result),
+    )
+    STATE.stats.add_audit_issue(issue)
+
+def _audit_float(value):
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+def _audit_target_prices(tr):
+    targets = []
+    for item in tr.get("target_map", []):
+        price = _audit_float(item.get("price"))
+        name = str(item.get("name", ""))
+        if price is not None and name.startswith("T"):
+            try:
+                targets.append((int(name.replace("T", "")), price))
+            except Exception:
+                pass
+    if not targets:
+        for idx, name in enumerate(["t1", "t2", "t3", "t4"], start=1):
+            price = _audit_float(tr.get(name))
+            if price is not None:
+                targets.append((idx, price))
+    targets.sort(key=lambda x: x[0])
+    return [x[1] for x in targets]
+
+def audit_losing_trade(tr, result_label, max_target_hit, r_result):
+    if not CFG.audit_enabled or tr is None:
+        return
+    if float(r_result) >= 0:
+        return
+    entry = _audit_float(tr.get("entry"))
+    initial_stop = _audit_float(tr.get("initial_stop"))
+    rr = _audit_float(tr.get("signal_rr"))
+    targets = _audit_target_prices(tr)
+    t1 = targets[0] if targets else _audit_float(tr.get("t1"))
+    stop_dist = abs(entry - initial_stop) if entry is not None and initial_stop is not None else None
+    t1_dist = abs(t1 - entry) if entry is not None and t1 is not None else None
+    trade_ref = (
+        str(tr.get("direction", "?")) +
+        " | Entry " + safe_f1(entry) +
+        " | Stop " + safe_f1(initial_stop) +
+        " | Result " + "{:+.2f}".format(float(r_result)) + "R"
+    )
+    if int(max_target_hit) <= 0:
+        _audit_add_issue(
+            tr, "loss_before_t1", "خسارة قبل T1",
+            trade_ref + "\nالصفقة ضربت وقف قبل تحقيق أول هدف.",
+            "راجع قوة المستوى وتوقيت الدخول قبل السماح بصفقات مشابهة.",
+            result_label, r_result,
+        )
+    if rr is not None and rr < CFG.audit_min_rr:
+        _audit_add_issue(
+            tr, "low_rr_loss", "RR ضعيف في صفقة خاسرة",
+            trade_ref + "\nRR عند الإشارة: " + safe_f2(rr),
+            "ناقش رفع الحد الأدنى للـ RR أو منع الصفقات التي لا تعطي عائد كاف.",
+            result_label, r_result,
+        )
+    if t1_dist is not None and t1_dist < CFG.audit_min_t1_points:
+        _audit_add_issue(
+            tr, "t1_too_close_loss", "T1 قريب جدًا",
+            trade_ref + "\nالمسافة إلى T1: " + safe_f1(t1_dist) + " نقطة.",
+            "ناقش رفض الصفقات التي يكون T1 فيها قريب ولا يغطي مخاطرة 0DTE.",
+            result_label, r_result,
+        )
+    if stop_dist is not None and t1_dist is not None and t1_dist > 0:
+        ratio = stop_dist / t1_dist
+        if ratio > CFG.audit_max_stop_to_t1_ratio:
+            _audit_add_issue(
+                tr, "stop_too_wide_vs_t1_loss", "الوقف كبير مقارنة بـ T1",
+                trade_ref + "\nStop/T1 ratio: " + safe_f2(ratio),
+                "ناقش رفض الصفقة إذا كان الوقف أكبر من الهدف بأكثر من الحد المسموح.",
+                result_label, r_result,
+            )
+    if len(targets) >= 2:
+        gaps = [abs(targets[i] - targets[i - 1]) for i in range(1, len(targets))]
+        min_gap = min(gaps) if gaps else None
+        if min_gap is not None and min_gap < CFG.audit_min_target_gap_points:
+            _audit_add_issue(
+                tr, "targets_too_close_loss", "الأهداف متقاربة",
+                trade_ref + "\nأقرب فرق بين هدفين: " + safe_f1(min_gap) + " نقطة.",
+                "ناقش بناء الأهداف من مستويات أقوى أو استخدام ATR بدل المستويات الصغيرة.",
+                result_label, r_result,
+            )
+    if not bool(tr.get("level_strong", False)):
+        _audit_add_issue(
+            tr, "weak_level_loss", "دخول من مستوى غير قوي",
+            trade_ref + "\nLevel Quality: " + safe_f2(tr.get("level_quality_score")) +
+            " | Touches: " + str(safe_int(tr.get("level_touches"))),
+            "ناقش منع مستويات C/B الضعيفة أو رفع وزن مستويات اليوم السابق والافتتاح.",
+            result_label, r_result,
+        )
+    market_label = str(tr.get("market_label_at_entry", "Unknown"))
+    if market_label in ("Messy", "Weak"):
+        _audit_add_issue(
+            tr, "messy_market_loss", "خسارة في سوق غير نظيف",
+            trade_ref + "\nMarket: " + market_label,
+            "ناقش تقليل الصفقات في Messy/Weak أو السماح فقط بمستوى A+.",
+            result_label, r_result,
+        )
+    bias = str(tr.get("bias_at_entry", "Weak"))
+    direction = str(tr.get("direction", "?"))
+    counter_bias = (
+        (bias == "Bullish" and direction == "SELL") or
+        (bias == "Bearish" and direction == "BUY")
+    )
+    if counter_bias:
+        _audit_add_issue(
+            tr, "counter_bias_loss", "صفقة عكس Bias وخسرت",
+            trade_ref + "\nBias at entry: " + bias,
+            "ناقش تفعيل Bias Lock أو منع عكس الاتجاه إلا من مستوى A+.",
+            result_label, r_result,
+        )
+    if str(tr.get("trade_type", "")) == "Weak":
+        _audit_add_issue(
+            tr, "weak_trade_type_loss", "صفقة Weak وخسرت",
+            trade_ref + "\nTrigger: " + str(tr.get("trigger", "N/A")),
+            "ناقش منع Weak trades أو جعلها مراقبة فقط.",
+            result_label, r_result,
+        )
+
+def daily_audit_message(target_date, manual=False):
+    issues = STATE.stats.get_day_audit_issues(target_date)
+    if not issues:
+        return (
+            CFG.user_title + " - أخطاء البوت اليوم\n"
+            "لا توجد أخطاء واضحة من الصفقات الخاسرة اليوم."
+        )
+    counts = {}
+    examples = {}
+    for issue in issues:
+        counts[issue.issue_key] = counts.get(issue.issue_key, 0) + 1
+        examples.setdefault(issue.issue_key, issue)
+    repeated = sorted(
+        [(count, key) for key, count in counts.items()
+         if count >= CFG.audit_repeat_min_count],
+        reverse=True,
+    )
+    lines = [
+        CFG.user_title + " - أخطاء البوت اليوم",
+        "التاريخ: " + target_date.isoformat() + " (Riyadh)",
+        "",
+    ]
+    if repeated:
+        lines.append("الأخطاء المتكررة:")
+        for count, key in repeated[:5]:
+            issue = examples[key]
+            lines.append(
+                "- " + issue.title + " | تكررت " + str(count) + " مرات\n"
+                "  مثال: " + issue.detail.replace("\n", "\n  ") + "\n"
+                "  للنقاش: " + issue.suggestion
+            )
+    else:
+        lines.append("لا يوجد خطأ تكرر مرتين أو أكثر، لكن توجد ملاحظات على صفقات خاسرة:")
+    if not repeated or manual:
+        lines.append("")
+        lines.append("أمثلة مختصرة:")
+        for issue in issues[-6:]:
+            lines.append(
+                "- " + issue.title + "\n"
+                "  " + issue.detail.replace("\n", "\n  ")
+            )
+    return "\n".join(lines)
 # === END PART 1 ===
 # === PART 2 ===
 # TV Fetching, Structure, Indicators, Liquidity, Wick, Trade Plan, Messages
@@ -1662,6 +1863,7 @@ def record_closed_trade(result_label, max_target_hit, r_result):
         session=str(tr.get("session_at_entry", "Unknown")),
     )
     STATE.stats.add_trade(rec)
+    audit_losing_trade(tr, result_label, max_target_hit, r_result)
 def compute_scored_result_from_targets(tr):
     if tr is None:
         return 0.0, "unknown", 0
@@ -1733,6 +1935,19 @@ def maybe_send_weekly_stats():
     summary = summarize_records(records)
     send_telegram(weekly_stats_message(summary, monday, friday))
     STATE.stats.last_weekly_stats_sent_week_key = week_key
+def maybe_send_daily_audit():
+    if not CFG.audit_enabled:
+        return
+    t = now_riyadh()
+    if not (t.hour == CFG.audit_send_hour
+            and t.minute >= CFG.audit_send_minute):
+        return
+    if STATE.stats.last_daily_audit_sent_date == t.date():
+        return
+    issues = STATE.stats.get_day_audit_issues(t.date())
+    if issues:
+        send_telegram(daily_audit_message(t.date(), manual=False))
+    STATE.stats.last_daily_audit_sent_date = t.date()
 # =========================
 # Active trade management
 # =========================
@@ -1995,6 +2210,7 @@ def evaluate_once():
             STATE.last_hour_sent = current_hour
     maybe_send_daily_stats()
     maybe_send_weekly_stats()
+    maybe_send_daily_audit()
     if (STATE.no_signal_until_utc is not None
             and datetime.utcnow() < STATE.no_signal_until_utc):
         return
@@ -2185,6 +2401,15 @@ def evaluate_once():
         "last_price":   float(level_now),
         "last_update_riyadh": now_riyadh().strftime("%Y-%m-%d %H:%M"),
         "trade_type":   trade_type,
+        "trigger":      trigger,
+        "score":        int(score),
+        "confidence":   int(conf),
+        "bias_at_entry": bias,
+        "signal_rr":    None if rr is None else float(rr),
+        "level_quality_score": float(level_info.get("quality_score", 0.0)),
+        "level_touches": int(level_info.get("touches", 0)),
+        "level_strong": bool(level_info.get("strong", False)),
+        "level_tradable": bool(level_info.get("tradable", False)),
         "market_label_at_entry": STATE.market_label,
         "session_at_entry":      session,
         "target_map":            plan.get("target_map", []),
@@ -3070,6 +3295,9 @@ def manual_targets_refresh_message():
     except Exception as e:
         return CFG.user_title + " - Target Refresh Error\n" + repr(e)
 
+def manual_daily_audit_message():
+    return daily_audit_message(now_riyadh().date(), manual=True)
+
 def command_help_message():
     return (
         CFG.user_title + " - أوامر البوت\n\n"
@@ -3078,6 +3306,7 @@ def command_help_message():
         "/close - إغلاق الصفقة داخل البوت يدويًا\n"
         "/scan - بحث يدوي عن فرصة الآن\n"
         "/daily_bias - تقرير تنفيذي عربي لحركة اليوم\n"
+        "/daily_audit - أخطاء الصفقات الخاسرة والمتكررة اليوم\n"
         "/targets_refresh - محاولة تحديث الهدف التالي يدويًا\n"
         "/wb_login - إعادة تسجيل Webull\n"
         "/wb_status - حالة Webull"
@@ -3281,6 +3510,8 @@ class _TelegramCommandHandler:
                             self._reply(chat_id, daily_bias_message())
                         except Exception as e:
                             self._reply(chat_id, CFG.user_title + " - Daily Bias Error\n" + repr(e))
+                    elif cmd in ("/daily_audit", "/audit_today", "/loss_review"):
+                        self._reply(chat_id, manual_daily_audit_message())
                     elif cmd == "/scan":
                         threading.Thread(
                             target=run_manual_scan,
@@ -3353,3 +3584,4 @@ def spxw_evaluator_start():
 if __name__ == "__main__":
     main()
 # === END PART 4 ===
+
