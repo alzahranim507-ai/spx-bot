@@ -299,6 +299,11 @@ class ClosedTradeRecord:
     r_result:         float
     market_label:     str
     session:          str
+    planned_entry:    float = None
+    exit_price:       float = None
+    opened_at_riyadh: object = None
+    exit_reason:      str = ""
+    price_basis:      str = "observed_index"
 @dataclass
 class AuditIssue:
     created_at_riyadh: datetime
@@ -370,7 +375,8 @@ def daily_stats_message(summary, target_date):
         "Total: " + str(summary["total"]) + "\n"
         "Wins: " + str(summary["wins"]) + " | Losses: " + str(summary["losses"]) + " | BE: " + str(summary["breakeven"]) + "\n"
         "Win Rate: " + "{:.1f}".format(summary["winrate"]) + "%\n"
-        "Net: " + "{:+.2f}".format(summary["net_r"]) + "R\n\n"
+        "Net (observed index, before costs): " + "{:+.2f}".format(summary["net_r"]) + "R\n\n"
+        "Highest target reached (separate from exit result):\n"
         "T1: " + str(summary["t1_only"]) + " | T2: " + str(summary["t2_hit"]) + " | T3: " + str(summary["t3_hit"]) + " | T4+: " + str(summary["t4_plus"]) + "\n\n"
         "Range: " + str(summary["range_count"]) + " | Trending: " + str(summary["trending_count"]) + "\n"
         "Messy: " + str(summary["messy_count"]) + " | Weak: " + str(summary["weak_count"]) + "\n\n"
@@ -392,7 +398,8 @@ def weekly_stats_message(summary, monday, friday):
         "Total: " + str(summary["total"]) + "\n"
         "Wins: " + str(summary["wins"]) + " | Losses: " + str(summary["losses"]) + " | BE: " + str(summary["breakeven"]) + "\n"
         "Win Rate: " + "{:.1f}".format(summary["winrate"]) + "%\n"
-        "Net: " + "{:+.2f}".format(summary["net_r"]) + "R\n\n"
+        "Net (observed index, before costs): " + "{:+.2f}".format(summary["net_r"]) + "R\n\n"
+        "Highest target reached (separate from exit result):\n"
         "T1: " + str(summary["t1_only"]) + " | T2: " + str(summary["t2_hit"]) + " | T3: " + str(summary["t3_hit"]) + " | T4+: " + str(summary["t4_plus"]) + "\n\n"
         "Range: " + str(summary["range_count"]) + " | Trending: " + str(summary["trending_count"]) + "\n"
         "Messy: " + str(summary["messy_count"]) + " | Weak: " + str(summary["weak_count"]) + "\n\n"
@@ -444,7 +451,7 @@ def audit_losing_trade(tr, result_label, max_target_hit, r_result):
         return
     if float(r_result) >= 0:
         return
-    entry = _audit_float(tr.get("entry"))
+    entry = _audit_float(tr.get("activation_price", tr.get("entry")))
     initial_stop = _audit_float(tr.get("initial_stop"))
     rr = _audit_float(tr.get("signal_rr"))
     targets = _audit_target_prices(tr)
@@ -460,7 +467,7 @@ def audit_losing_trade(tr, result_label, max_target_hit, r_result):
     if int(max_target_hit) <= 0:
         _audit_add_issue(
             tr, "loss_before_t1", "خسارة قبل T1",
-            trade_ref + "\nالصفقة ضربت وقف قبل تحقيق أول هدف.",
+            trade_ref + "\nأُغلقت الصفقة بخسارة قبل تسجيل أول هدف.",
             "راجع قوة المستوى وتوقيت الدخول قبل السماح بصفقات مشابهة.",
             result_label, r_result,
         )
@@ -665,7 +672,8 @@ def find_pivots(series, left, right):
     return piv_hi, piv_lo
 def structure_bias(df_1h, df_4h):
     def bias_from(df):
-        hi_idx, lo_idx = find_pivots(df["high"], CFG.pivot_left, CFG.pivot_right)
+        hi_idx, _ = find_pivots(df["high"], CFG.pivot_left, CFG.pivot_right)
+        _, lo_idx = find_pivots(df["low"], CFG.pivot_left, CFG.pivot_right)
         highs = [float(df["high"].iloc[i]) for i in hi_idx][-2:]
         lows  = [float(df["low"].iloc[i])  for i in lo_idx][-2:]
         if len(highs) < 2 or len(lows) < 2:
@@ -699,7 +707,8 @@ def cluster_levels(levels, tol_frac, price_ref):
     return clustered
 def extract_key_levels(df_15m, df_1h):
     price   = float(df_15m["close"].iloc[-1])
-    hi_idx, lo_idx = find_pivots(df_1h["high"], CFG.pivot_left, CFG.pivot_right)
+    hi_idx, _ = find_pivots(df_1h["high"], CFG.pivot_left, CFG.pivot_right)
+    _, lo_idx = find_pivots(df_1h["low"], CFG.pivot_left, CFG.pivot_right)
     swing_highs    = [float(df_1h["high"].iloc[i]) for i in hi_idx][-14:]
     swing_lows     = [float(df_1h["low"].iloc[i])  for i in lo_idx][-14:]
     recent         = df_15m.tail(220)
@@ -1067,16 +1076,17 @@ def wick_cluster_near_level(df_5m, level):
         rng = max(h - l, 1e-9)
         upper = h - max(o, c)
         lower = min(o, c) - l
-        near  = (
-            abs(h - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac
-            or abs(l - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac
-            or abs(c - level) / max(level, 1e-9) <= CFG.wick_near_level_tolerance_frac
-        )
+        tolerance = max(level, 1e-9) * CFG.wick_near_level_tolerance_frac
+        near = (abs(h - level) <= tolerance or abs(l - level) <= tolerance
+                or abs(c - level) <= tolerance)
         if not near:
             continue
-        if upper >= CFG.wick_min_abs_pts and (upper / rng) >= CFG.wick_ratio_strong:
+        # Attribute rejection only to the wick that intersects the level zone.
+        upper_near = max(o, c) - tolerance <= level <= h + tolerance
+        lower_near = l - tolerance <= level <= min(o, c) + tolerance
+        if upper_near and upper >= CFG.wick_min_abs_pts and (upper / rng) >= CFG.wick_ratio_strong:
             upper_hits += 1
-        if lower >= CFG.wick_min_abs_pts and (lower / rng) >= CFG.wick_ratio_strong:
+        if lower_near and lower >= CFG.wick_min_abs_pts and (lower / rng) >= CFG.wick_ratio_strong:
             lower_hits += 1
     return {
         "upper_cluster": upper_hits >= CFG.wick_cluster_min_hits,
@@ -1845,14 +1855,15 @@ def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price,
 # =========================
 # Trade result recording
 # =========================
-def record_closed_trade(result_label, max_target_hit, r_result):
+def record_closed_trade(result_label, max_target_hit, r_result,
+                        exit_price=None, exit_reason=""):
     tr = STATE.active_trade
     if tr is None:
         return
     rec = ClosedTradeRecord(
         closed_at_riyadh=now_riyadh(),
         direction=str(tr.get("direction", "?")),
-        entry=float(tr.get("entry", np.nan)),
+        entry=float(tr.get("activation_price", tr.get("entry", np.nan))),
         stop=float(tr.get("stop",  np.nan)),
         initial_stop=float(tr.get("initial_stop", np.nan)),
         trade_type=str(tr.get("trade_type", "N/A")),
@@ -1861,35 +1872,36 @@ def record_closed_trade(result_label, max_target_hit, r_result):
         r_result=float(r_result),
         market_label=str(tr.get("market_label_at_entry", "Unknown")),
         session=str(tr.get("session_at_entry", "Unknown")),
+        planned_entry=float(tr.get("entry", np.nan)),
+        exit_price=None if exit_price is None else float(exit_price),
+        opened_at_riyadh=tr.get("activated_at_riyadh"),
+        exit_reason=str(exit_reason),
+        price_basis=("observed_activation_and_exit" if "activation_price" in tr
+                     else "planned_entry_and_observed_exit"),
     )
     STATE.stats.add_trade(rec)
     audit_losing_trade(tr, result_label, max_target_hit, r_result)
-def compute_scored_result_from_targets(tr):
+def compute_exit_result(tr, exit_price):
+    """Score observed index movement; this is not an option fill or realized P&L."""
     if tr is None:
-        return 0.0, "unknown", 0
-    dynamic_targets = tr.get("dynamic_targets", {})
-    max_hit   = 0
-    max_price = None
-    for name, info in dynamic_targets.items():
-        if info.get("hit"):
-            try:
-                idx = int(name.replace("T", ""))
-                if idx > max_hit:
-                    max_hit   = idx
-                    max_price = float(info["price"])
-            except Exception:
-                pass
-    if max_hit <= 0 or max_price is None:
-        return -1.0, "Loss", 0
-    entry        = float(tr["entry"])
+        raise ValueError("Cannot score an absent trade")
+    entry        = float(tr.get("activation_price", tr["entry"]))
     initial_stop = float(tr["initial_stop"])
+    exit_price   = float(exit_price)
     direction    = tr["direction"]
+    if not all(np.isfinite(x) for x in (entry, initial_stop, exit_price)):
+        raise ValueError("Cannot score non-finite trade prices")
     risk         = abs(entry - initial_stop)
     if risk <= 0:
-        return 0.0, "Win @ T" + str(max_hit), max_hit
-    reward   = (max_price - entry) if direction == "BUY" else (entry - max_price)
+        raise ValueError("Cannot score a trade with zero initial risk")
+    if direction not in ("BUY", "SELL"):
+        raise ValueError("Cannot score an unknown trade direction")
+    reward   = (exit_price - entry) if direction == "BUY" else (entry - exit_price)
     r_result = reward / risk
-    return float(r_result), "Win @ T" + str(max_hit), max_hit
+    if abs(r_result) < 1e-9:
+        r_result = 0.0
+    label = "Win" if r_result > 0 else ("Loss" if r_result < 0 else "BE")
+    return float(r_result), label, current_max_target_hit(tr)
 def current_max_target_hit(tr):
     if tr is None:
         return 0
@@ -1969,6 +1981,8 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
         if triggered:
             tr["status"]         = "live"
             tr["live_since_utc"] = datetime.utcnow()
+            tr["activation_price"] = float(last_price)
+            tr["activated_at_riyadh"] = now_riyadh()
             send_telegram(
                 CFG.user_title + " - Trade Activated\n"
                 "Direction: " + direction + "\n"
@@ -2081,13 +2095,16 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
             highest_defined = max(int(k.replace("T", ""))
                                   for k in dynamic_targets.keys())
             if max_hit_idx >= highest_defined:
-                r_result, label, max_hit = compute_scored_result_from_targets(tr)
-                record_closed_trade(label, max_hit, r_result)
+                r_result, label, max_hit = compute_exit_result(tr, last_price)
+                record_closed_trade(label, max_hit, r_result,
+                                    exit_price=last_price, exit_reason="weakness")
                 send_telegram(
                     CFG.user_title + " - Trade Closed (Weakness)\n"
                     "Reason: weakness after T" + str(max_hit_idx) + "\n"
-                    "Result: " + "{:+.2f}".format(r_result) + "R\n"
-                    "Label: " + label
+                    "Observed exit: " + safe_f1(last_price) + "\n"
+                    "Result (observed index): " + "{:+.2f}".format(r_result) + "R\n"
+                    "Label: " + label + "\n"
+                    "Highest Target Hit: T" + str(max_hit)
                 )
                 STATE.active_trade = None
                 return
@@ -2102,16 +2119,17 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
                 else (last_price - stop) >= CFG.hard_stop_buffer_pts
             )
             if beyond:
-                r_result, label, max_hit = compute_scored_result_from_targets(tr)
+                r_result, label, max_hit = compute_exit_result(tr, last_price)
                 send_telegram(
                     CFG.user_title + " - Trade Closed (Hard Stop)\n"
                     "Direction: " + direction + "\n"
                     "Stop: " + safe_f1(stop) + " | Price: " + safe_f1(last_price) + "\n"
-                    "Result: " + "{:+.2f}".format(r_result) + "R\n"
+                    "Result (observed index): " + "{:+.2f}".format(r_result) + "R\n"
                     "Label: " + label + "\n"
                     "Highest Target Hit: T" + str(max_hit if max_hit > 0 else 0)
                 )
-                record_closed_trade(label, max_hit, r_result)
+                record_closed_trade(label, max_hit, r_result,
+                                    exit_price=last_price, exit_reason="hard_stop")
                 try:
                     spxw_on_stop_hit(spx_price_at_stop=last_price)
                 except Exception as e:
@@ -2137,16 +2155,17 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
                         else (last_close >= stop)
                     )
                     if confirmed:
-                        r_result, label, max_hit = compute_scored_result_from_targets(tr)
+                        r_result, label, max_hit = compute_exit_result(tr, last_close)
                         send_telegram(
                             CFG.user_title + " - Trade Closed (Stop Confirmed)\n"
                             "Direction: " + direction + "\n"
                             "Stop: " + safe_f1(stop) + " | Price: " + safe_f1(last_price) + "\n"
-                            "Result: " + "{:+.2f}".format(r_result) + "R\n"
+                            "Result (observed index): " + "{:+.2f}".format(r_result) + "R\n"
                             "Label: " + label + "\n"
                             "Highest Target Hit: T" + str(max_hit if max_hit > 0 else 0)
                         )
-                        record_closed_trade(label, max_hit, r_result)
+                        record_closed_trade(label, max_hit, r_result,
+                                            exit_price=last_close, exit_reason="confirmed_stop")
                         try:
                             spxw_on_stop_hit(spx_price_at_stop=last_close)
                         except Exception as e:
@@ -2821,7 +2840,8 @@ def _pick_contract(contracts, direction, trade_type):
                 "ask":         ask,
                 "mid":         round((bid + ask) / 2, 2),
                 "cost_usd":    round(ask * 100, 0),
-                "delta":       delta,
+                # Selection uses magnitude; P&L must retain the option direction.
+                "delta":       delta if direction == "BUY" else -delta,
                 "theta":       theta,
                 "iv":          round(iv * 100, 1) if iv < 5 else round(iv, 1),
                 "volume":      int(vol),
@@ -3023,7 +3043,7 @@ def _estimate_contract_pnl(spx_price_now):
     if delta is None or spx_entry is None or entry_time is None:
         return {"available": False}
     spx_move      = spx_price_now - spx_entry
-    delta_pnl     = spx_move * abs(delta) * 100
+    delta_pnl     = spx_move * float(delta) * 100
     hours_elapsed = (datetime.utcnow() - entry_time).total_seconds() / 3600.0
     theta_loss    = abs(theta or 0) * (hours_elapsed / 24.0) * 100
     net_pnl       = delta_pnl - theta_loss
@@ -3059,7 +3079,7 @@ def spxw_on_target_hit(target_name, spx_price_at_target, target_idx):
         "Now:   " + safe_f1(pnl["spx_now"]) + "\n"
         "Move:  " + "{:+.1f}".format(pnl["spx_move"]) + " pts\n\n"
         "--- Contract Estimate ---\n"
-        "Delta gain:  " + "{:+.0f}".format(pnl["delta_pnl"]) + "$\n"
+        "Delta P&L:   " + "{:+.0f}".format(pnl["delta_pnl"]) + "$\n"
         "  (SPX " + "{:+.1f}".format(pnl["spx_move"]) + " x Delta " + "{:.2f}".format(pnl["delta"]) + " x 100)\n\n"
         "Theta loss:  -" + "{:.0f}".format(pnl["theta_loss"]) + "$\n"
         "  (Theta " + "{:.3f}".format(abs(pnl["theta"] or 0)) + " x " + "{:.1f}".format(pnl["hours"]) + "h)\n\n"
@@ -3077,6 +3097,7 @@ def spxw_on_stop_hit(spx_price_at_stop):
         return
     pnl = _estimate_contract_pnl(spx_price_at_stop)
     if pnl["available"]:
+        status = "[+]" if pnl["net_pnl"] >= 0 else "[-]"
         send_telegram(
             CFG.user_title + " - SPXW Stop Hit\n\n"
             "--- SPX ---\n"
@@ -3087,7 +3108,7 @@ def spxw_on_stop_hit(spx_price_at_stop):
             "Delta P&L:   " + "{:+.0f}".format(pnl["delta_pnl"]) + "$\n"
             "Theta loss:  -" + "{:.0f}".format(pnl["theta_loss"]) + "$\n\n"
             "========================\n"
-            "[-] Net estimate: " + "{:+.0f}".format(pnl["net_pnl"]) + "$ (" + "{:+.1f}".format(pnl["pct"]) + "%)\n"
+            + status + " Net estimate: " + "{:+.0f}".format(pnl["net_pnl"]) + "$ (" + "{:+.1f}".format(pnl["pct"]) + "%)\n"
             "Original cost: $" + "{:.0f}".format(pnl["cost_usd"]) + "\n"
             "========================\n\n"
             "Close contract manually in Webull if not done.\n"
@@ -3247,17 +3268,30 @@ def close_active_trade_manually(text):
         return CFG.user_title + " - Manual Close\nلا توجد صفقة نشطة لإغلاقها."
     parts = text.split(maxsplit=1)
     reason = parts[1].strip() if len(parts) > 1 else "manual command"
-    max_hit = current_max_target_hit(tr)
-    if max_hit > 0:
-        r_result, _, _ = compute_scored_result_from_targets(tr)
-    else:
-        r_result = 0.0
-    label = "Manual Close" + ((" @ T" + str(max_hit)) if max_hit > 0 else "")
-    record_closed_trade(label, max_hit, r_result)
+    if tr.get("status") == "pending":
+        STATE.active_trade = None
+        try:
+            SPXW_STATE.clear_contract_data()
+        except Exception:
+            pass
+        return (CFG.user_title + " - Pending Trade Cancelled\n"
+                "Cancelled before activation; excluded from closed-trade stats.\n"
+                "Reason: " + reason)
+    if tr.get("status") != "live":
+        return CFG.user_title + " - Manual Close\nحالة الصفقة غير صالحة لحساب نتيجة الخروج."
+    last_price = _audit_float(tr.get("last_price"))
+    if last_price is None:
+        return CFG.user_title + " - Manual Close\nلا توجد قراءة سعر صالحة لحساب نتيجة الخروج."
+    try:
+        r_result, result_label, max_hit = compute_exit_result(tr, last_price)
+    except (ValueError, TypeError, KeyError):
+        return CFG.user_title + " - Manual Close\nبيانات الدخول أو الوقف غير صالحة لحساب النتيجة."
+    label = "Manual Close | " + result_label
+    record_closed_trade(label, max_hit, r_result,
+                        exit_price=last_price, exit_reason="manual: " + reason)
     direction = tr.get("direction", "N/A")
-    entry = tr.get("entry")
+    entry = tr.get("activation_price", tr.get("entry"))
     stop = tr.get("stop")
-    last_price = tr.get("last_price")
     STATE.active_trade = None
     try:
         SPXW_STATE.clear_contract_data()
@@ -3267,10 +3301,11 @@ def close_active_trade_manually(text):
         CFG.user_title + " - Trade Closed Manually\n"
         "Direction: " + str(direction) + "\n"
         "Entry: " + safe_f1(entry) + "\n"
-        "Last Price: " + safe_f1(last_price) + "\n"
+        "Observed exit: " + safe_f1(last_price) + "\n"
+        "Price time (Riyadh): " + str(tr.get("last_update_riyadh", "N/A")) + "\n"
         "Stop: " + safe_f1(stop) + "\n"
         "Highest Target Hit: " + ("T" + str(max_hit) if max_hit > 0 else "0") + "\n"
-        "Result: " + "{:+.2f}".format(float(r_result)) + "R\n"
+        "Result (observed index): " + "{:+.2f}".format(float(r_result)) + "R\n"
         "Reason: " + reason + "\n\n"
         "تنبيه: هذا يغلق الصفقة داخل البوت فقط، ولا يبيع العقد في الوسيط."
     )
@@ -3584,4 +3619,3 @@ def spxw_evaluator_start():
 if __name__ == "__main__":
     main()
 # === END PART 4 ===
-
