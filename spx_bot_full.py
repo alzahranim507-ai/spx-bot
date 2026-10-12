@@ -1362,13 +1362,13 @@ def format_target_map_for_message(target_map):
         return "N/A"
     lines = []
     for t in target_map:
-        lines.append(t["name"] + ": " + safe_f1(t["price"]) + " | " + str(safe_int(t["prob"])) + "% | " + t["zone"])
+        lines.append(t["name"] + ": " + safe_f1(t["price"]) + " | " + str(safe_int(t["prob"])) + "% (تقديري) | " + t["zone"])
     return "\n".join(lines)
 def signal_message(session, symbol, market_state_str, liq_state,
                    level_now, direction, level_hit, plan,
-                   score, conf, p_t1, p_t2, exp_move, eta_band, reasons):
+                   score, conf, p_t1, p_t2, exp_move, eta_band, reasons, key_levels=None):
     if exp_move and np.isfinite(float(exp_move)):
-        exp_txt = "+-" + "{:.0f}".format(float(exp_move)) + " pts"
+        exp_txt = "{:.0f}".format(float(exp_move)) + " pts"
     else:
         exp_txt = "N/A"
     eta_txt = "N/A" if eta_band is None else str(eta_band[0]) + "-" + str(eta_band[1]) + " min"
@@ -1392,45 +1392,22 @@ def signal_message(session, symbol, market_state_str, liq_state,
         "T3: " + safe_f1(plan.get("t3")) + "\n\n"
         "RR: " + safe_f2(plan.get("rr")) + "\n"
         "Score: " + str(score) + "/6\n"
-        "Confidence: " + str(conf) + "%\n\n"
-        "Probability\n"
+        "Setup quality (heuristic): " + str(conf) + "%\n\n"
+        "Probability — تقدير قواعد غير مُعاير إحصائيًا\n"
         "T1: " + str(p_t1) + "%\n"
         "T2: " + str(p_t2) + "%\n\n"
-        "Target Map\n"
+        "Target Map — تقدير مستقل عن Probability\n"
         + target_map_txt + "\n\n"
-        "Expected Move (1H): " + exp_txt + "\n"
-        "ETA to T1: " + eta_txt + "\n\n"
-        "Reason: " + ", ".join(reasons)
+        "مقياس التذبذب الساعي (ATR): " + exp_txt + " — مقياس تاريخي\n"
+        "ETA to T1 (تقريبي): " + eta_txt + "\n\n"
+        "Reason: " + ", ".join(reasons) + "\n\n"
+        + reporting_signal_explanation(direction, level_hit, plan, reasons, key_levels or [])
     )
 def hourly_update_message(session, symbol, bias, market_state_str,
                           levels, price, active_trade):
-    status = "None" if active_trade is None else active_trade.get("status", "Unknown")
-    trade_line = "-"
-    target_map_line = "N/A"
-    if active_trade is not None:
-        trade_line = (
-            active_trade.get("direction", "?") + " | "
-            "Entry " + safe_f1(active_trade.get("entry")) + " | "
-            "Stop " + safe_f1(active_trade.get("stop")) + " | "
-            "T1 " + safe_f1(active_trade.get("t1")) + " | "
-            "T2 " + safe_f1(active_trade.get("t2")) + " | "
-            "T3 " + safe_f1(active_trade.get("t3"))
-        )
-        target_map_line = format_target_map_for_message(active_trade.get("target_map", []))
-    ts = now_riyadh().strftime("%Y-%m-%d %H:%M")
-    return (
-        CFG.user_title + "\n"
-        "Hourly Update (" + ts + " Riyadh)\n"
-        "Session: " + session + "\n"
-        "Symbol: " + symbol + "\n"
-        "Bias (1H/4H): " + bias + "\n"
-        "Market: " + market_state_str + "\n"
-        "Price: " + safe_f1(price) + "\n"
-        "Key Levels: " + fmt_levels(levels) + "\n"
-        "Active Trade: " + status + "\n"
-        "Trade: " + trade_line + "\n"
-        "Targets:\n" + target_map_line
-    )
+    from bot_reporting import REPORTS
+    return REPORTS.hourly(session, symbol, bias, market_state_str,
+                          levels, price, active_trade, now_riyadh())
 # === END PART 2 ===
 # === PART 3 ===
 # BotState, Reset, Wick Validation, Scoring, Dynamic Extension, Trade Recording, Update Active Trade
@@ -1844,7 +1821,7 @@ def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price,
     send_telegram(
         CFG.user_title + " - New Target: " + stage_name + "\n"
         "Price: " + safe_f1(candidate) + "\n"
-        "Probability: " + str(prob) + "%\n"
+        "Probability (heuristic): " + str(prob) + "%\n"
         "Zone: " + zone + "\n"
         "Stop: " + safe_f1(tr["stop"])
         + (("\nNotes: " + " | ".join(override_notes)) if override_notes else "")
@@ -1881,6 +1858,8 @@ def record_closed_trade(result_label, max_target_hit, r_result,
     )
     STATE.stats.add_trade(rec)
     audit_losing_trade(tr, result_label, max_target_hit, r_result)
+    reporting_event("closed", tr, exit_price=exit_price, exit_reason=exit_reason,
+                    r_result=r_result, result_label=result_label, max_target_hit=max_target_hit)
 def compute_exit_result(tr, exit_price):
     """Score observed index movement; this is not an option fill or realized P&L."""
     if tr is None:
@@ -1969,6 +1948,8 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
         return
     tr["last_price"]         = float(last_price)
     tr["last_update_riyadh"] = now_riyadh().strftime("%Y-%m-%d %H:%M")
+    reporting_event("observation", tr, observed_price=last_price,
+                    candle_time=str(df_5m.index[-1]))
     direction = tr["direction"]
     entry     = float(tr["entry"])
     stop      = float(tr["stop"])
@@ -1983,6 +1964,7 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
             tr["live_since_utc"] = datetime.utcnow()
             tr["activation_price"] = float(last_price)
             tr["activated_at_riyadh"] = now_riyadh()
+            reporting_event("activated", tr, observed_price=last_price)
             send_telegram(
                 CFG.user_title + " - Trade Activated\n"
                 "Direction: " + direction + "\n"
@@ -1997,6 +1979,7 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
                 else (last_price >= stop)
             )
             if stop_hit:
+                reporting_event("cancelled", tr, observed_price=last_price, exit_reason="stop_before_activation")
                 send_telegram(
                     CFG.user_title + " - Pending Trade Cancelled\n"
                     "Direction: " + direction + " | Entry: " + safe_f1(entry) + "\n"
@@ -2046,12 +2029,14 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
                 tr["stop"] = float(tr["entry"])
         elif idx >= 3:
             pass
+        reporting_event("target_hit", tr, target=name, target_price=tgt_price,
+                        observed_price=last_price, candle_time=str(df_5m.index[-1]))
         # Target messages
         if idx == 1:
             send_telegram(
                 CFG.user_title + " - " + name + " Hit\n"
                 + name + ": " + safe_f1(tgt_price) + "\n"
-                "Probability was: " + str(safe_int(info.get("prob"))) + "%\n"
+                "Heuristic estimate was: " + str(safe_int(info.get("prob"))) + "%\n"
                 "Stop remains: " + safe_f1(tr["stop"])
             )
         else:
@@ -2059,7 +2044,7 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
             msg = (
                 CFG.user_title + " - " + name + " Hit\n"
                 + name + ": " + safe_f1(tgt_price) + "\n"
-                "Probability was: " + str(safe_int(info.get("prob"))) + "%\n"
+                "Heuristic estimate was: " + str(safe_int(info.get("prob"))) + "%\n"
                 "Zone: " + info.get("zone", "") + "\n"
                 "Stop: " + safe_f1(tr["stop"])
             )
@@ -2227,6 +2212,8 @@ def evaluate_once():
                 key_levels, level_now, STATE.active_trade
             ))
             STATE.last_hour_sent = current_hour
+    reporting_daily(symbol, session, level_now, key_levels, bias,
+                    STATE.market_label, STATE.market_dir, STATE.market_adx, liq_state, exp_move_val)
     maybe_send_daily_stats()
     maybe_send_weekly_stats()
     maybe_send_daily_audit()
@@ -2381,7 +2368,7 @@ def evaluate_once():
         level_now=level_now, direction=direction, level_hit=level_hit,
         plan=plan, score=score, conf=conf, p_t1=p1, p_t2=p2,
         exp_move=exp_move_val, eta_band=eta,
-        reasons=reasons + extra_reasons,
+        reasons=reasons + extra_reasons, key_levels=key_levels,
     )
     send_telegram(msg)
     STATE.mark_signal(key)
@@ -2439,6 +2426,12 @@ def evaluate_once():
         "last_target_hit_idx":   0,
         "reversal_watch_sent":   False,
     }
+    reporting_event("signal", STATE.active_trade, symbol=symbol, key_levels=key_levels,
+                    reasons=reasons + extra_reasons, probability_t1=p1, probability_t2=p2,
+                    atr_1h=exp_move_val, eta_minutes=eta, market_state=market_state_str,
+                    liquidity=liq_state, signal_price=level_now,
+                    bar_times={"5m": str(df_5m.index[-1]), "15m": str(df_15m.index[-1]),
+                               "1h": str(df_1h.index[-1]), "4h": str(df_4h.index[-1])})
 # =========================
 # Main Loop
 # =========================
@@ -3006,7 +2999,7 @@ def _report_msg(result, direction, plan, score, conf):
         "Time remaining: " + "{:.1f}".format(hrs) + "h | " + tz_str + "\n\n"
         "--- Bot Signal ---\n"
         "Direction: " + direction + " | " + plan.get("trade_type", "N/A") + "\n"
-        "Score: " + str(score) + "/6 | Confidence: " + str(conf) + "%\n"
+        "Score: " + str(score) + "/6 | Setup quality (heuristic): " + str(conf) + "%\n"
         "Entry: " + safe_f1(plan.get("entry")) + " | Stop: " + safe_f1(plan.get("stop")) + "\n"
         "T1: " + safe_f1(plan.get("t1")) + " | T2: " + safe_f1(plan.get("t2")) + "\n\n"
         "--- Contract ---\n"
@@ -3255,6 +3248,7 @@ def update_manual_stop_from_command(text):
     tr["manual_stop_updated_riyadh"] = now_riyadh().strftime("%Y-%m-%d %H:%M")
     tr["stop_pending"] = False
     tr.pop("stop_pending_since_utc", None)
+    reporting_event("manual_stop", tr, previous_stop=old_stop, new_stop=new_stop)
     return (
         CFG.user_title + " - Stop Updated\n"
         "Old: " + safe_f1(old_stop) + "\n"
@@ -3269,6 +3263,7 @@ def close_active_trade_manually(text):
     parts = text.split(maxsplit=1)
     reason = parts[1].strip() if len(parts) > 1 else "manual command"
     if tr.get("status") == "pending":
+        reporting_event("cancelled", tr, exit_reason="manual: " + reason)
         STATE.active_trade = None
         try:
             SPXW_STATE.clear_contract_data()
@@ -3341,6 +3336,8 @@ def command_help_message():
         "/close - إغلاق الصفقة داخل البوت يدويًا\n"
         "/scan - بحث يدوي عن فرصة الآن\n"
         "/daily_bias - تقرير تنفيذي عربي لحركة اليوم\n"
+        "/evaluation - ملخص سجل التقييم لآخر 7 أيام\n"
+        "/export_evaluation 7 - تنزيل سجل آخر 7 أيام (CSV)\n"
         "/daily_audit - أخطاء الصفقات الخاسرة والمتكررة اليوم\n"
         "/targets_refresh - محاولة تحديث الهدف التالي يدويًا\n"
         "/wb_login - إعادة تسجيل Webull\n"
@@ -3393,72 +3390,17 @@ def _daily_view_text(market_label, bias, price, supports, resistances):
     return "الصورة غير كافية لاتجاه واضح. الانتظار أفضل من إجبار صفقة."
 
 def daily_bias_message():
+    # A display-only snapshot: do not refresh or overwrite the trading-state cache.
+    from bot_reporting import daily_text
     symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
     df_5m = compute_indicators_5m(df_5m)
     price = float(df_5m["close"].iloc[-1])
     label, market_dir, adx_val = compute_market_state(df_1h, df_4h, STATE.market_label)
-    STATE.market_label = label
-    STATE.market_dir = market_dir
-    STATE.market_adx = adx_val
-    STATE.market_state_last_calc_utc = datetime.utcnow()
     bias = structure_bias(df_1h, df_4h)
     levels = extract_key_levels(df_15m, df_1h)
-    supports, resistances = _levels_around_price(levels, price)
-    liq_state_val, liq_ratio = liquidity_state(df_5m)
-    exp_move_val = expected_move_1h(df_1h)
-    view = _daily_view_text(label, bias, price, supports, resistances)
-    adx_txt = safe_f1(adx_val)
-    exp_txt = safe_f1(exp_move_val) + " نقطة" if exp_move_val else "N/A"
-    liq_txt = liq_state_val
-    if liq_ratio is not None:
-        liq_txt += " (" + safe_f2(liq_ratio) + "x)"
-    primary = "محايد"
-    if bias == "Bullish" or market_dir == "Bullish":
-        primary = "صاعد بشرط الثبات فوق أقرب دعم"
-    elif bias == "Bearish" or market_dir == "Bearish":
-        primary = "هابط بشرط الفشل تحت أقرب مقاومة"
-    buy_line = "أفضل شراء يكون من دعم واضح مع شمعة تأكيد، وليس بعد اندفاع طويل."
-    sell_line = "أفضل بيع يكون من مقاومة واضحة مع رفض أو كسر مستوى مهم."
-    if supports:
-        buy_line = "إذا حافظ السعر على " + safe_f1(supports[0]) + " ففرص BUY من الرجوع تكون أفضل."
-    if resistances:
-        sell_line = "إذا رفض السعر " + safe_f1(resistances[0]) + " ففرصة SELL السريعة تصبح قابلة للمراقبة."
-    break_line = "إذا كسر أقرب دعم/مقاومة بإغلاق 5 دقائق، نغير السيناريو بدل العناد."
-    if supports:
-        break_line = "كسر " + safe_f1(supports[0]) + " بإغلاق 5 دقائق يضعف سيناريو الصعود."
-    if resistances and bias == "Bullish":
-        break_line = "اختراق " + safe_f1(resistances[0]) + " بإغلاق 5 دقائق يدعم استمرار الصعود."
-    ts = now_riyadh().strftime("%Y-%m-%d %H:%M")
-    return (
-        CFG.user_title + " - التقرير التنفيذي اليومي\n\n" +
-        "الوقت: " + ts + " (Riyadh)\n" +
-        "الرمز: " + symbol + "\n" +
-        "السعر الحالي: " + safe_f1(price) + "\n\n" +
-        "النظرة التنفيذية:\n" +
-        view + "\n\n" +
-        "وضع السوق:\n" +
-        "الحالة: " + label + "\n" +
-        "الاتجاه العام: " + market_dir + "\n" +
-        "Bias 1H/4H: " + bias + "\n" +
-        "ADX: " + adx_txt + "\n" +
-        "السيولة: " + liq_txt + "\n" +
-        "الحركة المتوقعة 1H: " + exp_txt + "\n\n" +
-        "الاتجاه الرئيسي:\n" +
-        primary + "\n\n" +
-        "المستويات المهمة:\n" +
-        "مقاومات: " + _fmt_short_levels(resistances) + "\n" +
-        "دعوم: " + _fmt_short_levels(supports) + "\n\n" +
-        "خطة اليوم:\n" +
-        "1. " + buy_line + "\n" +
-        "2. " + sell_line + "\n" +
-        "3. " + break_line + "\n\n" +
-        "ملاحظات المخاطر:\n" +
-        "لا تطارد الشموع الممتدة.\n" +
-        "تجنب الدخول في منتصف الرينج.\n" +
-        "لعقود 0DTE ركز على Delta بين 0.35 و0.55 وسبريد ضيق.\n\n" +
-        "الخلاصة التنفيذية:\n" +
-        "خل السعر يجي لمستواك. إذا الصورة غير نظيفة، الكاش قرار."
-    )
+    liq, _ = liquidity_state(df_5m)
+    return daily_text(symbol, session_label(), price, levels, bias, label,
+                      market_dir, adx_val, liq, expected_move_1h(df_1h), now_riyadh())
 
 def run_manual_scan(reply_fn):
     if STATE.active_trade is not None:
@@ -3485,6 +3427,63 @@ def run_manual_scan(reply_fn):
 
 # Command Handler
 # =========================
+
+def reporting_event(event, trade, **details):
+    try:
+        from bot_reporting import REPORTS
+        REPORTS.journal.record(event, trade, now_riyadh(), **details)
+    except Exception as exc:
+        print("[WARN] Reporting unavailable: " + type(exc).__name__)
+
+
+def reporting_signal_explanation(direction, level, plan, reasons, levels):
+    try:
+        from bot_reporting import signal_explanation
+        return signal_explanation(direction, level, plan, reasons, levels, CFG.pending_invalidate_at_stop)
+    except Exception as exc:
+        print("[WARN] Signal explanation unavailable: " + type(exc).__name__)
+        return "شرح الإشارة غير متاح لهذه القراءة؛ راجع الأسباب أعلاه."
+
+
+def reporting_daily(symbol, session, price, levels, bias, label, market_dir, adx, liquidity, atr):
+    try:
+        from bot_reporting import REPORTS, daily_text
+        if REPORTS.daily_due(symbol, levels, price, bias, label, market_dir, now_ny(), now_riyadh()):
+            send_telegram(daily_text(symbol, session, price, levels, bias, label,
+                                     market_dir, adx, liquidity, atr, now_riyadh()))
+    except Exception as exc:
+        print("[WARN] Daily presentation unavailable: " + type(exc).__name__)
+
+
+def reporting_command(text, chat_id, reply):
+    # Called only after the existing configured-chat authorization check.
+    try:
+        from bot_reporting import REPORTS
+        parts = text.split()
+        if len(parts) > 2 or (len(parts) == 2 and not parts[1].isascii()):
+            raise ValueError("invalid days")
+        days = int(parts[1]) if len(parts) == 2 else 7
+        if not 1 <= days <= 90:
+            raise ValueError("invalid days")
+        if parts[0].lower() == "/evaluation":
+            reply(chat_id, REPORTS.journal.summary(days, now_riyadh()))
+            return
+        data = REPORTS.journal.export_csv(days, now_riyadh())
+        filename = "dr_mohammed_evaluation_" + now_riyadh().strftime("%Y%m%d") + ".csv"
+        response = requests.post(
+            "https://api.telegram.org/bot" + CFG.telegram_bot_token + "/sendDocument",
+            data={"chat_id": chat_id, "caption": CFG.user_title + " | سجل التقييم — " + str(days) + " أيام"},
+            files={"document": (filename, data, "text/csv")}, timeout=30,
+        )
+        if not response.ok or not response.json().get("ok"):
+            reply(chat_id, CFG.user_title + " | تعذّر إرسال الملف. السجل محفوظ؛ حاول مرة أخرى.")
+    except ValueError:
+        reply(chat_id, CFG.user_title + " | استخدم عدد أيام من 1 إلى 90، مثل /export_evaluation 7. إذا كبر الملف اختر فترة أقصر.")
+    except Exception as exc:
+        print("[WARN] Evaluation command failed: " + type(exc).__name__)
+        reply(chat_id, CFG.user_title + " | تعذّرت قراءة السجل أو إرساله. راجع التخزين والاتصال ثم أعد المحاولة.")
+
+
 class _TelegramCommandHandler:
     def __init__(self):
         self._offset  = 0
@@ -3545,6 +3544,8 @@ class _TelegramCommandHandler:
                             self._reply(chat_id, daily_bias_message())
                         except Exception as e:
                             self._reply(chat_id, CFG.user_title + " - Daily Bias Error\n" + repr(e))
+                    elif cmd in ("/evaluation", "/export_evaluation"):
+                        reporting_command(text, chat_id, self._reply)
                     elif cmd in ("/daily_audit", "/audit_today", "/loss_review"):
                         self._reply(chat_id, manual_daily_audit_message())
                     elif cmd == "/scan":
