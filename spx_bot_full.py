@@ -1401,12 +1401,13 @@ def signal_message(session, symbol, market_state_str, liq_state,
         "مقياس التذبذب الساعي (ATR): " + exp_txt + " — مقياس تاريخي\n"
         "ETA to T1 (تقريبي): " + eta_txt + "\n\n"
         "Reason: " + ", ".join(reasons) + "\n\n"
-        + motion_text() + "\n\n" + reporting_signal_explanation(direction, level_hit, plan, reasons, key_levels or [])
+        + reporting_signal_explanation(direction, level_hit, plan, reasons, key_levels or [])
     )
 def hourly_update_message(session, symbol, bias, market_state_str,
                           levels, price, active_trade):
+    from bot_reporting import REPORTS
     return REPORTS.hourly(session, symbol, bias, market_state_str,
-                          levels, price, active_trade, now_riyadh()) + "\n\n" + motion_text()
+                          levels, price, active_trade, now_riyadh())
 # === END PART 2 ===
 # === PART 3 ===
 # BotState, Reset, Wick Validation, Scoring, Dynamic Extension, Trade Recording, Update Active Trade
@@ -1711,7 +1712,7 @@ def detect_weakening_or_reversal_watch(df_5m, direction):
         if c > pc and l >= pl:
             return True, "sell follow-through weakening"
     return False, "no weakness"
-def legacy_extend_next_target(df_5m, df_15m, df_1h, last_price,
+def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price,
                              manual=False, notify_skip=False):
     tr = STATE.active_trade
     if tr is None or tr.get("status") != "live":
@@ -1721,9 +1722,6 @@ def legacy_extend_next_target(df_5m, df_15m, df_1h, last_price,
     exp_move_val = expected_move_1h(df_1h)
     levels       = extract_key_levels(df_15m, df_1h)
     override_notes = []
-    if STRATEGY.extension_retry_enabled:
-        tr["extension_evaluation"] = {"atr_1h": exp_move_val, "key_levels": list(levels),
-                                      "used_targets": list(used_targets)}
     if manual:
         dynamic_targets = tr.get("dynamic_targets", {})
         if dynamic_targets:
@@ -1754,8 +1752,6 @@ def legacy_extend_next_target(df_5m, df_15m, df_1h, last_price,
         direction=direction, exp_move_val=exp_move_val,
         used_targets=used_targets, stage=stage_name,
     )
-    if STRATEGY.extension_retry_enabled:
-        tr["extension_evaluation"].update(candidate=candidate, stage=stage_name)
     if candidate is None:
         reason = "no valid next target found"
         tr["last_extension_skip_reason"] = reason
@@ -1770,8 +1766,6 @@ def legacy_extend_next_target(df_5m, df_15m, df_1h, last_price,
         market_label=STATE.market_label, exp_move_val=exp_move_val,
         current_price=last_price, candidate_target=candidate,
     )
-    if STRATEGY.extension_retry_enabled:
-        tr["extension_evaluation"]["behavior_check"] = behavior_reason
     if not ok:
         if not manual:
             reason = behavior_reason
@@ -1795,8 +1789,6 @@ def legacy_extend_next_target(df_5m, df_15m, df_1h, last_price,
         liq_state=liq_state_val,
     )
     min_prob = max(35, CFG.target_probability_min_to_extend - (next_idx - 3) * 3)
-    if STRATEGY.extension_retry_enabled:
-        tr["extension_evaluation"].update(probability_estimate=prob, minimum_probability=min_prob)
     if prob < min_prob:
         if not manual:
             reason = "probability low (" + str(prob) + "% < " + str(min_prob) + "%)"
@@ -1825,8 +1817,7 @@ def legacy_extend_next_target(df_5m, df_15m, df_1h, last_price,
         anchor_info  = tr["dynamic_targets"].get("T" + str(anchor_idx), {})
         anchor_price = anchor_info.get("price")
         if anchor_info.get("hit") and anchor_price is not None:
-            tr["stop"] = (max(float(tr["stop"]), float(anchor_price)) if direction == "BUY"
-                          else min(float(tr["stop"]), float(anchor_price))) if STRATEGY.extension_retry_enabled else float(anchor_price)
+            tr["stop"] = float(anchor_price)
     send_telegram(
         CFG.user_title + " - New Target: " + stage_name + "\n"
         "Price: " + safe_f1(candidate) + "\n"
@@ -1835,7 +1826,7 @@ def legacy_extend_next_target(df_5m, df_15m, df_1h, last_price,
         "Stop: " + safe_f1(tr["stop"])
         + (("\nNotes: " + " | ".join(override_notes)) if override_notes else "")
     )
-    if not STRATEGY.extension_retry_enabled and prob >= 65 and dynamic_extension_allowed(df_5m, direction):
+    if prob >= 65 and dynamic_extension_allowed(df_5m, direction):
         maybe_extend_next_target(df_5m, df_15m, df_1h, last_price)
     return True, stage_name + " created"
 # =========================
@@ -1868,9 +1859,7 @@ def record_closed_trade(result_label, max_target_hit, r_result,
     STATE.stats.add_trade(rec)
     audit_losing_trade(tr, result_label, max_target_hit, r_result)
     reporting_event("closed", tr, exit_price=exit_price, exit_reason=exit_reason,
-                    r_result=r_result, result_label=result_label, max_target_hit=max_target_hit,
-                    weakness_decision=tr.get("last_weakness_decision"),
-                    extension_decision=tr.get("last_extension_decision"))
+                    r_result=r_result, result_label=result_label, max_target_hit=max_target_hit)
 def compute_exit_result(tr, exit_price):
     """Score observed index movement; this is not an option fill or realized P&L."""
     if tr is None:
@@ -1970,17 +1959,6 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
             (last_price >= entry) if direction == "BUY"
             else (last_price <= entry)
         )
-        if triggered and STRATEGY.fast_motion_enabled:
-            allowed, why = motion_entry_allowed(direction, getattr(STATE, "fast_motion", None))
-            if not allowed:
-                strategy_event_once("activation_blocked", tr, strategy_now().floor("5min"), why,
-                                    fast_motion=getattr(STATE, "fast_motion", {}), observed_price=last_price)
-                if why == "entry_against_confirmed_impulse":
-                    reporting_event("cancelled", tr, exit_reason=why)
-                    send_telegram(CFG.user_title + " - Pending Trade Cancelled\n"
-                                  "تغير الاندفاع الحالي وأصبح عكس الإشارة؛ أُلغيت قبل التفعيل.")
-                    STATE.active_trade = None
-                return
         if triggered:
             tr["status"]         = "live"
             tr["live_since_utc"] = datetime.utcnow()
@@ -2034,8 +2012,6 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
             continue
         info["hit"]               = True
         tr["last_target_hit_idx"] = idx
-        if idx == 2 and (STRATEGY.confirmed_weakness_enabled or STRATEGY.extension_retry_enabled) and "strategy_t2_hit_at" not in tr:
-            tr["strategy_t2_hit_at"] = strategy_now().isoformat()
         # Stop Movement
         if idx == 1:
             pass
@@ -2064,8 +2040,7 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
                 "Stop remains: " + safe_f1(tr["stop"])
             )
         else:
-            weak, weak_reason = ((False, "") if STRATEGY.confirmed_weakness_enabled else
-                                 detect_weakening_or_reversal_watch(df_5m, direction))
+            weak, weak_reason = detect_weakening_or_reversal_watch(df_5m, direction)
             msg = (
                 CFG.user_title + " - " + name + " Hit\n"
                 + name + ": " + safe_f1(tgt_price) + "\n"
@@ -2087,12 +2062,12 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
             print("[WARN] spxw_on_target_hit: " + repr(e))
         # Extend next target
         highest_defined = max(int(k.replace("T", "")) for k in dynamic_targets.keys())
-        if idx >= highest_defined and not STRATEGY.extension_retry_enabled:
+        if idx >= highest_defined:
             maybe_extend_next_target(df_5m, df_15m, df_1h, last_price,
                                      notify_skip=True)
     # --- Weakness Exit ---
     max_hit_idx = current_max_target_hit(tr)
-    if max_hit_idx >= 2 and not STRATEGY.confirmed_weakness_enabled:
+    if max_hit_idx >= 2:
         weak, weak_reason = detect_weakening_or_reversal_watch(df_5m, direction)
         if weak and not tr.get("reversal_watch_sent"):
             tr["reversal_watch_sent"] = True
@@ -2189,9 +2164,6 @@ def update_active_trade(df_5m, df_15m, df_1h, last_price):
     if tr.get("stop_pending"):
         tr["stop_pending"] = False
         tr.pop("stop_pending_since_utc", None)
-
-    if not breached:
-        strategy_manage_after_targets(df_5m, df_15m, df_1h, last_price)
 # === END PART 3 ===
 # === PART 4 ===
 # evaluate_once, main, SPXW Evaluator Module
@@ -2230,7 +2202,6 @@ def evaluate_once():
     bias         = structure_bias(df_1h, df_4h)
     key_levels   = extract_key_levels(df_15m, df_1h)
     exp_move_val = expected_move_1h(df_1h)
-    motion = strategy_motion(df_5m, df_15m, df_1h)
     if STATE.active_trade is not None:
         update_active_trade(df_5m, df_15m, df_1h, level_now)
     if CFG.hourly_update:
@@ -2252,7 +2223,6 @@ def evaluate_once():
     if STATE.active_trade is not None:
         return
     if not key_levels:
-        strategy_rejection("no_key_levels", df_5m)
         return
     level_hit, level_info = choose_best_level(df_5m, level_now, key_levels)
     wick_info             = level_info["wick_info"]
@@ -2292,28 +2262,19 @@ def evaluate_once():
         if direction is None:
             blocked = True
     if blocked or direction is None:
-        strategy_rejection("wick_direction_conflict", df_5m, direction, level_hit)
-        return
-    motion_ok, motion_reason = motion_entry_allowed(direction, motion)
-    if not motion_ok:
-        strategy_rejection(motion_reason, df_5m, direction, level_hit)
         return
     score, reasons, trigger = score_setup(df_5m, level_hit, direction, wick_info)
     if score <= 0:
-        strategy_rejection("no_trigger", df_5m, direction, level_hit)
         return
     conf       = confidence_percent(score, direction, bias, session,
                                     STATE.market_label, liq_state)
     trade_type = classify_trade_strength(score, conf)
     if CFG.block_all_weak_trades and trade_type == "Weak":
-        strategy_rejection("weak_trade_disabled", df_5m, direction, level_hit)
         return
     if is_offhours(session):
         if score < CFG.offhours_min_score:
-            strategy_rejection("offhours_low_score", df_5m, direction, level_hit, score=score)
             return
         if CFG.offhours_block_weak and trade_type == "Weak":
-            strategy_rejection("offhours_weak_trade", df_5m, direction, level_hit)
             return
     if CFG.block_counter_trend_in_trending_market and STATE.market_label == "Trending":
         if STATE.market_dir == "Bullish" and direction == "SELL":
@@ -2322,7 +2283,6 @@ def evaluate_once():
                 market_label=STATE.market_label, market_dir=STATE.market_dir,
                 df_5m=df_5m, score=score,
             )):
-                strategy_rejection("counter_trend_filter", df_5m, direction, level_hit)
                 return
         if STATE.market_dir == "Bearish" and direction == "BUY":
             if not (CFG.allow_counter_trend_wick_if_strong and wick_trade_is_valid(
@@ -2330,14 +2290,12 @@ def evaluate_once():
                 market_label=STATE.market_label, market_dir=STATE.market_dir,
                 df_5m=df_5m, score=score,
             )):
-                strategy_rejection("counter_trend_filter", df_5m, direction, level_hit)
                 return
     if not wick_trade_is_valid(
         direction=direction, trigger=trigger, level_info=level_info,
         market_label=STATE.market_label, market_dir=STATE.market_dir,
         df_5m=df_5m, score=score,
     ):
-        strategy_rejection("wick_validation", df_5m, direction, level_hit)
         return
     range_ok, range_reason = range_level_is_clean(
         levels=key_levels, level_hit=level_hit, direction=direction,
@@ -2345,14 +2303,12 @@ def evaluate_once():
         market_adx=STATE.market_adx, exp_move_val=exp_move_val,
     )
     if not range_ok:
-        strategy_rejection("range_filter: " + range_reason, df_5m, direction, level_hit)
         return
     messy_ok, messy_reason = messy_trade_is_allowed(
         direction=direction, trigger=trigger, level_info=level_info,
         df_5m=df_5m, session=session,
     )
     if not messy_ok:
-        strategy_rejection("messy_filter: " + messy_reason, df_5m, direction, level_hit)
         return
     if CFG.require_momentum_confirmation:
         if direction == "BUY" and not strong_buy_confirmation(df_5m):
@@ -2365,7 +2321,6 @@ def evaluate_once():
                 and momentum_breakout(df_5m, level_hit, "BUY")
             )
             if not allow_buy:
-                strategy_rejection("buy_momentum_not_confirmed", df_5m, direction, level_hit)
                 return
         if direction == "SELL" and not strong_sell_confirmation(df_5m):
             allow_sell = (
@@ -2377,11 +2332,9 @@ def evaluate_once():
                 and momentum_breakout(df_5m, level_hit, "SELL")
             )
             if not allow_sell:
-                strategy_rejection("sell_momentum_not_confirmed", df_5m, direction, level_hit)
                 return
     if trade_type == "Weak" and trigger != "Wick Rejection near Level":
         if not level_info["strong"]:
-            strategy_rejection("weak_level", df_5m, direction, level_hit)
             return
     plan = compute_trade_plan(
         df_5m=df_5m, levels=key_levels, level_hit=level_hit,
@@ -2391,12 +2344,10 @@ def evaluate_once():
     )
     rr = plan.get("rr")
     if rr is not None and np.isfinite(float(rr)) and float(rr) < CFG.min_rr_to_t1:
-        strategy_rejection("minimum_rr", df_5m, direction, level_hit, rr=rr)
         return
     key = (STATE.market_label + ":" + direction + ":"
            + str(round(level_hit, 1)) + ":" + trigger + ":" + trade_type)
     if not STATE.can_signal(key):
-        strategy_rejection("signal_cooldown", df_5m, direction, level_hit)
         return
     dist_t1 = abs(float(plan["t1"]) - level_now) if plan.get("t1") else None
     dist_t2 = abs(float(plan["t2"]) - level_now) if plan.get("t2") else None
@@ -2474,10 +2425,9 @@ def evaluate_once():
         "next_target_idx_to_define": max(3, initial_highest + 1),
         "last_target_hit_idx":   0,
         "reversal_watch_sent":   False,
-        "fast_motion_at_entry": motion,
     }
     reporting_event("signal", STATE.active_trade, symbol=symbol, key_levels=key_levels,
-                    reasons=reasons + extra_reasons, probability_t1=p1, probability_t2=p2, fast_motion=motion,
+                    reasons=reasons + extra_reasons, probability_t1=p1, probability_t2=p2,
                     atr_1h=exp_move_val, eta_minutes=eta, market_state=market_state_str,
                     liquidity=liq_state, signal_price=level_now,
                     bar_times={"5m": str(df_5m.index[-1]), "15m": str(df_15m.index[-1]),
@@ -2489,12 +2439,12 @@ def main():
     send_telegram(
         CFG.user_title + " - Bot Started\n"
         "- Source: TradingView (" + CFG.tv_exchange + ":" + CFG.tv_symbol + ")\n"
-        "- Direction: Bias(1H/4H) + confirmed 5m/15m impulse filter\n"
-        "- Targets: Retry after final hit target (T2+), on each new closed 5m bar\n"
+        "- Direction: Bias(1H/4H) -> Wick / Break-Retest / Momentum\n"
+        "- Targets: Unlimited (auto-extend after T4)\n"
         "- Pending cancel: at stop level\n"
         "- Weekend blackout: Sat 01:00 -> Mon 01:00\n"
         "- SPXW Evaluator: " + ("ON (Delta + Theta tracking)" if SPXW_CFG.enabled else "OFF") + "\n" +
-        "- Stats: Daily + Weekly\n" + "- Version: " + STRATEGY_VERSION
+        "- Stats: Daily + Weekly"
     )
     try:
         _HANDLER.start()
@@ -3441,6 +3391,7 @@ def _daily_view_text(market_label, bias, price, supports, resistances):
 
 def daily_bias_message():
     # A display-only snapshot: do not refresh or overwrite the trading-state cache.
+    from bot_reporting import daily_text
     symbol, df_4h, df_1h, df_15m, df_5m = fetch_timeframes()
     df_5m = compute_indicators_5m(df_5m)
     price = float(df_5m["close"].iloc[-1])
@@ -3479,6 +3430,7 @@ def run_manual_scan(reply_fn):
 
 def reporting_event(event, trade, **details):
     try:
+        from bot_reporting import REPORTS
         REPORTS.journal.record(event, trade, now_riyadh(), **details)
     except Exception as exc:
         print("[WARN] Reporting unavailable: " + type(exc).__name__)
@@ -3486,6 +3438,7 @@ def reporting_event(event, trade, **details):
 
 def reporting_signal_explanation(direction, level, plan, reasons, levels):
     try:
+        from bot_reporting import signal_explanation
         return signal_explanation(direction, level, plan, reasons, levels, CFG.pending_invalidate_at_stop)
     except Exception as exc:
         print("[WARN] Signal explanation unavailable: " + type(exc).__name__)
@@ -3494,6 +3447,7 @@ def reporting_signal_explanation(direction, level, plan, reasons, levels):
 
 def reporting_daily(symbol, session, price, levels, bias, label, market_dir, adx, liquidity, atr):
     try:
+        from bot_reporting import REPORTS, daily_text
         if REPORTS.daily_due(symbol, levels, price, bias, label, market_dir, now_ny(), now_riyadh()):
             send_telegram(daily_text(symbol, session, price, levels, bias, label,
                                      market_dir, adx, liquidity, atr, now_riyadh()))
@@ -3504,6 +3458,7 @@ def reporting_daily(symbol, session, price, levels, bias, label, market_dir, adx
 def reporting_command(text, chat_id, reply):
     # Called only after the existing configured-chat authorization check.
     try:
+        from bot_reporting import REPORTS
         parts = text.split()
         if len(parts) > 2 or (len(parts) == 2 and not parts[1].isascii()):
             raise ValueError("invalid days")
@@ -3662,712 +3617,7 @@ def spxw_evaluator_start():
 # =========================
 # Entry point
 # =========================
-# Embedded reporting: keep deployment self-contained.
-"""Presentation and an observational journal. No trading decisions or broker calls.
-
-Only allowlisted signal data enters the journal. Failures are reported to the
-operator and never used to accept/reject an entry or change an active trade.
-"""
-import csv
-import hashlib
-import io
-import json
-import math
-import os
-import sqlite3
-import threading
-from datetime import date, datetime, timedelta
-from pathlib import Path
-
-VERSION = "strategy-v2-candidate"
-TITLE = "دكتور محمد"
-
-
-def number(value):
-    try:
-        value = float(value)
-        return value if math.isfinite(value) else None
-    except (TypeError, ValueError):
-        return None
-
-
-def fmt(value):
-    value = number(value)
-    return "غير متاح" if value is None else f"{value:.1f}"
-
-
-def clean(value):
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {str(k): clean(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [clean(v) for v in value]
-    if isinstance(value, bool) or value is None or isinstance(value, str):
-        return value
-    if isinstance(value, int):
-        return value
-    try:
-        return number(value)
-    except Exception:
-        return None
-
-
-def split_levels(levels, price):
-    values = sorted(set(x for v in levels if (x := number(v)) is not None))
-    return ([v for v in reversed(values) if v < price],
-            [v for v in values if v > price], [v for v in values if v == price])
-
-
-def levels_text(levels):
-    return " / ".join(fmt(v) for v in levels) or "غير متاحة"
-
-
-def key_levels_text(levels, price):
-    supports, resistances, at_price = split_levels(levels, price)
-    lines = ["📍 Key Levels — الأقرب أولًا",
-             "مقاومات: " + levels_text(resistances),
-             "السعر: " + fmt(price), "دعوم: " + levels_text(supports)]
-    if at_price:
-        lines.append("مستوى عند السعر: " + levels_text(at_price))
-    return "\n".join(lines)
-
-
-def scenarios(levels, price, bias, market_label, market_dir):
-    supports, resistances, _ = split_levels(levels, price)
-    support = supports[0] if supports else None
-    resistance = resistances[0] if resistances else None
-    up = "المحطات الأعلى: " + levels_text(resistances)
-    down = "المحطات الأدنى: " + levels_text(supports)
-    bullish = (bias == "Bullish" and market_dir != "Bearish"
-               and market_label not in ("Range", "Messy", "Weak"))
-    bearish = (bias == "Bearish" and market_dir != "Bullish"
-               and market_label not in ("Range", "Messy", "Weak"))
-    if bullish and support is not None:
-        return ("ميل صاعد مشروط بالحفاظ على الدعم " + fmt(support),
-                "إذا حافظ السعر على " + fmt(support) + " وظهر تأكيد ارتداد، نراقب الصعود. " + up,
-                "إذا فقد الدعم " + fmt(support) + "، نراقب امتداد الهبوط. "
-                + "المحطات التالية: " + levels_text(supports[1:]),
-                "تداول السعر دون " + fmt(support) + " يستدعي إعادة تقييم سيناريو الصعود.")
-    if bearish and resistance is not None:
-        return ("ميل هابط مشروط بالبقاء دون المقاومة " + fmt(resistance),
-                "إذا ظهر رفض عند " + fmt(resistance) + "، نراقب الهبوط. " + down,
-                "إذا تجاوز المقاومة " + fmt(resistance) + "، نراقب امتداد الصعود. "
-                + "المحطات التالية: " + levels_text(resistances[1:]),
-                "تداول السعر فوق " + fmt(resistance) + " يستدعي إعادة تقييم سيناريو الهبوط.")
-    if support is not None and resistance is not None:
-        return ("لا أفضلية اتجاهية واضحة في هذه القراءة",
-                "نراقب التفاعل بين الدعم " + fmt(support) + " والمقاومة " + fmt(resistance)
-                + ". الارتداد أو الرفض يحتاج تأكيدًا؛ وجود السعر عند المستوى وحده لا يكفي.",
-                "تجاوز أحد الطرفين يستدعي متابعة الاتجاه الجديد. " + up + "؛ " + down,
-                "الخروج من المنطقة بين " + fmt(support) + " و" + fmt(resistance)
-                + " أو تغير الميل يستدعي إعادة التقييم.")
-    return ("المستويات المتاحة لا تكفي لبناء سيناريو متوازن",
-            "نراقب أقرب مستوى متاح مع انتظار تأكيد مستقل. " + up + "؛ " + down,
-            "تُعاد القراءة عند ظهور مستويات إضافية أو تغير الميل.",
-            "لا يوجد شرط إلغاء محدد لسيناريو اتجاهي مكتمل في هذه القراءة.")
-
-
-def hourly_text(session, symbol, bias, market, levels, price, trade, now,
-                previous=None):
-    supports, resistances, _ = split_levels(levels, price)
-    lines = [TITLE + " | 🕐 تحديث الساعة", now.strftime("%Y-%m-%d %H:%M") + " بتوقيت الرياض",
-             symbol + " | " + session, "", "🧭 قراءة السوق", "الحالة: " + market,
-             "الميل 1H/4H: " + bias, "", key_levels_text(levels, price), "",
-             "👀 ما نراقبه", "أقرب دعم: " + fmt(supports[0] if supports else None)
-             + " | أقرب مقاومة: " + fmt(resistances[0] if resistances else None),
-             "نراقب رد الفعل عند المستوى؛ تأكيد الدخول يخضع لشروط البوت الحالية."]
-    if previous and previous.get("symbol") == symbol:
-        changes = []
-        delta = price - previous["price"]
-        if abs(delta) >= 0.05:
-            changes.append(f"السعر {delta:+.1f} نقطة")
-        if previous["bias"] != bias:
-            changes.append("الميل " + previous["bias"] + " ← " + bias)
-        if previous["levels"] != list(levels):
-            changes.append("تحدّثت Key Levels المعروضة")
-        if changes:
-            lines += ["", "التغير منذ التحديث السابق (" + previous["time"] + "): " + "؛ ".join(changes)]
-    lines += ["", "🎯 متابعة الصفقة"]
-    if not trade:
-        lines.append("لا توجد صفقة نشطة.")
-    else:
-        status = {"pending": "بانتظار التفعيل", "live": "مفعّلة"}.get(trade.get("status"), "غير معروف")
-        lines += [status + " | " + str(trade.get("direction", "")),
-                  "الدخول المخطط: " + fmt(trade.get("entry")) + " | الوقف الحالي: " + fmt(trade.get("stop")),
-                  "T1: " + fmt(trade.get("t1")) + " | T2: " + fmt(trade.get("t2"))
-                  + " | T3: " + fmt(trade.get("t3"))]
-        targets = trade.get("dynamic_targets", {})
-        pending = [(name, t) for name, t in targets.items() if not t.get("hit")]
-        pending.sort(key=lambda pair: int(pair[0][1:]))
-        if pending:
-            name, target = pending[0]
-            lines.append("الهدف التالي المتابع: " + name + " عند " + fmt(target.get("price")))
-        for t in trade.get("target_map", []):
-            lines.append(str(t["name"]) + ": " + fmt(t["price"]) + " | تقدير خريطة الأهداف: "
-                         + str(t.get("prob", "N/A")) + "% | " + str(t.get("zone", "")))
-    return "\n".join(lines)
-
-
-def daily_text(symbol, session, price, levels, bias, market_label, market_dir,
-               adx, liquidity, atr, now):
-    view, primary, alternative, invalidation = scenarios(levels, price, bias, market_label, market_dir)
-    return "\n".join([
-        TITLE + " | 🗓️ خطة اليوم", now.strftime("%Y-%m-%d %H:%M") + " بتوقيت الرياض",
-        symbol + " | " + session, "السعر: " + fmt(price), "",
-        "🧭 الصورة العامة", view,
-        "الحالة: " + market_label + " | الاتجاه: " + market_dir + " | الميل 1H/4H: " + bias,
-        "ADX: " + fmt(adx) + " | السيولة: " + liquidity,
-        "مقياس التذبذب الساعي (ATR): " + fmt(atr) + " نقطة — مقياس تاريخي، وليس حدودًا متوقعة", "",
-        key_levels_text(levels, price), "", "① السيناريو الأساسي", primary,
-        "", "② السيناريو البديل", alternative, "", "↻ متى نعيد التقييم؟", invalidation,
-        "", "هذه قراءة مشروطة للمستويات الحالية، وليست إشارة دخول أو توقعًا ثابتًا لنهاية اليوم."])
-
-
-def signal_explanation(direction, level, plan, reasons, levels, pending_invalidate):
-    translations = {"Wick Rejection near Level": "تجمّع ذيول رفض قرب المستوى",
-                    "Break&Retest": "تحقق شرط الكسر وإعادة الاختبار",
-                    "Rejection": "تحقق شرط شمعة الرفض", "Stoch RSI cross": "تقاطع Stoch RSI",
-                    "Momentum shift": "تحول في الزخم", "Momentum breakout": "تحقق شرط اختراق الزخم"}
-    evidence = [translations[r] for r in reasons if r in translations]
-    entry, t1, stop = (number(plan.get(k)) for k in ("entry", "t1", "stop"))
-    sign = 1 if direction == "BUY" else -1
-    obstacles = sorted(set(v for x in levels if (v := number(x)) is not None
-                           and entry is not None and t1 is not None
-                           and 0 < sign * (v - entry) < sign * (t1 - entry)), reverse=sign < 0)
-    activation = "عند أو فوق " if direction == "BUY" else "عند أو تحت "
-    route = "الدخول " + fmt(entry)
-    for name in ("t1", "t2", "t3"):
-        if number(plan.get(name)) is not None:
-            route += " ← " + name.upper() + " " + fmt(plan[name])
-    cancel = ("وصول السعر إلى الوقف " + fmt(stop) + " قبل التفعيل يلغي الإشارة وفق قواعد البوت."
-              if pending_invalidate else "الإلغاء التلقائي عند الوقف قبل التفعيل معطّل في الإعدادات.")
-    return "\n".join(["🧠 شرح الإشارة المبكرة", "المستوى المرجعي: " + fmt(level),
-                      "ما رصده البوت: " + ("؛ ".join(evidence) or "راجع قائمة الأسباب المسجلة أعلاه"),
-                      "شرط التفعيل الحالي: رصد السعر " + activation + fmt(entry) + " في دورة المتابعة.",
-                      "المسار المحتمل بعد التفعيل: " + route,
-                      "مستويات معاكسة قبل T1: " + (levels_text(obstacles) if obstacles else "لا توجد ضمن Key Levels المتاحة"),
-                      cancel, "بعد التفعيل تُطبّق قواعد الوقف وإدارة الصفقة الحالية.",
-                      "تحقق الأهداف مشروط باستمرار الحركة؛ هذا الشرح لا يضيف شرط دخول جديدًا."])
-
-
-TRADE_FIELDS = (
-    "direction", "level", "entry", "stop", "initial_stop", "t1", "t2", "t3", "t4",
-    "status", "created_utc", "last_price", "last_update_riyadh", "trade_type", "trigger",
-    "score", "confidence", "bias_at_entry", "signal_rr", "level_quality_score",
-    "level_touches", "level_strong", "level_tradable", "market_label_at_entry",
-    "session_at_entry", "target_map", "all_target_candidates", "dynamic_targets",
-    "activation_price", "activated_at_riyadh", "last_target_hit_idx", "stop_pending",
-    "fast_motion_at_entry", "last_weakness_decision", "last_extension_decision",
-    "last_extension_skip_reason", "strategy_t2_hit_at")
-
-
-class EvaluationJournal:
-    def __init__(self, path):
-        self.path = Path(path)
-        self.lock = threading.RLock()
-        self.last_error = None
-        self.last_success = None
-        self._last_observation = None
-
-    def _connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.path), timeout=0.5)
-        conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, at TEXT NOT NULL, "
-                     "trade_id TEXT NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL)")
-        conn.execute("CREATE INDEX IF NOT EXISTS events_at ON events(at)")
-        return conn
-
-    def trade_id(self, trade):
-        identity = [str(trade.get(k, "")) for k in ("created_utc", "direction", "entry", "level")]
-        return hashlib.sha256("|".join(identity).encode()).hexdigest()[:20]
-
-    def record(self, event, trade, now, **details):
-        if not trade:
-            return False
-        try:
-            trade_id = self.trade_id(trade)
-            sample_key = (trade_id, now.strftime("%Y-%m-%dT%H:%M"))
-            with self.lock:
-                if event == "observation" and sample_key == self._last_observation:
-                    return True
-                payload = clean({"schema": 2, "version": VERSION,
-                                 "price_basis": "observed_index_not_broker_fill",
-                                 "trade": {k: trade[k] for k in TRADE_FIELDS if k in trade},
-                                 "details": details})
-                conn = self._connect()
-                try:
-                    with conn:
-                        conn.execute("INSERT INTO events(at,trade_id,event,payload) VALUES(?,?,?,?)",
-                                     (now.isoformat(), trade_id, event,
-                                      json.dumps(payload, ensure_ascii=False, allow_nan=False)))
-                finally:
-                    conn.close()
-                if event == "observation":
-                    self._last_observation = sample_key
-                self.last_success = now.isoformat()
-                return True
-        except Exception as exc:
-            self.last_error = now.isoformat() + " | " + type(exc).__name__
-            # Do not print credentials, event payloads or database exception strings.
-            print("[WARN] Evaluation journal write failed: " + type(exc).__name__)
-            return False
-
-    def rows(self, days, now):
-        if not 1 <= days <= 90:
-            raise ValueError("days must be between 1 and 90")
-        since = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        if not self.path.exists():
-            return []
-        with self.lock:
-            conn = self._connect()
-            try:
-                rows = conn.execute("SELECT at,trade_id,event,payload FROM events WHERE at>=? AND at<=? ORDER BY id LIMIT 100001",
-                                    (since.isoformat(), now.isoformat())).fetchall()
-            finally:
-                conn.close()
-        if len(rows) > 100000:
-            raise ValueError("export too large; choose fewer days")
-        return [(at, tid, event, json.loads(payload)) for at, tid, event, payload in rows]
-
-    def summary(self, days, now):
-        rows = self.rows(days, now)
-        counts = {event: sum(row[2] == event for row in rows)
-                  for event in ("signal", "activated", "cancelled", "closed")}
-        results = [number(p["details"].get("r_result")) for _, _, event, p in rows if event == "closed"]
-        results = [r for r in results if r is not None]
-        wins, losses, be = (sum(r > 0 for r in results), sum(r < 0 for r in results), sum(r == 0 for r in results))
-        return "\n".join([TITLE + " | 📒 سجل التقييم", f"الفترة: آخر {days} أيام تقويمية حتى الآن",
-                           f"إشارات صدرت: {counts['signal']} | تفعّلت: {counts['activated']}",
-                           f"أُلغيت قبل التفعيل: {counts['cancelled']} | أُغلقت: {counts['closed']}",
-                           f"نتائج الإغلاق: ربح {wins} | خسارة {losses} | تعادل {be}",
-                           f"المحصلة المرصودة للمؤشر: {sum(results):+.2f}R — قبل التكاليف",
-                           "الإحصاء حسب وقت الحدث؛ قد تكون الصفقة المغلقة قد بدأت قبل الفترة.",
-                           "لا يمثل ربح العقود الفعلي، ولا يعيد بناء تداولات ما قبل تشغيل السجل.",
-                           "آخر تعثر كتابة في هذه الجلسة: " + (self.last_error or "لا يوجد"),
-                           "تنزيل الملف: /export_evaluation " + str(days)])
-
-    def export_csv(self, days, now):
-        rows = self.rows(days, now)
-        output = io.StringIO(newline="")
-        writer = csv.writer(output)
-        writer.writerow(["time_riyadh", "signal_id", "event", "direction", "status", "level",
-                         "planned_entry", "observed_activation", "initial_stop", "current_stop",
-                         "T1", "T2", "T3", "score", "quality_estimate", "market", "session",
-                         "observed_price", "exit_price", "exit_reason", "result_R", "highest_target_hit",
-                         "details_json", "snapshot_json"])
-        for at, tid, event, payload in rows:
-            tr, detail = payload["trade"], payload["details"]
-            values = [at, tid, event, tr.get("direction"), tr.get("status"), tr.get("level"),
-                      tr.get("entry"), tr.get("activation_price"), tr.get("initial_stop"), tr.get("stop"),
-                      tr.get("t1"), tr.get("t2"), tr.get("t3"), tr.get("score"), tr.get("confidence"),
-                      tr.get("market_label_at_entry"), tr.get("session_at_entry"),
-                      detail.get("observed_price", tr.get("last_price")), detail.get("exit_price"),
-                      detail.get("exit_reason"), detail.get("r_result"), detail.get("max_target_hit"),
-                      json.dumps(detail, ensure_ascii=False), json.dumps(tr, ensure_ascii=False)]
-            # Protect user-entered manual close reasons when opened by spreadsheet apps.
-            values = [("'" + v if isinstance(v, str) and v.lstrip().startswith(("=", "+", "-", "@")) else v)
-                      for v in values]
-            writer.writerow(values)
-        data = output.getvalue().encode("utf-8-sig")
-        if len(data) > 24 * 1024 * 1024:
-            raise ValueError("export too large; choose fewer days")
-        return data
-
-
-class Reports:
-    def __init__(self):
-        default = Path(__file__).resolve().parent / "data" / "evaluation.sqlite3"
-        self.journal = EvaluationJournal(os.getenv("EVALUATION_DB_PATH", str(default)))
-        self.previous_hour = None
-        self.daily_anchor = None
-        self.daily_sent_at = None
-
-    def hourly(self, session, symbol, bias, market, levels, price, trade, now):
-        message = hourly_text(session, symbol, bias, market, levels, price, trade, now, self.previous_hour)
-        self.previous_hour = {"symbol": symbol, "bias": bias, "levels": list(levels),
-                              "price": price, "time": now.strftime("%Y-%m-%d %H:%M")}
-        return message
-
-    def daily_due(self, symbol, levels, price, bias, label, market_dir, ny_now, now):
-        # Presentation schedule only. Never alters BotState or the trading clock.
-        if ny_now.weekday() >= 5 or not 9 * 60 + 15 <= ny_now.hour * 60 + ny_now.minute < 16 * 60:
-            return False
-        anchor = self.daily_anchor
-        first = anchor is None or anchor["day"] != ny_now.date() or anchor["symbol"] != symbol
-        changed = False
-        if not first:
-            support, resistance = anchor["support"], anchor["resistance"]
-            changed = ((support is not None and price < support)
-                       or (resistance is not None and price > resistance)
-                       or (bias, label, market_dir) != anchor["regime"])
-            changed = changed and (now - self.daily_sent_at).total_seconds() >= 1800
-        if not first and not changed:
-            return False
-        supports, resistances, _ = split_levels(levels, price)
-        self.daily_anchor = {"symbol": symbol, "day": ny_now.date(),
-                             "support": supports[0] if supports else None,
-                             "resistance": resistances[0] if resistances else None,
-                             "regime": (bias, label, market_dir)}
-        self.daily_sent_at = now
-        return True
-
-
-REPORTS = Reports()
-
-
-"""Strategy helpers embedded in the deployment file by the local builder.
-Numeric defaults are starting hypotheses, not calibrated success probabilities.
-"""
-@dataclass
-class StrategyConfig:
-    fast_motion_enabled: bool = True
-    confirmed_weakness_enabled: bool = True
-    extension_retry_enabled: bool = True
-    impulse_bars: int = 3
-    baseline_tr_bars: int = 14
-    breakout_lookback: int = 6
-    impulse_tr_multiple: float = 1.5
-    min_efficiency: float = 0.65
-    impulse_hold_bars: int = 6
-    reclaim_buffer_tr: float = 0.25
-
-
-STRATEGY = StrategyConfig()
-STRATEGY_VERSION = "strategy-v2-candidate"
-_EXTENSION_LOCK = threading.Lock()
-
-
-def strategy_now():
-    return pd.Timestamp(now_riyadh()).tz_convert("UTC")
-
-
-def closed_strategy_bars(df, minutes, now=None, minimum=1, contiguous=True):
-    """Input timestamps denote bar OPEN, as in the normalized TradingView feed."""
-    if df is None or not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
-        return None, "missing_timezone_or_datetime_index"
-    now = strategy_now() if now is None else pd.Timestamp(now).tz_convert("UTC")
-    if not df.index.is_monotonic_increasing or df.index.has_duplicates:
-        return None, "unordered_or_duplicate_bars"
-    delta = pd.Timedelta(minutes=minutes)
-    closed = df.loc[df.index + delta <= now].copy()
-    if len(closed) < minimum:
-        return None, "insufficient_closed_bars"
-    tail = closed.tail(minimum)
-    if now - (tail.index[-1] + delta) >= delta * 2:
-        return None, "stale_closed_bars"
-    if contiguous and minimum > 1 and not (tail.index.to_series().diff().dropna() == delta).all():
-        return None, "gap_in_recent_bars"
-    if not {"open", "high", "low", "close"}.issubset(tail.columns):
-        return None, "missing_ohlc"
-    try:
-        values = tail[["open", "high", "low", "close"]].to_numpy(dtype=float)
-    except (TypeError, ValueError):
-        return None, "nonnumeric_ohlc"
-    if not np.isfinite(values).all() or (values <= 0).any():
-        return None, "invalid_ohlc"
-    if ((values[:, 1] < values[:, [0, 2, 3]].max(axis=1)).any()
-            or (values[:, 2] > values[:, [0, 1, 3]].min(axis=1)).any()):
-        return None, "inconsistent_ohlc"
-    # Normalized feeds are numeric; tolerate numeric strings in a replay too.
-    for column in ("open", "high", "low", "close"):
-        closed[column] = pd.to_numeric(closed[column], errors="coerce")
-    return closed, "ok"
-
-
-def analyze_fast_motion(df_5m, df_15m, levels, previous=None, now=None):
-    now = strategy_now() if now is None else pd.Timestamp(now).tz_convert("UTC")
-    count = STRATEGY.impulse_bars
-    need = STRATEGY.baseline_tr_bars + count + 1
-    five, why5 = closed_strategy_bars(df_5m, 5, now, minimum=need)
-    fifteen, why15 = closed_strategy_bars(df_15m, 15, now, minimum=3)
-    if five is None or fifteen is None:
-        return {"state": "Unavailable", "direction": None, "reason": why5 if five is None else why15,
-                "checked_at": now.isoformat()}
-    stamp = five.index[-1]
-    # Strictly historical baseline: the impulse itself does not inflate its own threshold.
-    prior_close = five["close"].shift(1)
-    tr = pd.concat([five["high"] - five["low"], (five["high"] - prior_close).abs(),
-                    (five["low"] - prior_close).abs()], axis=1).max(axis=1)
-    baseline = float(tr.iloc[-count-STRATEGY.baseline_tr_bars:-count].mean())
-    closes = five["close"].astype(float)
-    start, price = float(closes.iloc[-count-1]), float(closes.iloc[-1])
-    move = price - start
-    path = float(closes.tail(count + 1).diff().abs().sum())
-    efficiency = abs(move) / path if path > 0 else 0.0
-    sign = 1 if move > 0 else -1
-    prior_range = five.iloc[-count-STRATEGY.breakout_lookback:-count]
-    range_boundary = float(prior_range["high"].max() if sign > 0 else prior_range["low"].min())
-    crossed = [float(level) for level in levels if number(level) is not None
-               and sign * (float(level) - start) >= 0 and sign * (price - float(level)) > 0]
-    range_break = sign * (price - range_boundary) > 0
-    boundary = (range_boundary if range_break else
-                ((max(crossed) if sign > 0 else min(crossed)) if crossed else None))
-    persistence = bool((closes.tail(3).diff().dropna() * sign > 0).all())
-    fifteen_confirm = sign * float(fifteen["close"].iloc[-1] - fifteen["close"].iloc[-2]) > 0
-    checks = {"large_move": baseline > 0 and abs(move) >= baseline * STRATEGY.impulse_tr_multiple,
-              "efficient_move": efficiency >= STRATEGY.min_efficiency,
-              "level_or_range_break": boundary is not None,
-              "two_successive_5m_moves": persistence, "closed_15m_agrees": bool(fifteen_confirm)}
-    result = {"state": "Neutral", "direction": None, "reason": "impulse_not_confirmed",
-              "bar_time": stamp.isoformat(), "bar_15m": fifteen.index[-1].isoformat(),
-              "checked_at": now.isoformat(), "closed_price": price, "move_points": move,
-              "baseline_tr": baseline, "efficiency": efficiency, "checks": checks}
-    if all(checks.values()):
-        result.update(state="Bullish impulse" if sign > 0 else "Bearish impulse",
-                      direction="BUY" if sign > 0 else "SELL", reason="confirmed_closed_bar_impulse",
-                      anchor=boundary, confirmed_bar=stamp.isoformat())
-        return result
-    # Keep a confirmed impulse through a small pause; never refresh its expiry on a pause.
-    if previous and previous.get("direction") in ("BUY", "SELL"):
-        prior_stamp = pd.Timestamp(previous["confirmed_bar"])
-        age = (stamp - prior_stamp).total_seconds() / 300.0
-        prior_sign = 1 if previous["direction"] == "BUY" else -1
-        anchor = float(previous["anchor"])
-        still_beyond = prior_sign * (price - anchor) >= -baseline * STRATEGY.reclaim_buffer_tr
-        if 0 <= age <= STRATEGY.impulse_hold_bars and still_beyond:
-            result.update(state=previous["state"], direction=previous["direction"],
-                          reason="impulse_held_through_pause", anchor=anchor,
-                          confirmed_bar=previous["confirmed_bar"])
-        elif not still_beyond:
-            result["reason"] = "broken_level_reclaimed"
-        else:
-            result["reason"] = "impulse_expired"
-    return result
-
-
-def strategy_motion(df_5m, df_15m, df_1h):
-    # Failure of the added entry filter must never prevent management of a live stop.
-    try:
-        return _strategy_motion(df_5m, df_15m, df_1h)
-    except Exception as exc:
-        result = {"state": "Unavailable", "direction": None,
-                  "reason": "motion_analysis_error:" + type(exc).__name__}
-        STATE.fast_motion = result
-        return result
-
-
-def _strategy_motion(df_5m, df_15m, df_1h):
-    if not STRATEGY.fast_motion_enabled:
-        return {"state": "Disabled", "direction": None, "reason": "feature_disabled"}
-    closed15, _ = closed_strategy_bars(df_15m, 15, minimum=3)
-    closed1h, _ = closed_strategy_bars(df_1h, 60, minimum=8, contiguous=False)
-    levels = extract_key_levels(closed15, closed1h) if closed15 is not None and closed1h is not None else []
-    previous = getattr(STATE, "fast_motion", None)
-    # Preserve the last valid anchor across a transient missing/stale response.
-    if previous and previous.get("state") == "Unavailable":
-        previous = getattr(STATE, "last_valid_fast_motion", None)
-    result = analyze_fast_motion(df_5m, df_15m, levels, previous)
-    STATE.fast_motion = result
-    if result["state"] != "Unavailable":
-        STATE.last_valid_fast_motion = result
-    return result
-
-
-def motion_entry_allowed(direction, motion):
-    if not STRATEGY.fast_motion_enabled:
-        return True, "feature_disabled"
-    if not motion or motion.get("state") == "Unavailable":
-        return False, "fast_motion_data_unavailable"
-    if motion.get("direction") and motion["direction"] != direction:
-        return False, "entry_against_confirmed_impulse"
-    return True, "direction_allowed"
-
-
-def motion_text(motion=None):
-    motion = motion if motion is not None else getattr(STATE, "fast_motion", {})
-    labels = {"Bullish impulse": "اندفاع صاعد", "Bearish impulse": "اندفاع هابط",
-              "Neutral": "لا يوجد اندفاع مؤكد", "Unavailable": "بيانات التأكيد غير متاحة", "Disabled": "معطلة"}
-    return "الحركة الحالية (5m/15m): " + labels.get(motion.get("state"), "لم تُحسب بعد")
-
-
-def strategy_snapshot(df_5m):
-    fields = ("open", "high", "low", "close", "ema20", "macd_hist", "stochrsi_k", "stochrsi_d")
-    out = []
-    if df_5m is not None:
-        for stamp, row in df_5m.tail(3).iterrows():
-            out.append({"bar_time": str(stamp), **{k: number(row.get(k)) for k in fields}})
-    return out
-
-
-def strategy_event_once(event, tr, bar, reason, **details):
-    """Bound duplicate journal events; errors do not alter strategy state or exits."""
-    try:
-        memo = getattr(STATE, "strategy_event_keys", {})
-        # One latest key per event/trade/direction/reason category, bounded globally.
-        slot = (event, str(tr.get("created_utc")), tr.get("direction"), reason)
-        if memo.get(slot) == str(bar):
-            return
-        reporting_event(event, tr, reason=reason, decision_bar=str(bar),
-                        strategy_version=STRATEGY_VERSION, **details)
-        memo[slot] = str(bar)
-        if len(memo) > 256:
-            memo.pop(next(iter(memo)))
-        STATE.strategy_event_keys = memo
-    except Exception as exc:
-        print("[WARN] Strategy journal failed: " + type(exc).__name__)
-
-
-def strategy_rejection(reason, df_5m, direction=None, level=None, **details):
-    closed, _ = closed_strategy_bars(df_5m, 5)
-    bar = str(closed.index[-1]) if closed is not None else str(df_5m.index[-1])
-    # This is a candidate evaluation, not a signal or closed trade.
-    candidate = {"created_utc": "decision:" + bar, "direction": direction, "level": level,
-                 "status": "rejected", "market_label_at_entry": STATE.market_label,
-                 "last_price": float(df_5m["close"].iloc[-1])}
-    strategy_event_once("entry_rejected", candidate, bar, reason,
-                        fast_motion=getattr(STATE, "fast_motion", {}),
-                        market_direction=STATE.market_dir, market_adx=STATE.market_adx,
-                        input_bars=strategy_snapshot(df_5m), input_may_include_open_bar=True, **details)
-
-
-def closed_indicator_status(df):
-    fields = ["ema20", "macd_hist", "stochrsi_k", "stochrsi_d"]
-    try:
-        return (all(k in df for k in fields)
-                and np.isfinite(df[fields].tail(3).to_numpy(dtype=float)).all())
-    except (TypeError, ValueError):
-        return False
-
-
-def confirmed_weakness_check(tr, df_5m, last_price):
-    closed, reason = closed_strategy_bars(df_5m, 5, minimum=9)
-    if closed is None or not closed_indicator_status(closed):
-        result = {"confirmed": False, "watch": False, "reason": reason if closed is None else "missing_indicators"}
-        strategy_event_once("weakness_check", tr, strategy_now().floor("5min"), result["reason"], confirmed=False)
-        return result
-    stamp = closed.index[-1]
-    if tr.get("weakness_checked_bar") == stamp.isoformat():
-        return {"confirmed": False, "watch": False, "reason": "already_checked"}
-    tr["weakness_checked_bar"] = stamp.isoformat()
-    hit_at = tr.get("strategy_t2_hit_at")
-    if hit_at is None:
-        tr["strategy_t2_hit_at"] = strategy_now().isoformat()
-        return {"confirmed": False, "watch": False, "reason": "waiting_for_post_target_bars", "bar": stamp.isoformat()}
-    after_target = closed.index[-2] + pd.Timedelta(minutes=5) > pd.Timestamp(hit_at)
-    reasons = []
-    for end in (-1, None):
-        sample = closed.iloc[:end] if end is not None else closed
-        weak, why = detect_weakening_or_reversal_watch(sample, tr["direction"])
-        reasons.append({"weak": bool(weak), "reason": why, "bar": sample.index[-1].isoformat()})
-    resumed = (last_price > float(closed["high"].iloc[-1]) if tr["direction"] == "BUY"
-               else last_price < float(closed["low"].iloc[-1]))
-    confirmed = bool(after_target and all(x["weak"] for x in reasons) and not resumed)
-    result = {"confirmed": confirmed, "watch": bool(reasons[-1]["weak"] and not resumed),
-              "reason": "confirmed_two_closed_bars" if confirmed else
-                        ("price_resumed_trade_direction" if resumed else "weakness_not_confirmed"),
-              "bar": stamp.isoformat(), "post_target_bars": bool(after_target), "checks": reasons,
-              "input_bars": strategy_snapshot(closed), "observed_price": last_price}
-    tr["last_weakness_decision"] = result
-    strategy_event_once("weakness_check", tr, stamp, result["reason"],
-                        **{k:v for k,v in result.items() if k not in ("reason", "bar")})
-    return result
-
-
-def maybe_extend_next_target(df_5m, df_15m, df_1h, last_price, manual=False, notify_skip=False):
-    if not STRATEGY.extension_retry_enabled:
-        return legacy_extend_next_target(df_5m, df_15m, df_1h, last_price, manual, notify_skip)
-    # Telegram commands and the scan loop may run in different threads.
-    if not _EXTENSION_LOCK.acquire(blocking=False):
-        return False, "extension_check_in_progress"
-    try:
-        return _closed_bar_extension(df_5m, df_15m, df_1h, last_price, manual, notify_skip)
-    finally:
-        _EXTENSION_LOCK.release()
-
-
-def _closed_bar_extension(df_5m, df_15m, df_1h, last_price, manual=False, notify_skip=False):
-    tr = STATE.active_trade
-    if tr is None or tr.get("status") != "live":
-        return False, "no live trade"
-    if tr.get("extension_in_progress"):
-        return False, "one_extension_per_attempt"
-    targets = tr.get("dynamic_targets", {})
-    highest = max((int(k[1:]) for k in targets), default=0)
-    if not manual and (highest < 2 or current_max_target_hit(tr) < highest):
-        return False, "current target still pending"
-    five, why = closed_strategy_bars(df_5m, 5, minimum=10)
-    fifteen, why15 = closed_strategy_bars(df_15m, 15, minimum=3)
-    # Hourly ATR/key levels span sessions; do not reject their normal session gaps.
-    hourly, why1h = closed_strategy_bars(df_1h, 60, minimum=CFG.expected_move_atr_window + 5, contiguous=False)
-    if five is None or fifteen is None or hourly is None or not closed_indicator_status(five):
-        reason = "closed_data_unavailable: " + (why if five is None else why15 if fifteen is None else why1h if hourly is None else "indicators")
-        strategy_event_once("extension_rejected", tr, strategy_now().floor("5min"), reason)
-        return False, reason
-    bar = five.index[-1].isoformat()
-    if not manual and tr.get("extension_checked_bar") == bar:
-        return False, "already_checked_this_closed_bar"
-    if not manual:
-        hit_at = tr.get("strategy_t2_hit_at")
-        if hit_at and five.index[-1] + pd.Timedelta(minutes=5) <= pd.Timestamp(hit_at):
-            return False, "waiting_for_post_target_bar"
-        tr["extension_checked_bar"] = bar
-    # Retain the original manual-override behavior only when explicitly requested.
-    tr["extension_in_progress"] = True
-    try:
-        ok, reason = legacy_extend_next_target(five, fifteen, hourly, last_price, manual, False)
-    finally:
-        tr.pop("extension_in_progress", None)
-    last = five.iloc[-1]
-    momentum_checks = ({"below_ema20": bool(last["close"] < last["ema20"]),
-                        "negative_macd_hist": bool(last["macd_hist"] < 0),
-                        "stoch_k_not_above_d": bool(last["stochrsi_k"] <= last["stochrsi_d"])}
-                       if tr["direction"] == "SELL" else
-                       {"above_ema20": bool(last["close"] > last["ema20"]),
-                        "positive_macd_hist": bool(last["macd_hist"] > 0),
-                        "stoch_k_not_below_d": bool(last["stochrsi_k"] >= last["stochrsi_d"])})
-    tr["last_extension_decision"] = {"reason": reason, "accepted": bool(ok), "bar": bar,
-                                     "input_bars": strategy_snapshot(five), "manual": bool(manual),
-                                     "target_evaluation": tr.get("extension_evaluation", {}),
-                                     "momentum_checks": momentum_checks,
-                                     "failed_momentum_checks": [k for k,v in momentum_checks.items() if not v]}
-    strategy_event_once("extension_added" if ok else "extension_rejected", tr, bar, reason,
-                        input_bars=strategy_snapshot(five), observed_price=last_price, manual=manual,
-                        market_label=STATE.market_label, market_direction=STATE.market_dir,
-                        target_evaluation=tr.get("extension_evaluation", {}),
-                        momentum_checks=momentum_checks,
-                        failed_momentum_checks=[k for k,v in momentum_checks.items() if not v])
-    if not ok and notify_skip and tr.get("extension_notified_reason") != reason:
-        send_telegram(CFG.user_title + " - Target Extension Pending\nReason: " + reason
-                      + "\nسأعيد الفحص مع شمعة 5 دقائق مكتملة جديدة؛ الوقف الحالي مستمر.")
-        tr["extension_notified_reason"] = reason
-    if ok:
-        tr.pop("extension_notified_reason", None)
-        tr.pop("last_extension_skip_reason", None)
-    return ok, reason
-
-
-def strategy_manage_after_targets(df_5m, df_15m, df_1h, last_price):
-    tr = STATE.active_trade
-    if tr is None or tr.get("status") != "live":
-        return
-    highest = max((int(k[1:]) for k in tr.get("dynamic_targets", {})), default=0)
-    max_hit = current_max_target_hit(tr)
-    if max_hit < 2:
-        return
-    if STRATEGY.confirmed_weakness_enabled:
-        decision = confirmed_weakness_check(tr, df_5m, last_price)
-        if decision.get("watch") and not decision.get("confirmed"):
-            if not tr.get("strategy_weakness_watch_sent"):
-                send_telegram(CFG.user_title + " - Weakness Watch\nظهرت علامة ضعف على شمعة مكتملة. "
-                              "ننتظر تأكيدًا إضافيًا؛ الصفقة مستمرة بوقفها الحالي.")
-                tr["strategy_weakness_watch_sent"] = True
-        elif decision.get("reason") != "already_checked":
-            tr["strategy_weakness_watch_sent"] = False
-        if decision.get("confirmed") and max_hit >= highest:
-            r_result, label, hit = compute_exit_result(tr, last_price)
-            record_closed_trade(label, hit, r_result, exit_price=last_price, exit_reason="weakness_confirmed")
-            send_telegram(CFG.user_title + " - Trade Closed (Confirmed Weakness)\n"
-                          "Reason: weakness on two completed 5m candles after T2\n"
-                          "Observed exit: " + safe_f1(last_price) + "\n"
-                          "Result (observed index): " + f"{r_result:+.2f}R\n"
-                          "Label: " + label + "\nHighest Target Hit: T" + str(hit))
-            STATE.active_trade = None
-            return
-    if STRATEGY.extension_retry_enabled and max_hit >= highest:
-        maybe_extend_next_target(df_5m, df_15m, df_1h, last_price, notify_skip=True)
-
-
 if __name__ == "__main__":
     main()
 # === END PART 4 ===
+
